@@ -67,10 +67,11 @@
 - `merge_media_files(task: MergeTaskPayload)` ➔ `Result<String, String>`
 - `cancel_merge()` ➔ `Result<(), String>`
 
-### 5. Subtitle Generator (Script-to-Sub)
+### 5. Subtitle Generator (Script-to-Sub & Local AI Whisper)
 - `generate_subtitles(task: SubtitleGenerateTask)` ➔ `Result<SubtitleGenerateResult, String>`
 - `save_subtitle_file(path: String, content: String)` ➔ `Result<(), String>`
 - `read_script_file(path: String)` ➔ `Result<String, String>`
+- `extract_audio_pcm_16k(path: String)` ➔ `Result<Vec<f32>, String>`
 
 ### 6. History & Files
 - `list_history_files()` ➔ `Vec<HistoryItem>`

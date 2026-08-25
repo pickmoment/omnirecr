@@ -279,3 +279,16 @@ pub fn read_script_file(path: String) -> Result<String, String> {
     SubtitleController::read_script_file(&path)
 }
 
+#[tauri::command]
+pub async fn extract_audio_pcm_16k(path: String) -> Result<Vec<f32>, String> {
+    let settings = SettingsManager::load();
+    let custom_path = settings.custom_ffmpeg_path.clone();
+
+    tokio::task::spawn_blocking(move || {
+        let p = std::path::PathBuf::from(&path);
+        SubtitleController::extract_pcm_16k(&p, custom_path.as_deref())
+    })
+    .await
+    .map_err(|e| format!("PCM 추출 작업 실패: {}", e))?
+}
+

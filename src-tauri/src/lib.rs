@@ -70,6 +70,7 @@ pub fn run() {
             commands::generate_subtitles,
             commands::save_subtitle_file,
             commands::read_script_file,
+            commands::extract_audio_pcm_16k,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

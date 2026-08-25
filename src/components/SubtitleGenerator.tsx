@@ -18,6 +18,8 @@ import {
   Wand2,
   FileCheck,
   Search,
+  Bot,
+  Zap,
 } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { open, save } from '@tauri-apps/plugin-dialog';
@@ -28,6 +30,7 @@ import type {
   SubtitleItem,
   SubtitleSplitMode,
 } from '../types';
+import { runLocalWhisperTranscribe, alignScriptWithWhisperChunks } from '../services/whisperService';
 
 interface SubtitleGeneratorProps {
   settings: Settings;
@@ -49,12 +52,18 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
   // Input State
   const [scriptText, setScriptText] = useState<string>('');
   const [audioPath, setAudioPath] = useState<string>(initialAudioPath || '');
+  const [syncEngine, setSyncEngine] = useState<'ai-whisper' | 'vad'>('ai-whisper');
+  const [whisperModel, setWhisperModel] = useState<'Xenova/whisper-tiny' | 'Xenova/whisper-base'>('Xenova/whisper-tiny');
   const [splitMode, setSplitMode] = useState<SubtitleSplitMode>('auto');
   const [maxChars, setMaxChars] = useState<number>(28);
   const [silenceThresholdDb, setSilenceThresholdDb] = useState<number>(-35.0);
   const [minSilenceDuration, setMinSilenceDuration] = useState<number>(0.25);
   const [startOffsetSecs, setStartOffsetSecs] = useState<number>(0.1);
   const [autoSave, setAutoSave] = useState<boolean>(true);
+
+  // AI Progress State
+  const [aiStatusMsg, setAiStatusMsg] = useState<string | null>(null);
+  const [aiProgress, setAiProgress] = useState<number>(0);
 
   // Result & Editor State
   const [isGenerating, setIsGenerating] = useState<boolean>(false);
@@ -193,7 +202,7 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
     }
   };
 
-  // Generate Subtitles
+  // Generate Subtitles (Local AI Whisper or High-Precision VAD DP)
   const handleGenerate = async () => {
     if (!audioPath.trim()) {
       setErrorMsg('음성 또는 영상 미디어 파일을 선택해 주세요.');
@@ -206,35 +215,106 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
 
     setErrorMsg(null);
     setIsGenerating(true);
-    try {
-      const task: SubtitleGenerateTask = {
-        audio_path: audioPath,
-        script_text: scriptText,
-        split_mode: splitMode,
-        max_chars: maxChars,
-        min_silence_duration_secs: minSilenceDuration,
-        silence_threshold_db: silenceThresholdDb,
-        start_offset_secs: startOffsetSecs,
-        end_margin_secs: 0.2,
-        auto_save: autoSave,
-        output_dir: settings.output_dir || null,
-      };
+    setAiStatusMsg(null);
+    setAiProgress(0);
 
-      const result = await invoke<SubtitleGenerateResult>('generate_subtitles', { task });
-      setGenerateResult(result);
-      setSubtitles(result.subtitles);
-      setSavedPaths({
-        srt: result.srt_path || undefined,
-        vtt: result.vtt_path || undefined,
-      });
+    try {
+      if (syncEngine === 'ai-whisper') {
+        // --- 1. LOCAL AI WHISPER MODE ---
+        setAiStatusMsg('오디오 16kHz PCM 데이터를 추출하는 중...');
+        setAiProgress(5);
+
+        const rawSamples = await invoke<number[]>('extract_audio_pcm_16k', { path: audioPath });
+        const floatArray = new Float32Array(rawSamples);
+
+        const audioDur = floatArray.length / 16000;
+
+        const whisperResult = await runLocalWhisperTranscribe(
+          floatArray,
+          whisperModel,
+          (msg, pct) => {
+            setAiStatusMsg(msg);
+            if (pct) setAiProgress(pct);
+          }
+        );
+
+        // Split user script into lines
+        const lines = scriptText
+          .split('\n')
+          .map((l) => l.trim())
+          .filter((l) => l.length > 0);
+
+        const alignedSubtitles = alignScriptWithWhisperChunks(lines, whisperResult.chunks, audioDur);
+
+        const srtContent = buildCurrentSrt(alignedSubtitles);
+        const vttContent = buildCurrentVtt(alignedSubtitles);
+
+        let srtSaved: string | undefined = undefined;
+        let vttSaved: string | undefined = undefined;
+
+        if (autoSave) {
+          const stem = audioPath.split(/[\\/]/).pop()?.replace(/\.[^/.]+$/, '') || 'subtitles';
+          const lastSlash = Math.max(audioPath.lastIndexOf('/'), audioPath.lastIndexOf('\\'));
+          const targetDir = settings.output_dir?.trim() || (lastSlash > 0 ? audioPath.substring(0, lastSlash) : '.');
+          const srtFile = `${targetDir}/${stem}.srt`;
+          const vttFile = `${targetDir}/${stem}.vtt`;
+
+          try {
+            await invoke('save_subtitle_file', { path: srtFile, content: srtContent });
+            srtSaved = srtFile;
+          } catch {}
+          try {
+            await invoke('save_subtitle_file', { path: vttFile, content: vttContent });
+            vttSaved = vttFile;
+          } catch {}
+        }
+
+        setSubtitles(alignedSubtitles);
+        setGenerateResult({
+          subtitles: alignedSubtitles,
+          srt_content: srtContent,
+          vtt_content: vttContent,
+          srt_path: srtSaved,
+          vtt_path: vttSaved,
+          total_duration: audioDur,
+          speech_segments_detected: whisperResult.chunks.length,
+          script_lines_count: lines.length,
+        });
+        setSavedPaths({ srt: srtSaved, vtt: vttSaved });
+
+      } else {
+        // --- 2. HIGH-PRECISION VAD + DP MODE ---
+        const task: SubtitleGenerateTask = {
+          audio_path: audioPath,
+          script_text: scriptText,
+          split_mode: splitMode,
+          max_chars: maxChars,
+          min_silence_duration_secs: minSilenceDuration,
+          silence_threshold_db: silenceThresholdDb,
+          start_offset_secs: startOffsetSecs,
+          end_margin_secs: 0.2,
+          auto_save: autoSave,
+          output_dir: settings.output_dir || null,
+        };
+
+        const result = await invoke<SubtitleGenerateResult>('generate_subtitles', { task });
+        setGenerateResult(result);
+        setSubtitles(result.subtitles);
+        setSavedPaths({
+          srt: result.srt_path || undefined,
+          vtt: result.vtt_path || undefined,
+        });
+      }
 
       if (!audioBlobUrl) {
         await loadAudioFile(audioPath);
       }
     } catch (err: any) {
+      console.error('Subtitle generation failed:', err);
       setErrorMsg(`자막 생성 실패: ${err?.message || err}`);
     } finally {
       setIsGenerating(false);
+      setAiStatusMsg(null);
     }
   };
 
@@ -772,7 +852,83 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
               )}
             </div>
 
-            {/* Subtitle Alignment Options */}
+            {/* Sync Engine Selector */}
+            <div className="p-3 rounded-xl bg-slate-950/80 border border-slate-800 space-y-2">
+              <div className="flex items-center justify-between">
+                <span className="text-[11px] font-bold text-slate-200 flex items-center gap-1.5">
+                  <Bot className="w-3.5 h-3.5 text-orange-400" />
+                  <span>자막 싱크 엔진 선택</span>
+                </span>
+                <span className="text-[10px] text-orange-400 font-medium">
+                  {syncEngine === 'ai-whisper' ? '로컬 AI Whisper (단어 실측)' : '고속 음성 파형 VAD'}
+                </span>
+              </div>
+
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  onClick={() => setSyncEngine('ai-whisper')}
+                  className={`p-2.5 rounded-xl border flex flex-col items-start gap-1 transition text-left ${
+                    syncEngine === 'ai-whisper'
+                      ? 'bg-orange-950/50 border-orange-500/80 shadow-md shadow-orange-500/10'
+                      : 'bg-slate-900/60 border-slate-800 hover:border-slate-700 text-slate-400'
+                  }`}
+                >
+                  <div className="flex items-center gap-1.5 text-xs font-bold text-slate-100">
+                    <Bot className="w-4 h-4 text-orange-400" />
+                    <span>로컬 AI Whisper</span>
+                    <span className="text-[9px] bg-orange-500/20 text-orange-400 px-1 py-0.2 rounded border border-orange-500/30">추천</span>
+                  </div>
+                  <p className="text-[10px] text-slate-400 leading-tight">
+                    AI가 실제 음성 단어 타임코드를 실측 분석하여 대본과 100% 밀착 정렬
+                  </p>
+                </button>
+
+                <button
+                  onClick={() => setSyncEngine('vad')}
+                  className={`p-2.5 rounded-xl border flex flex-col items-start gap-1 transition text-left ${
+                    syncEngine === 'vad'
+                      ? 'bg-cyan-950/50 border-cyan-500/80 shadow-md shadow-cyan-500/10'
+                      : 'bg-slate-900/60 border-slate-800 hover:border-slate-700 text-slate-400'
+                  }`}
+                >
+                  <div className="flex items-center gap-1.5 text-xs font-bold text-slate-100">
+                    <Zap className="w-4 h-4 text-cyan-400" />
+                    <span>고속 음성 파형 VAD</span>
+                  </div>
+                  <p className="text-[10px] text-slate-400 leading-tight">
+                    FFmpeg 16kHz PCM 음성 에너지 및 DP 기반 초고속 정렬
+                  </p>
+                </button>
+              </div>
+
+              {syncEngine === 'ai-whisper' && (
+                <div className="pt-2 border-t border-slate-800/80 flex items-center justify-between gap-2">
+                  <span className="text-[11px] text-slate-300">AI 모델 선택:</span>
+                  <div className="flex items-center gap-1">
+                    <button
+                      onClick={() => setWhisperModel('Xenova/whisper-tiny')}
+                      className={`px-2 py-1 rounded-lg text-[10px] font-semibold transition ${
+                        whisperModel === 'Xenova/whisper-tiny'
+                          ? 'bg-orange-600 text-white shadow-sm'
+                          : 'bg-slate-800 text-slate-400 hover:text-slate-200'
+                      }`}
+                    >
+                      Whisper Tiny (39MB • 초고속)
+                    </button>
+                    <button
+                      onClick={() => setWhisperModel('Xenova/whisper-base')}
+                      className={`px-2 py-1 rounded-lg text-[10px] font-semibold transition ${
+                        whisperModel === 'Xenova/whisper-base'
+                          ? 'bg-orange-600 text-white shadow-sm'
+                          : 'bg-slate-800 text-slate-400 hover:text-slate-200'
+                      }`}
+                    >
+                      Whisper Base (73MB • 고정확도)
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
             <div className="space-y-3 pt-1 text-xs">
               {/* Split Mode */}
               <div className="flex flex-col gap-1.5">
@@ -885,6 +1041,27 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
               </div>
             </div>
 
+            {/* AI Progress Notification */}
+            {isGenerating && aiStatusMsg && (
+              <div className="p-3 rounded-xl bg-orange-950/40 border border-orange-500/40 space-y-2 animate-fadeIn">
+                <div className="flex items-center justify-between text-xs font-semibold text-orange-300">
+                  <div className="flex items-center gap-2">
+                    <div className="w-3.5 h-3.5 border-2 border-orange-400/30 border-t-orange-400 rounded-full animate-spin" />
+                    <span>{aiStatusMsg}</span>
+                  </div>
+                  {aiProgress > 0 && <span className="font-mono text-orange-400">{aiProgress}%</span>}
+                </div>
+                {aiProgress > 0 && (
+                  <div className="w-full bg-slate-900 rounded-full h-1.5 overflow-hidden">
+                    <div
+                      className="bg-gradient-to-r from-amber-500 to-orange-500 h-1.5 rounded-full transition-all duration-300"
+                      style={{ width: `${aiProgress}%` }}
+                    />
+                  </div>
+                )}
+              </div>
+            )}
+
             {/* Big Action Button */}
             <button
               onClick={handleGenerate}
@@ -894,12 +1071,12 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
               {isGenerating ? (
                 <>
                   <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                  <span>FFmpeg 음성 분석 및 자막 정렬 중...</span>
+                  <span>{syncEngine === 'ai-whisper' ? '로컬 AI 음성인식 및 대본 정밀 매칭 중...' : 'FFmpeg 음성 분석 및 자막 정렬 중...'}</span>
                 </>
               ) : (
                 <>
-                  <Wand2 className="w-4 h-4" />
-                  <span>대본 기반 자막 자동 생성하기</span>
+                  {syncEngine === 'ai-whisper' ? <Bot className="w-4 h-4" /> : <Wand2 className="w-4 h-4" />}
+                  <span>{syncEngine === 'ai-whisper' ? '로컬 AI Whisper 기반 자막 자동 생성' : '대본 기반 자막 자동 생성하기'}</span>
                 </>
               )}
             </button>

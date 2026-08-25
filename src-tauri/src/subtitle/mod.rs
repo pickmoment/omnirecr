@@ -418,20 +418,10 @@ impl SubtitleController {
         None
     }
 
-    /// High-precision Voice Activity Detection by decoding audio to 16kHz mono PCM
-    fn detect_speech_segments_pcm(
-        path: &Path,
-        total_duration: f64,
-        user_thresh_db: f64,
-        min_silence_secs: f64,
-        custom_ffmpeg_path: Option<&str>,
-    ) -> Vec<SpeechSegment> {
-        let ffmpeg_path = match SettingsManager::find_ffmpeg(custom_ffmpeg_path) {
-            Ok(p) => p,
-            Err(_) => return Vec::new(),
-        };
+    /// Extract 16kHz mono Float32 PCM samples from any audio/video file using FFmpeg
+    pub fn extract_pcm_16k(path: &Path, custom_ffmpeg_path: Option<&str>) -> Result<Vec<f32>, String> {
+        let ffmpeg_path = SettingsManager::find_ffmpeg(custom_ffmpeg_path)?;
 
-        // Decode directly to 16kHz mono raw float32 PCM
         let mut cmd = Command::new(ffmpeg_path);
         #[cfg(windows)]
         {
@@ -451,25 +441,38 @@ impl SubtitleController {
             "pipe:1",
         ]);
 
-        let output = match cmd.output() {
-            Ok(o) if o.status.success() || !o.stdout.is_empty() => o,
-            _ => return Vec::new(),
-        };
+        let output = cmd.output().map_err(|e| format!("FFmpeg 실행 실패: {}", e))?;
 
-        let raw_bytes = output.stdout;
-        if raw_bytes.len() < 4 * 1600 {
-            return Vec::new();
+        if !output.status.success() && output.stdout.is_empty() {
+            let err_msg = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("FFmpeg 오디오 PCM 추출 오류: {}", err_msg));
         }
 
-        // Convert u8 slice to f32 samples
+        let raw_bytes = output.stdout;
+        if raw_bytes.len() < 4 * 160 {
+            return Err("오디오 데이터가 너무 짧거나 비어 있습니다.".to_string());
+        }
+
         let samples: Vec<f32> = raw_bytes
             .chunks_exact(4)
             .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
             .collect();
 
-        if samples.is_empty() {
-            return Vec::new();
-        }
+        Ok(samples)
+    }
+
+    /// High-precision Voice Activity Detection by decoding audio to 16kHz mono PCM
+    fn detect_speech_segments_pcm(
+        path: &Path,
+        total_duration: f64,
+        user_thresh_db: f64,
+        min_silence_secs: f64,
+        custom_ffmpeg_path: Option<&str>,
+    ) -> Vec<SpeechSegment> {
+        let samples = match Self::extract_pcm_16k(path, custom_ffmpeg_path) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
 
         const FRAME_SIZE: usize = 160; // 10ms per frame at 16kHz
         const FRAME_DURATION: f64 = 0.01;
