@@ -22,6 +22,7 @@ import {
   Zap,
   Link2,
   Link2Off,
+  Mic,
 } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { open, save } from '@tauri-apps/plugin-dialog';
@@ -35,6 +36,7 @@ import type {
 import {
   runLocalWhisperTranscribe,
   alignScriptWithWhisperChunks,
+  generateSubtitlesFromAiChunks,
   splitScriptIntoLines,
   resetWhisperPipeline,
 } from '../services/whisperService';
@@ -57,6 +59,7 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
   onOpenExplorer,
 }) => {
   // Input State
+  const [generationWorkflow, setGenerationWorkflow] = useState<'with-script' | 'ai-only'>('with-script');
   const [scriptText, setScriptText] = useState<string>('');
   const [audioPath, setAudioPath] = useState<string>(initialAudioPath || '');
   const [syncEngine, setSyncEngine] = useState<'ai-whisper' | 'vad'>('ai-whisper');
@@ -216,8 +219,8 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
       setErrorMsg('음성 또는 영상 미디어 파일을 선택해 주세요.');
       return;
     }
-    if (!scriptText.trim()) {
-      setErrorMsg('대본 내용을 입력하거나 파일을 불러와 주세요.');
+    if (generationWorkflow === 'with-script' && !scriptText.trim()) {
+      setErrorMsg('대본 내용을 입력하거나 파일을 불러와 주세요. (대본 없이 생성하려면 상단에서 [🤖 대본 없는 순수 AI 자막 생성] 모드를 선택하세요)');
       return;
     }
 
@@ -230,7 +233,7 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
     setAiProgress(0);
 
     try {
-      if (syncEngine === 'ai-whisper') {
+      if (generationWorkflow === 'ai-only' || syncEngine === 'ai-whisper') {
         // --- 1. LOCAL AI WHISPER MODE ---
         setAiStatusMsg('오디오 16kHz PCM 데이터를 추출하는 중...');
         setAiProgress(5);
@@ -252,17 +255,25 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
           }
         );
 
-        // Split user script into lines according to splitMode & maxChars
-        const lines = splitScriptIntoLines(scriptText, splitMode, maxChars);
+        let finalSubtitles: SubtitleItem[] = [];
 
-        if (lines.length === 0) {
-          throw new Error('대본에서 유효한 텍스트 문장을 찾을 수 없습니다.');
+        if (generationWorkflow === 'ai-only') {
+          // --- AI-ONLY DIRECT TRANSCRIPTION (No Script) ---
+          finalSubtitles = generateSubtitlesFromAiChunks(whisperResult.chunks, maxChars);
+          if (whisperResult.text && !scriptText.trim()) {
+            setScriptText(whisperResult.text);
+          }
+        } else {
+          // --- SCRIPT + AI FORCED ALIGNMENT ---
+          const lines = splitScriptIntoLines(scriptText, splitMode, maxChars);
+          if (lines.length === 0) {
+            throw new Error('대본에서 유효한 텍스트 문장을 찾을 수 없습니다.');
+          }
+          finalSubtitles = alignScriptWithWhisperChunks(lines, whisperResult.chunks, audioDur);
         }
 
-        const alignedSubtitles = alignScriptWithWhisperChunks(lines, whisperResult.chunks, audioDur);
-
-        const srtContent = buildCurrentSrt(alignedSubtitles);
-        const vttContent = buildCurrentVtt(alignedSubtitles);
+        const srtContent = buildCurrentSrt(finalSubtitles);
+        const vttContent = buildCurrentVtt(finalSubtitles);
 
         let srtSaved: string | undefined = undefined;
         let vttSaved: string | undefined = undefined;
@@ -284,16 +295,16 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
           } catch {}
         }
 
-        setSubtitles(alignedSubtitles);
+        setSubtitles(finalSubtitles);
         setGenerateResult({
-          subtitles: alignedSubtitles,
+          subtitles: finalSubtitles,
           srt_content: srtContent,
           vtt_content: vttContent,
           srt_path: srtSaved,
           vtt_path: vttSaved,
           total_duration: audioDur,
           speech_segments_detected: whisperResult.chunks.length,
-          script_lines_count: lines.length,
+          script_lines_count: finalSubtitles.length,
         });
         setSavedPaths({ srt: srtSaved, vtt: vttSaved });
 
@@ -847,6 +858,36 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
 
       {/* Main Container */}
       <div className="max-w-7xl mx-auto w-full p-6 space-y-6">
+        {/* Workflow Mode Selector Tab */}
+        <div className="bg-slate-900/90 border border-slate-800 p-1.5 rounded-2xl flex items-center gap-2 max-w-2xl shadow-lg">
+          <button
+            onClick={() => setGenerationWorkflow('with-script')}
+            className={`flex-1 flex items-center justify-center gap-2 py-2.5 px-4 rounded-xl font-bold text-xs transition ${
+              generationWorkflow === 'with-script'
+                ? 'bg-gradient-to-r from-amber-600 to-orange-600 text-white shadow-md shadow-orange-600/30'
+                : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/60'
+            }`}
+          >
+            <FileText className="w-4 h-4" />
+            <span>📝 대본 + AI 싱크 모드 (대본 원문 보존)</span>
+          </button>
+
+          <button
+            onClick={() => {
+              setGenerationWorkflow('ai-only');
+              setSyncEngine('ai-whisper');
+            }}
+            className={`flex-1 flex items-center justify-center gap-2 py-2.5 px-4 rounded-xl font-bold text-xs transition ${
+              generationWorkflow === 'ai-only'
+                ? 'bg-gradient-to-r from-orange-600 to-amber-500 text-white shadow-md shadow-orange-500/30'
+                : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/60'
+            }`}
+          >
+            <Bot className="w-4 h-4 text-amber-300" />
+            <span>🤖 대본 없는 순수 AI 자동 자막 모드</span>
+          </button>
+        </div>
+
         {/* Error Notification */}
         {errorMsg && (
           <div className="p-4 rounded-xl bg-red-950/60 border border-red-500/50 text-red-300 text-xs flex items-center justify-between gap-3 animate-shake">
@@ -867,59 +908,90 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
           {/* Column 1: Script Editor (7 cols) */}
           <div className="lg:col-span-7 bg-slate-900/80 border border-slate-800/90 rounded-2xl p-5 flex flex-col gap-4 shadow-xl">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                <FileText className="w-4 h-4 text-orange-400" />
-                <h2 className="text-sm font-semibold text-white">대본 (스크립트) 입력</h2>
-                <span className="text-[11px] text-slate-400 font-mono">
-                  ({scriptText.length.toLocaleString()}자 /{' '}
-                  {scriptText.split('\n').filter((l) => l.trim().length > 0).length}줄)
-                </span>
-              </div>
-              <div className="flex items-center gap-1.5">
-                <button
-                  onClick={handleSelectScriptFile}
-                  title="대본 파일 열기 (.txt, .md, .srt, .vtt)"
-                  className="px-2.5 py-1.5 rounded-lg text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 flex items-center gap-1.5 transition"
-                >
-                  <Upload className="w-3.5 h-3.5 text-orange-400" />
-                  <span>파일 열기</span>
-                </button>
-                <button
-                  onClick={handleCleanSpaces}
-                  title="불필요한 공백 및 빈 줄 정리"
-                  className="px-2 py-1.5 rounded-lg text-xs font-medium bg-slate-800/60 hover:bg-slate-700 text-slate-300 border border-slate-800 transition"
-                >
-                  공백 정리
-                </button>
-                <button
-                  onClick={handleRemoveTimestamps}
-                  title="타임코드 태그 제거"
-                  className="px-2 py-1.5 rounded-lg text-xs font-medium bg-slate-800/60 hover:bg-slate-700 text-slate-300 border border-slate-800 transition"
-                >
-                  태그 제거
-                </button>
-                {scriptText && (
-                  <button
-                    onClick={() => setScriptText('')}
-                    title="대본 지우기"
-                    className="p-1.5 rounded-lg text-slate-400 hover:text-red-400 hover:bg-slate-800 transition"
-                  >
-                    <Trash2 className="w-3.5 h-3.5" />
-                  </button>
-                )}
-              </div>
-            </div>
+            {generationWorkflow === 'ai-only' ? (
+              /* AI-Only Workflow View */
+              <div className="flex-1 flex flex-col justify-between p-4 rounded-xl bg-slate-950/60 border border-slate-800/80 space-y-4">
+                <div className="space-y-2">
+                  <div className="flex items-center gap-2 text-sm font-bold text-orange-400">
+                    <Bot className="w-5 h-5" />
+                    <span>순수 AI 음성인식 전사 모드 안내</span>
+                  </div>
+                  <p className="text-xs text-slate-300 leading-relaxed">
+                    대본을 따로 준비할 필요가 없습니다. 우측에서 <strong>음성 또는 영상 미디어 파일</strong>만 선택하고 하단의 <strong>[로컬 AI 자막 자동 생성]</strong> 버튼을 누르면, 온디바이스 AI Whisper가 실제 목소리를 직접 받아쓰고 적절한 길이로 자막을 자동 생성합니다.
+                  </p>
+                </div>
 
-            {/* Script Textarea */}
-            <div className="relative flex-1 min-h-[220px]">
-              <textarea
-                value={scriptText}
-                onChange={(e) => setScriptText(e.target.value)}
-                placeholder="여기에 대본이나 낭독 스크립트를 직접 입력하거나 붙여넣으세요...&#10;또는 [파일 열기] 버튼으로 텍스트(.txt, .md) 파일을 불러올 수 있습니다."
-                className="w-full h-full min-h-[220px] bg-slate-950/70 border border-slate-800 rounded-xl p-3.5 text-xs text-slate-200 placeholder:text-slate-500 font-sans leading-relaxed focus:outline-none focus:border-orange-500/50 focus:ring-1 focus:ring-orange-500/50 resize-y"
-              />
-            </div>
+                <div className="p-3.5 rounded-xl bg-slate-900/90 border border-slate-800 space-y-2 text-xs">
+                  <div className="flex items-center gap-2 text-slate-200 font-semibold">
+                    <Mic className="w-4 h-4 text-emerald-400" />
+                    <span>AI 전사 결과 텍스트 (생성 후 자동 표시)</span>
+                  </div>
+                  <textarea
+                    value={scriptText}
+                    readOnly
+                    placeholder="AI 자막 생성을 시작하면 전사된 텍스트가 여기에 자동으로 채워집니다..."
+                    className="w-full h-36 bg-slate-950 border border-slate-800 rounded-lg p-2.5 text-xs text-slate-300 font-mono focus:outline-none resize-none"
+                  />
+                </div>
+              </div>
+            ) : (
+              /* With-Script Workflow View */
+              <>
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <FileText className="w-4 h-4 text-orange-400" />
+                    <h2 className="text-sm font-semibold text-white">대본 (스크립트) 입력</h2>
+                    <span className="text-[11px] text-slate-400 font-mono">
+                      ({scriptText.length.toLocaleString()}자 /{' '}
+                      {scriptText.split('\n').filter((l) => l.trim().length > 0).length}줄)
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      onClick={handleSelectScriptFile}
+                      title="대본 파일 열기 (.txt, .md, .srt, .vtt)"
+                      className="px-2.5 py-1.5 rounded-lg text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 flex items-center gap-1.5 transition"
+                    >
+                      <Upload className="w-3.5 h-3.5 text-orange-400" />
+                      <span>파일 열기</span>
+                    </button>
+                    <button
+                      onClick={handleCleanSpaces}
+                      title="불필요한 공백 및 빈 줄 정리"
+                      className="px-2 py-1.5 rounded-lg text-xs font-medium bg-slate-800/60 hover:bg-slate-700 text-slate-300 border border-slate-800 transition"
+                    >
+                      공백 정리
+                    </button>
+                    <button
+                      onClick={handleRemoveTimestamps}
+                      title="타임코드 태그 제거"
+                      className="px-2 py-1.5 rounded-lg text-xs font-medium bg-slate-800/60 hover:bg-slate-700 text-slate-300 border border-slate-800 transition"
+                    >
+                      태그 제거
+                    </button>
+                    {scriptText && (
+                      <button
+                        onClick={() => setScriptText('')}
+                        title="대본 지우기"
+                        className="p-1.5 rounded-lg text-slate-400 hover:text-red-400 hover:bg-slate-800 transition"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                {/* Script Textarea */}
+                <div className="relative flex-1 min-h-[220px]">
+                  <textarea
+                    value={scriptText}
+                    onChange={(e) => setScriptText(e.target.value)}
+                    placeholder="여기에 대본이나 낭독 스크립트를 직접 입력하거나 붙여넣으세요...&#10;또는 [파일 열기] 버튼으로 텍스트(.txt, .md) 파일을 불러올 수 있습니다."
+                    className="w-full h-full min-h-[220px] bg-slate-950/70 border border-slate-800 rounded-xl p-3.5 text-xs text-slate-200 placeholder:text-slate-500 font-sans leading-relaxed focus:outline-none focus:border-orange-500/50 focus:ring-1 focus:ring-orange-500/50 resize-y"
+                  />
+                </div>
+              </>
+            )}
           </div>
 
           {/* Column 2: Audio Source & Alignment Controls (5 cols) */}

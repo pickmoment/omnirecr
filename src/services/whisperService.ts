@@ -355,6 +355,73 @@ export function alignScriptWithWhisperChunks(
   return results;
 }
 
+/**
+ * Generate Subtitles directly from AI Whisper transcription chunks (No Script needed)
+ */
+export function generateSubtitlesFromAiChunks(
+  chunks: WhisperChunk[],
+  maxChars: number = 28
+): SubtitleItem[] {
+  if (chunks.length === 0) return [];
+
+  const results: SubtitleItem[] = [];
+  let currentText = '';
+  let currentStart = 0;
+  let currentEnd = 0;
+  let hasActive = false;
+
+  for (const chunk of chunks) {
+    const chunkText = chunk.text.trim();
+    if (!chunkText) continue;
+
+    const chunkStart = Math.max(0, chunk.timestamp[0]);
+    const chunkEnd = Math.max(chunkStart + 0.2, chunk.timestamp[1]);
+
+    if (!hasActive) {
+      currentText = chunkText;
+      currentStart = chunkStart;
+      currentEnd = chunkEnd;
+      hasActive = true;
+    } else {
+      const isEndingPunct = /[.?!…~。]$/.test(currentText);
+      const isLongEnough = (currentText.length + chunkText.length + 1) > maxChars;
+      const hasLargeGap = chunkStart > currentEnd + 0.6; // Silence gap > 0.6s
+
+      if (isEndingPunct || isLongEnough || hasLargeGap) {
+        // Finalize current subtitle
+        results.push({
+          index: results.length + 1,
+          start_secs: currentStart,
+          end_secs: currentEnd,
+          start_formatted: formatSrtTime(currentStart),
+          end_formatted: formatSrtTime(currentEnd),
+          text: currentText,
+        });
+
+        currentText = chunkText;
+        currentStart = chunkStart;
+        currentEnd = chunkEnd;
+      } else {
+        currentText += (currentText ? ' ' : '') + chunkText;
+        currentEnd = Math.max(currentEnd, chunkEnd);
+      }
+    }
+  }
+
+  if (hasActive && currentText.trim()) {
+    results.push({
+      index: results.length + 1,
+      start_secs: currentStart,
+      end_secs: currentEnd,
+      start_formatted: formatSrtTime(currentStart),
+      end_formatted: formatSrtTime(currentEnd),
+      text: currentText,
+    });
+  }
+
+  return results;
+}
+
 function cleanText(t: string): string {
   return t.replace(/[.,?!…~'"`\-_/\\()\[\]]/g, '').toLowerCase().trim();
 }
