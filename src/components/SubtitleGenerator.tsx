@@ -20,6 +20,8 @@ import {
   Search,
   Bot,
   Zap,
+  Link2,
+  Link2Off,
 } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { open, save } from '@tauri-apps/plugin-dialog';
@@ -87,6 +89,7 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
   const [isMuted, setIsMuted] = useState<boolean>(false);
   const [highlightedIndex, setHighlightedIndex] = useState<number | null>(null);
   const [autoScroll, setAutoScroll] = useState<boolean>(true);
+  const [rippleEdit, setRippleEdit] = useState<boolean>(true);
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const subtitleListRef = useRef<HTMLDivElement | null>(null);
@@ -459,20 +462,52 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
   };
 
   const handleShiftSingle = (index: number, offsetSecs: number) => {
-    setSubtitles((prev) =>
-      prev.map((item, i) => {
-        if (i !== index) return item;
-        const newStart = Math.max(0, item.start_secs + offsetSecs);
-        const newEnd = Math.max(newStart + 0.15, item.end_secs + offsetSecs);
-        return {
-          ...item,
-          start_secs: newStart,
-          end_secs: newEnd,
-          start_formatted: formatSrtTimestamp(newStart),
-          end_formatted: formatSrtTimestamp(newEnd),
-        };
-      })
-    );
+    setSubtitles((prev) => {
+      const target = prev[index];
+      if (!target) return prev;
+      const newStart = Math.max(0, target.start_secs + offsetSecs);
+      const newEnd = Math.max(newStart + 0.15, target.end_secs + offsetSecs);
+      const delta = newStart - target.start_secs;
+
+      return prev.map((item, i) => {
+        if (i < index) {
+          if (rippleEdit && delta < 0 && i === index - 1 && item.end_secs > newStart - 0.05) {
+            const adjEnd = Math.max(item.start_secs + 0.1, newStart - 0.05);
+            return {
+              ...item,
+              end_secs: adjEnd,
+              end_formatted: formatSrtTimestamp(adjEnd),
+            };
+          }
+          return item;
+        }
+
+        if (i === index) {
+          return {
+            ...item,
+            start_secs: newStart,
+            end_secs: newEnd,
+            start_formatted: formatSrtTimestamp(newStart),
+            end_formatted: formatSrtTimestamp(newEnd),
+          };
+        }
+
+        // Subsequent items (i > index)
+        if (rippleEdit) {
+          const cascadeStart = Math.max(0, item.start_secs + delta);
+          const cascadeEnd = Math.max(cascadeStart + 0.15, item.end_secs + delta);
+          return {
+            ...item,
+            start_secs: cascadeStart,
+            end_secs: cascadeEnd,
+            start_formatted: formatSrtTimestamp(cascadeStart),
+            end_formatted: formatSrtTimestamp(cascadeEnd),
+          };
+        }
+
+        return item;
+      });
+    });
   };
 
   // Subtitle Editing Operations
@@ -483,31 +518,90 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
   };
 
   const handleStartSecsChange = (index: number, val: number) => {
-    setSubtitles((prev) =>
-      prev.map((item, i) =>
-        i === index
-          ? {
+    const newStart = Math.max(0, val);
+    setSubtitles((prev) => {
+      const target = prev[index];
+      if (!target) return prev;
+      const delta = newStart - target.start_secs;
+      if (Math.abs(delta) < 0.001) return prev;
+
+      return prev.map((item, i) => {
+        if (i < index) {
+          if (rippleEdit && delta < 0 && i === index - 1 && item.end_secs > newStart - 0.05) {
+            const adjEnd = Math.max(item.start_secs + 0.1, newStart - 0.05);
+            return {
               ...item,
-              start_secs: Math.max(0, val),
-              start_formatted: formatSrtTimestamp(Math.max(0, val)),
-            }
-          : item
-      )
-    );
+              end_secs: adjEnd,
+              end_formatted: formatSrtTimestamp(adjEnd),
+            };
+          }
+          return item;
+        }
+
+        if (i === index) {
+          const itemEnd = rippleEdit ? Math.max(newStart + 0.15, target.end_secs + delta) : target.end_secs;
+          return {
+            ...item,
+            start_secs: newStart,
+            end_secs: itemEnd,
+            start_formatted: formatSrtTimestamp(newStart),
+            end_formatted: formatSrtTimestamp(itemEnd),
+          };
+        }
+
+        // Subsequent items (i > index)
+        if (rippleEdit) {
+          const cascadeStart = Math.max(0, item.start_secs + delta);
+          const cascadeEnd = Math.max(cascadeStart + 0.15, item.end_secs + delta);
+          return {
+            ...item,
+            start_secs: cascadeStart,
+            end_secs: cascadeEnd,
+            start_formatted: formatSrtTimestamp(cascadeStart),
+            end_formatted: formatSrtTimestamp(cascadeEnd),
+          };
+        }
+
+        return item;
+      });
+    });
   };
 
   const handleEndSecsChange = (index: number, val: number) => {
-    setSubtitles((prev) =>
-      prev.map((item, i) =>
-        i === index
-          ? {
-              ...item,
-              end_secs: Math.max(item.start_secs + 0.1, val),
-              end_formatted: formatSrtTimestamp(Math.max(item.start_secs + 0.1, val)),
-            }
-          : item
-      )
-    );
+    setSubtitles((prev) => {
+      const target = prev[index];
+      if (!target) return prev;
+      const newEnd = Math.max(target.start_secs + 0.1, val);
+      const delta = newEnd - target.end_secs;
+      if (Math.abs(delta) < 0.001) return prev;
+
+      return prev.map((item, i) => {
+        if (i < index) return item;
+
+        if (i === index) {
+          return {
+            ...item,
+            end_secs: newEnd,
+            end_formatted: formatSrtTimestamp(newEnd),
+          };
+        }
+
+        // Subsequent items (i > index)
+        if (rippleEdit) {
+          const cascadeStart = Math.max(0, item.start_secs + delta);
+          const cascadeEnd = Math.max(cascadeStart + 0.15, item.end_secs + delta);
+          return {
+            ...item,
+            start_secs: cascadeStart,
+            end_secs: cascadeEnd,
+            start_formatted: formatSrtTimestamp(cascadeStart),
+            end_formatted: formatSrtTimestamp(cascadeEnd),
+          };
+        }
+
+        return item;
+      });
+    });
   };
 
   const handleDeleteItem = (index: number) => {
@@ -1166,6 +1260,24 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
                 >
                   <Check className={`w-3 h-3 ${autoScroll ? 'text-orange-400 opacity-100' : 'opacity-0'}`} />
                   <span>자동 스크롤</span>
+                </button>
+
+                {/* Ripple Edit Toggle */}
+                <button
+                  onClick={() => setRippleEdit(!rippleEdit)}
+                  className={`px-2.5 py-1 rounded-lg text-[11px] font-medium border transition flex items-center gap-1.5 ${
+                    rippleEdit
+                      ? 'bg-emerald-950/60 border-emerald-600/50 text-emerald-300 shadow-sm'
+                      : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200'
+                  }`}
+                  title={
+                    rippleEdit
+                      ? '이후 자막 연동 ON: 하나의 자막 시간을 바꾸면 이후 모든 자막도 함께 이동합니다.'
+                      : '이후 자막 연동 OFF: 해당 자막만 독립적으로 수정합니다.'
+                  }
+                >
+                  {rippleEdit ? <Link2 className="w-3.5 h-3.5 text-emerald-400" /> : <Link2Off className="w-3.5 h-3.5 text-slate-500" />}
+                  <span>이후 자막 연동 {rippleEdit ? 'ON' : 'OFF'}</span>
                 </button>
 
                 {/* Scale to Duration / Fit Buttons */}
