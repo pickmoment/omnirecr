@@ -89,7 +89,7 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
   const [isMuted, setIsMuted] = useState<boolean>(false);
   const [highlightedIndex, setHighlightedIndex] = useState<number | null>(null);
   const [autoScroll, setAutoScroll] = useState<boolean>(true);
-  const [rippleEdit, setRippleEdit] = useState<boolean>(true);
+  const [rippleEdit, setRippleEdit] = useState<boolean>(false);
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const subtitleListRef = useRef<HTMLDivElement | null>(null);
