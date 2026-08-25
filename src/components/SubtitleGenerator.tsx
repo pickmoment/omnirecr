@@ -30,7 +30,12 @@ import type {
   SubtitleItem,
   SubtitleSplitMode,
 } from '../types';
-import { runLocalWhisperTranscribe, alignScriptWithWhisperChunks } from '../services/whisperService';
+import {
+  runLocalWhisperTranscribe,
+  alignScriptWithWhisperChunks,
+  splitScriptIntoLines,
+  resetWhisperPipeline,
+} from '../services/whisperService';
 
 interface SubtitleGeneratorProps {
   settings: Settings;
@@ -213,6 +218,9 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
       return;
     }
 
+    // Stop existing playback & timer cleanly
+    stopAudio();
+
     setErrorMsg(null);
     setIsGenerating(true);
     setAiStatusMsg(null);
@@ -225,8 +233,11 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
         setAiProgress(5);
 
         const rawSamples = await invoke<number[]>('extract_audio_pcm_16k', { path: audioPath });
-        const floatArray = new Float32Array(rawSamples);
+        if (!rawSamples || rawSamples.length === 0) {
+          throw new Error('오디오 데이터를 읽을 수 없습니다.');
+        }
 
+        const floatArray = new Float32Array(rawSamples);
         const audioDur = floatArray.length / 16000;
 
         const whisperResult = await runLocalWhisperTranscribe(
@@ -238,11 +249,12 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
           }
         );
 
-        // Split user script into lines
-        const lines = scriptText
-          .split('\n')
-          .map((l) => l.trim())
-          .filter((l) => l.length > 0);
+        // Split user script into lines according to splitMode & maxChars
+        const lines = splitScriptIntoLines(scriptText, splitMode, maxChars);
+
+        if (lines.length === 0) {
+          throw new Error('대본에서 유효한 텍스트 문장을 찾을 수 없습니다.');
+        }
 
         const alignedSubtitles = alignScriptWithWhisperChunks(lines, whisperResult.chunks, audioDur);
 
@@ -906,7 +918,10 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
                   <span className="text-[11px] text-slate-300">AI 모델 선택:</span>
                   <div className="flex items-center gap-1">
                     <button
-                      onClick={() => setWhisperModel('Xenova/whisper-tiny')}
+                      onClick={() => {
+                        resetWhisperPipeline();
+                        setWhisperModel('Xenova/whisper-tiny');
+                      }}
                       className={`px-2 py-1 rounded-lg text-[10px] font-semibold transition ${
                         whisperModel === 'Xenova/whisper-tiny'
                           ? 'bg-orange-600 text-white shadow-sm'
@@ -916,7 +931,10 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
                       Whisper Tiny (39MB • 초고속)
                     </button>
                     <button
-                      onClick={() => setWhisperModel('Xenova/whisper-base')}
+                      onClick={() => {
+                        resetWhisperPipeline();
+                        setWhisperModel('Xenova/whisper-base');
+                      }}
                       className={`px-2 py-1 rounded-lg text-[10px] font-semibold transition ${
                         whisperModel === 'Xenova/whisper-base'
                           ? 'bg-orange-600 text-white shadow-sm'

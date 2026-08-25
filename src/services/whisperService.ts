@@ -1,5 +1,5 @@
 import { pipeline, env } from '@xenova/transformers';
-import type { SubtitleItem } from '../types';
+import type { SubtitleItem, SubtitleSplitMode } from '../types';
 
 // Configure transformers.js for local/in-browser execution
 env.allowLocalModels = false;
@@ -18,8 +18,13 @@ export interface WhisperTranscribeResult {
 let transcriberInstance: any = null;
 let currentModelName: string | null = null;
 
+export function resetWhisperPipeline() {
+  transcriberInstance = null;
+  currentModelName = null;
+}
+
 /**
- * Load or reuse Whisper ASR pipeline
+ * Load or reuse Whisper ASR pipeline safely
  */
 export async function getWhisperPipeline(
   modelId: string = 'Xenova/whisper-tiny',
@@ -29,11 +34,17 @@ export async function getWhisperPipeline(
     return transcriberInstance;
   }
 
-  transcriberInstance = await pipeline('automatic-speech-recognition', modelId, {
-    progress_callback: onProgress,
-  });
-  currentModelName = modelId;
-  return transcriberInstance;
+  try {
+    transcriberInstance = await pipeline('automatic-speech-recognition', modelId, {
+      progress_callback: onProgress,
+    });
+    currentModelName = modelId;
+    return transcriberInstance;
+  } catch (err) {
+    transcriberInstance = null;
+    currentModelName = null;
+    throw err;
+  }
 }
 
 /**
@@ -46,24 +57,39 @@ export async function runLocalWhisperTranscribe(
 ): Promise<WhisperTranscribeResult> {
   onProgress?.('AI 모델을 준비하고 있습니다...', 10);
 
-  const transcriber = await getWhisperPipeline(modelId, (data) => {
-    if (data.status === 'progress' && typeof data.progress === 'number') {
-      const pct = Math.round(data.progress);
-      onProgress?.(`AI 모델 로딩 중... (${pct}%)`, 10 + Math.round(pct * 0.4));
-    } else if (data.status === 'done') {
-      onProgress?.('AI 모델 준비 완료, 음성 전사 시작...', 50);
-    }
-  });
+  let transcriber;
+  try {
+    transcriber = await getWhisperPipeline(modelId, (data) => {
+      if (data.status === 'progress' && typeof data.progress === 'number') {
+        const pct = Math.round(data.progress);
+        onProgress?.(`AI 모델 다운로드/로딩 중... (${pct}%)`, 10 + Math.round(pct * 0.4));
+      } else if (data.status === 'done') {
+        onProgress?.('AI 모델 준비 완료, 음성 전사 시작...', 50);
+      }
+    });
+  } catch (err: any) {
+    resetWhisperPipeline();
+    throw new Error(`AI 모델 로딩 실패: ${err?.message || err}`);
+  }
 
   onProgress?.('로컬 AI가 실제 음성 단어 및 타임코드를 분석 중입니다...', 60);
 
-  const output = await transcriber(audioPcm, {
-    return_timestamps: true,
-    chunk_length_s: 30,
-    stride_length_s: 5,
-    language: 'korean',
-    task: 'transcribe',
-  });
+  // Clone or ensure clean float buffer slice to avoid WASM memory detachment issues on re-run
+  const cleanPcm = new Float32Array(audioPcm);
+
+  let output;
+  try {
+    output = await transcriber(cleanPcm, {
+      return_timestamps: true,
+      chunk_length_s: 30,
+      stride_length_s: 5,
+      language: 'korean',
+      task: 'transcribe',
+    });
+  } catch (err: any) {
+    resetWhisperPipeline();
+    throw new Error(`Whisper 음성 분석 중 오류 발생: ${err?.message || err}`);
+  }
 
   onProgress?.('음성 분석 완료! 대본과 정밀 정렬 중...', 95);
 
@@ -82,9 +108,68 @@ export async function runLocalWhisperTranscribe(
   }
 
   return {
-    text: output.text || '',
+    text: output?.text || '',
     chunks,
   };
+}
+
+/**
+ * Split script into sentences or chunks according to user split mode
+ */
+export function splitScriptIntoLines(
+  rawText: string,
+  mode: SubtitleSplitMode = 'auto',
+  maxChars: number = 28
+): string[] {
+  const lrcRegex = /\[\d{1,2}:\d{2}(?:\.\d+)?\]/g;
+  const cleanRaw = rawText.replace(lrcRegex, '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  const rawLines = cleanRaw.split('\n').map((l) => l.trim()).filter((l) => l.length > 0);
+
+  const results: string[] = [];
+
+  for (const line of rawLines) {
+    if (mode === 'line') {
+      results.push(line);
+      continue;
+    }
+
+    // Sentence splitting by punctuation (. ? ! … 。)
+    const sentences: string[] = [];
+    let cur = '';
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      cur += ch;
+      if (ch === '.' || ch === '?' || ch === '!' || ch === '…' || ch === '。') {
+        const nextIsSpace = i + 1 >= line.length || /\s/.test(line[i + 1]);
+        if (nextIsSpace) {
+          if (cur.trim()) sentences.push(cur.trim());
+          cur = '';
+        }
+      }
+    }
+    if (cur.trim()) sentences.push(cur.trim());
+
+    for (const s of sentences) {
+      if (mode === 'sentence' || (mode === 'auto' && s.length <= maxChars)) {
+        results.push(s);
+      } else {
+        // Length chunking
+        const words = s.split(/\s+/);
+        let chunk = '';
+        for (const w of words) {
+          if (chunk.length + w.length + 1 > maxChars && chunk.length > 0) {
+            results.push(chunk.trim());
+            chunk = w;
+          } else {
+            chunk += (chunk ? ' ' : '') + w;
+          }
+        }
+        if (chunk.trim()) results.push(chunk.trim());
+      }
+    }
+  }
+
+  return results.filter((r) => r.length > 0);
 }
 
 /**
@@ -119,7 +204,7 @@ export function alignScriptWithWhisperChunks(
   for (const chunk of chunks) {
     const words = chunk.text.split(/\s+/).filter((w) => w.length > 0);
     if (words.length === 0) continue;
-    const chunkDur = chunk.timestamp[1] - chunk.timestamp[0];
+    const chunkDur = Math.max(0.1, chunk.timestamp[1] - chunk.timestamp[0]);
     const wordDur = chunkDur / words.length;
 
     words.forEach((w, i) => {
