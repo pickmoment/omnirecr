@@ -76,6 +76,25 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const subtitleListRef = useRef<HTMLDivElement | null>(null);
   const activeItemRef = useRef<HTMLDivElement | null>(null);
+  const segmentTimerRef = useRef<number | null>(null);
+
+  // Global Spacebar shortcut for Play / Pause
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      const tag = (e.target as HTMLElement)?.tagName?.toLowerCase();
+      if (tag === 'input' || tag === 'textarea') {
+        return;
+      }
+
+      if (e.code === 'Space') {
+        e.preventDefault();
+        togglePlay();
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [isPlaying]);
 
   // Sync initialAudioPath prop
   useEffect(() => {
@@ -268,6 +287,10 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
 
   const togglePlay = () => {
     if (!audioRef.current) return;
+    if (segmentTimerRef.current) {
+      clearTimeout(segmentTimerRef.current);
+      segmentTimerRef.current = null;
+    }
     if (isPlaying) {
       audioRef.current.pause();
       setIsPlaying(false);
@@ -277,20 +300,44 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
     }
   };
 
-  const playSegment = (start: number, end: number) => {
-    if (!audioRef.current) return;
-    audioRef.current.currentTime = start;
-    audioRef.current.play().catch(console.error);
-    setIsPlaying(true);
+  const stopAudio = () => {
+    if (segmentTimerRef.current) {
+      clearTimeout(segmentTimerRef.current);
+      segmentTimerRef.current = null;
+    }
+    if (audioRef.current) {
+      audioRef.current.pause();
+    }
+    setIsPlaying(false);
+  };
 
-    // Auto pause at end
-    const durationToPlay = (end - start) * 1000;
-    setTimeout(() => {
-      if (audioRef.current && Math.abs(audioRef.current.currentTime - end) < 0.3) {
-        audioRef.current.pause();
-        setIsPlaying(false);
+  const handleToggleSubPlay = (sub: SubtitleItem) => {
+    if (!audioRef.current) return;
+
+    const isThisSubPlaying = isPlaying && highlightedIndex === sub.index - 1;
+
+    if (isThisSubPlaying) {
+      stopAudio();
+    } else {
+      if (segmentTimerRef.current) {
+        clearTimeout(segmentTimerRef.current);
+        segmentTimerRef.current = null;
       }
-    }, durationToPlay);
+
+      audioRef.current.currentTime = Math.max(0, sub.start_secs - 0.05);
+      audioRef.current
+        .play()
+        .then(() => setIsPlaying(true))
+        .catch(console.error);
+
+      const durMs = Math.max(0.3, sub.end_secs - sub.start_secs + 0.1) * 1000;
+      segmentTimerRef.current = window.setTimeout(() => {
+        if (audioRef.current) {
+          audioRef.current.pause();
+          setIsPlaying(false);
+        }
+      }, durMs);
+    }
   };
 
   // Snap currently playing audio position to start / end of specific subtitle
@@ -825,18 +872,37 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
           <div className="bg-slate-900/90 border border-slate-800 rounded-2xl p-5 space-y-4 shadow-2xl animate-fadeIn">
             {/* Editor Top Bar */}
             <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 pb-3 border-b border-slate-800">
-              <div className="flex items-center gap-3">
+              <div className="flex items-center gap-3 flex-wrap">
                 <div className="flex items-center gap-2">
                   <FileCheck className="w-5 h-5 text-emerald-400" />
                   <h3 className="text-sm font-bold text-white">생성된 자막 목록 ({subtitles.length}개)</h3>
                 </div>
+
+                {/* Quick Master Play/Pause in Header */}
+                {audioBlobUrl && (
+                  <button
+                    onClick={togglePlay}
+                    className={`px-2.5 py-1 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition ${
+                      isPlaying
+                        ? 'bg-orange-600 text-white shadow-md shadow-orange-600/30'
+                        : 'bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700'
+                    }`}
+                  >
+                    {isPlaying ? <Pause className="w-3.5 h-3.5" /> : <Play className="w-3.5 h-3.5" />}
+                    <span>{isPlaying ? '일시정지 (Space)' : '전체 재생 (Space)'}</span>
+                    <span className="font-mono text-[10px] text-orange-300 ml-1">
+                      {formatSecs(currentTime)}
+                    </span>
+                  </button>
+                )}
+
                 {generateResult && (
                   <span className="text-[11px] px-2 py-0.5 rounded bg-emerald-950/60 text-emerald-400 border border-emerald-800/60 font-medium">
                     총 {formatSecs(generateResult.total_duration)} / {generateResult.speech_segments_detected}개 구간 감지
                   </span>
                 )}
-                <span className="text-[10px] text-slate-400 bg-slate-800/80 px-2 py-0.5 rounded border border-slate-700/60 hidden lg:inline-block">
-                  💡 팁: 재생 중 [시작] / [종료] 버튼으로 현재 음성에 맞춰 1초 만에 싱크 조정 가능
+                <span className="text-[10px] text-slate-400 bg-slate-800/80 px-2 py-0.5 rounded border border-slate-700/60 hidden xl:inline-block">
+                  💡 Space: 재생/정지 | [ / ]: 시작/종료 스냅
                 </span>
               </div>
 
@@ -911,13 +977,21 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
                       #{sub.index}
                     </div>
 
-                    {/* Play Segment Button */}
+                    {/* Play / Pause Segment Button */}
                     <button
-                      onClick={() => playSegment(sub.start_secs, sub.end_secs)}
-                      title="이 구간만 재생"
-                      className="w-7 h-7 rounded-lg bg-slate-800 hover:bg-orange-600 text-slate-300 hover:text-white flex items-center justify-center shrink-0 transition"
+                      onClick={() => handleToggleSubPlay(sub)}
+                      title={isHighlight && isPlaying ? '재생 멈춤 (Space)' : '이 구간 재생 (Space)'}
+                      className={`w-7 h-7 rounded-lg flex items-center justify-center shrink-0 transition ${
+                        isHighlight && isPlaying
+                          ? 'bg-orange-600 text-white shadow-md shadow-orange-600/40 animate-pulse'
+                          : 'bg-slate-800 hover:bg-orange-600 text-slate-300 hover:text-white'
+                      }`}
                     >
-                      <Play className="w-3.5 h-3.5 translate-x-0.5" />
+                      {isHighlight && isPlaying ? (
+                        <Pause className="w-3.5 h-3.5" />
+                      ) : (
+                        <Play className="w-3.5 h-3.5 translate-x-0.5" />
+                      )}
                     </button>
 
                     {/* Timestamps */}
