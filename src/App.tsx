@@ -17,6 +17,7 @@ import { AudioRecorder } from './components/AudioRecorder';
 import { HistoryList } from './components/HistoryList';
 import { MediaJoiner } from './components/MediaJoiner';
 import { AudioConverter } from './components/AudioConverter';
+import { SubtitleGenerator } from './components/SubtitleGenerator';
 import { SettingsModal } from './components/SettingsModal';
 import { SettingsView } from './components/SettingsView';
 import { SelectionOverlay } from './components/SelectionOverlay';
@@ -73,6 +74,7 @@ export const App: React.FC = () => {
 
   const [joinerInitialFiles, setJoinerInitialFiles] = useState<string[]>([]);
   const [converterInitialFiles, setConverterInitialFiles] = useState<string[]>([]);
+  const [subtitleInitialAudio, setSubtitleInitialAudio] = useState<string | null>(null);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [ffmpegDetected, setFfmpegDetected] = useState(false);
 
@@ -265,6 +267,11 @@ export const App: React.FC = () => {
     setCurrentTab('converter');
   };
 
+  const handleSendToSubtitle = (audioPath: string) => {
+    setSubtitleInitialAudio(audioPath);
+    setCurrentTab('subtitle');
+  };
+
   const handleOpenSelectionOverlay = async () => {
     try {
       await invoke('show_selection_overlay');
@@ -298,7 +305,7 @@ export const App: React.FC = () => {
       />
 
       {/* Main Tab Content */}
-      <main className="flex-1 overflow-hidden relative">
+      <main className="flex-1 min-h-0 overflow-y-auto relative">
         {currentTab === 'screen' && (
           <ScreenRecorder
             settings={settings}
@@ -336,6 +343,7 @@ export const App: React.FC = () => {
             onOpenDefaultPlayer={handleOpenDefaultPlayer}
             onSendToMerger={handleSendToMerger}
             onSendToConverter={handleSendToConverter}
+            onSendToSubtitle={handleSendToSubtitle}
           />
         )}
 
@@ -358,6 +366,15 @@ export const App: React.FC = () => {
               refreshHistory();
               setCurrentTab('history');
             }}
+            onSendToSubtitle={handleSendToSubtitle}
+          />
+        )}
+
+        {currentTab === 'subtitle' && (
+          <SubtitleGenerator
+            settings={settings}
+            initialAudioPath={subtitleInitialAudio}
+            onOpenExplorer={handleOpenExplorer}
           />
         )}
 

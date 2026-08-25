@@ -62,7 +62,7 @@ export const AudioRecorder: React.FC<AudioRecorderProps> = ({
   };
 
   return (
-    <div className="h-full flex flex-col p-6 space-y-5 overflow-y-auto max-w-5xl mx-auto">
+    <div className="min-h-full flex flex-col p-6 space-y-5 max-w-5xl mx-auto pb-10">
       {/* Audio Recording Profile Card */}
       <div className="bg-slate-900/80 border border-slate-800 rounded-2xl p-5 shadow-lg space-y-3">
         <div className="flex items-center justify-between">

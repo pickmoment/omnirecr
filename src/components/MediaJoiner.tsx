@@ -214,7 +214,7 @@ export const MediaJoiner: React.FC<MediaJoinerProps> = ({
   };
 
   return (
-    <div className="h-full flex flex-col p-6 space-y-5 max-w-5xl mx-auto overflow-hidden">
+    <div className="min-h-full flex flex-col p-6 space-y-5 max-w-5xl mx-auto">
       {/* Top Banner & Mode Detection */}
       <div className="bg-slate-900/80 border border-slate-800 rounded-2xl p-5 shadow-lg shrink-0 space-y-3">
         <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">

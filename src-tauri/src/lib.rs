@@ -5,6 +5,7 @@ pub mod history;
 pub mod merger;
 pub mod recorder;
 pub mod settings;
+pub mod subtitle;
 pub mod types;
 
 use std::sync::Arc;
@@ -54,6 +55,7 @@ pub fn run() {
             commands::get_recording_status,
             commands::list_history_files,
             commands::delete_history_file,
+            commands::rename_history_file,
             commands::read_audio_file,
             commands::open_in_explorer,
             commands::open_with_default_player,
@@ -65,6 +67,9 @@ pub fn run() {
             commands::show_selection_overlay,
             commands::hide_selection_overlay,
             commands::confirm_selection_region,
+            commands::generate_subtitles,
+            commands::save_subtitle_file,
+            commands::read_script_file,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -28,7 +28,7 @@ export interface Settings {
   custom_ffmpeg_path?: string | null;
 }
 
-export type TabType = 'screen' | 'audio' | 'converter' | 'history' | 'merger' | 'settings';
+export type TabType = 'screen' | 'audio' | 'subtitle' | 'converter' | 'history' | 'merger' | 'settings';
 
 export interface RecordingStatus {
   status: 'idle' | 'recording' | 'paused' | 'stopping';
@@ -117,3 +117,39 @@ export interface AudioConvertProgressPayload {
   finished: boolean;
   error?: string | null;
 }
+
+export interface SubtitleItem {
+  index: number;
+  start_secs: number;
+  end_secs: number;
+  start_formatted: string;
+  end_formatted: string;
+  text: string;
+}
+
+export type SubtitleSplitMode = 'auto' | 'sentence' | 'line' | 'length';
+
+export interface SubtitleGenerateTask {
+  audio_path: string;
+  script_text: string;
+  split_mode: SubtitleSplitMode;
+  max_chars: number;
+  min_silence_duration_secs?: number;
+  silence_threshold_db?: number;
+  start_offset_secs?: number;
+  end_margin_secs?: number;
+  auto_save: boolean;
+  output_dir?: string | null;
+}
+
+export interface SubtitleGenerateResult {
+  subtitles: SubtitleItem[];
+  srt_content: string;
+  vtt_content: string;
+  srt_path?: string | null;
+  vtt_path?: string | null;
+  total_duration: number;
+  speech_segments_detected: number;
+  script_lines_count: number;
+}
+

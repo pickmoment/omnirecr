@@ -1,5 +1,5 @@
 import React from 'react';
-import { Video, Mic, FolderOpen, Merge, RefreshCw, Settings as SettingsIcon, Activity, CheckCircle, AlertTriangle } from 'lucide-react';
+import { Video, Mic, FolderOpen, Merge, RefreshCw, Settings as SettingsIcon, Activity, CheckCircle, AlertTriangle, FileText } from 'lucide-react';
 import type { TabType, RecordingStatus } from '../types';
 
 interface NavbarProps {
@@ -107,7 +107,19 @@ export const Navbar: React.FC<NavbarProps> = ({
           }`}
         >
           <RefreshCw className="w-4 h-4" />
-          <span>오디오 변환 (WAV)</span>
+          <span>오디오 변환</span>
+        </button>
+
+        <button
+          onClick={() => onSelectTab('subtitle')}
+          className={`flex items-center gap-2 px-3.5 py-2 rounded-lg text-xs font-semibold transition-all duration-200 ${
+            currentTab === 'subtitle'
+              ? 'bg-amber-600 text-white shadow-md shadow-amber-600/30'
+              : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/50'
+          }`}
+        >
+          <FileText className="w-4 h-4" />
+          <span>자막 생성기</span>
         </button>
 
         <button

@@ -13,7 +13,8 @@
 ┌────────────────────────────────────────────────────────────────────────┐
 │                        React 19 Frontend (Vite)                        │
 │  - ScreenRecorder  - AudioRecorder  - MediaJoiner  - AudioConverter    │
-│  - HistoryList     - SettingsView   - MiniController- SelectionOverlay │
+│  - SubtitleGen     - HistoryList    - SettingsView - MiniController   │
+│  - SelectionOverlay                                                   │
 └───────────────────────────────────┬────────────────────────────────────┘
                                     │ Tauri 2 IPC (invoke & events)
 ┌───────────────────────────────────▼────────────────────────────────────┐
@@ -66,14 +67,20 @@
 - `merge_media_files(task: MergeTaskPayload)` ➔ `Result<String, String>`
 - `cancel_merge()` ➔ `Result<(), String>`
 
-### 5. History & Files
+### 5. Subtitle Generator (Script-to-Sub)
+- `generate_subtitles(task: SubtitleGenerateTask)` ➔ `Result<SubtitleGenerateResult, String>`
+- `save_subtitle_file(path: String, content: String)` ➔ `Result<(), String>`
+- `read_script_file(path: String)` ➔ `Result<String, String>`
+
+### 6. History & Files
 - `list_history_files()` ➔ `Vec<HistoryItem>`
 - `delete_history_file(path: String)` ➔ `Result<(), String>`
+- `rename_history_file(old_path: String, new_name: String)` ➔ `Result<String, String>`
 - `read_audio_file(path: String)` ➔ `Result<Vec<u8>, String>`
 - `open_in_explorer(path: String)` ➔ `Result<(), String>`
 - `open_with_default_player(path: String)` ➔ `Result<(), String>`
 
-### 6. Window & Overlay Controls
+### 7. Window & Overlay Controls
 - `show_selection_overlay()` ➔ `Result<(), String>`
 - `hide_selection_overlay()` ➔ `Result<(), String>`
 - `confirm_selection_region(region: RectRegion)` ➔ `Result<(), String>`

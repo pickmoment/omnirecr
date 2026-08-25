@@ -83,7 +83,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   };
 
   return (
-    <div className="h-full flex flex-col p-6 space-y-6 overflow-y-auto max-w-5xl mx-auto">
+    <div className="min-h-full flex flex-col p-6 space-y-6 max-w-5xl mx-auto pb-10">
       {/* Header Banner */}
       <div className="bg-slate-900/80 border border-slate-800 rounded-2xl p-5 shadow-lg flex items-center justify-between">
         <div className="flex items-center gap-3.5">

@@ -174,3 +174,40 @@ pub struct AudioConvertProgressPayload {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubtitleItem {
+    pub index: usize,
+    pub start_secs: f64,
+    pub end_secs: f64,
+    pub start_formatted: String,
+    pub end_formatted: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubtitleGenerateTask {
+    pub audio_path: String,
+    pub script_text: String,
+    pub split_mode: String, // "auto" | "line" | "sentence" | "length"
+    pub max_chars: usize,
+    pub min_silence_duration_secs: Option<f64>,
+    pub silence_threshold_db: Option<f64>,
+    pub start_offset_secs: Option<f64>,
+    pub end_margin_secs: Option<f64>,
+    pub auto_save: bool,
+    pub output_dir: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubtitleGenerateResult {
+    pub subtitles: Vec<SubtitleItem>,
+    pub srt_content: String,
+    pub vtt_content: String,
+    pub srt_path: Option<String>,
+    pub vtt_path: Option<String>,
+    pub total_duration: f64,
+    pub speech_segments_detected: usize,
+    pub script_lines_count: usize,
+}
+
+

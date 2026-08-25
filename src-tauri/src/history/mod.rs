@@ -98,6 +98,49 @@ impl HistoryManager {
         Ok(())
     }
 
+    pub fn rename_file(old_path_str: &str, new_name_str: &str) -> Result<String, String> {
+        let old_path = Path::new(old_path_str);
+        if !old_path.exists() {
+            return Err("원본 파일을 찾을 수 없습니다.".to_string());
+        }
+
+        let parent_dir = old_path.parent().ok_or("상위 폴더를 찾을 수 없습니다.")?;
+        let old_ext = old_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+
+        // Trim new name and sanitize
+        let new_name_clean = new_name_str.trim();
+        if new_name_clean.is_empty() {
+            return Err("새 파일명을 입력해 주세요.".to_string());
+        }
+
+        // Check invalid characters
+        let invalid_chars = ['\\', '/', ':', '*', '?', '"', '<', '>', '|'];
+        if new_name_clean.chars().any(|c| invalid_chars.contains(&c)) {
+            return Err("파일명에 사용할 수 없는 특수문자(\\ / : * ? \" < > |)가 포함되어 있습니다.".to_string());
+        }
+
+        // If new_name doesn't have the original extension, append it
+        let target_file_name = if !old_ext.is_empty() && !new_name_clean.to_lowercase().ends_with(&format!(".{}", old_ext.to_lowercase())) {
+            format!("{}.{}", new_name_clean, old_ext)
+        } else {
+            new_name_clean.to_string()
+        };
+
+        let new_path = parent_dir.join(&target_file_name);
+
+        if new_path == old_path {
+            return Ok(old_path_str.to_string());
+        }
+
+        if new_path.exists() {
+            return Err(format!("'{}' 파일이 이미 존재합니다.", target_file_name));
+        }
+
+        fs::rename(old_path, &new_path).map_err(|e| format!("파일명 변경 실패: {}", e))?;
+
+        Ok(new_path.to_string_lossy().to_string())
+    }
+
     pub fn open_in_explorer(path_str: &str) -> Result<(), String> {
         let p = Path::new(path_str);
         if !p.exists() {

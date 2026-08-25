@@ -6,8 +6,10 @@ use crate::history::HistoryManager;
 use crate::merger::MergerController;
 use crate::recorder::RecorderController;
 use crate::settings::SettingsManager;
+use crate::subtitle::SubtitleController;
 use crate::types::{
-    AudioConvertTaskPayload, HistoryItem, MediaProbeInfo, MergeTaskPayload, RecordingStateStatus, RecordingStatus, RectRegion, Settings,
+    AudioConvertTaskPayload, HistoryItem, MediaProbeInfo, MergeTaskPayload, RecordingStateStatus,
+    RecordingStatus, RectRegion, Settings, SubtitleGenerateResult, SubtitleGenerateTask,
 };
 
 pub struct AppState {
@@ -124,6 +126,11 @@ pub fn list_history_files() -> Vec<HistoryItem> {
 #[tauri::command]
 pub fn delete_history_file(path: String) -> Result<(), String> {
     HistoryManager::delete_file(&path)
+}
+
+#[tauri::command]
+pub fn rename_history_file(old_path: String, new_name: String) -> Result<String, String> {
+    HistoryManager::rename_file(&old_path, &new_name)
 }
 
 #[tauri::command]
@@ -247,3 +254,28 @@ pub fn confirm_selection_region(app: AppHandle, region: RectRegion) -> Result<()
     let _ = app.emit("region_selected", &region);
     Ok(())
 }
+
+#[tauri::command]
+pub async fn generate_subtitles(
+    task: SubtitleGenerateTask,
+) -> Result<SubtitleGenerateResult, String> {
+    let settings = SettingsManager::load();
+    let custom_path = settings.custom_ffmpeg_path.clone();
+
+    tokio::task::spawn_blocking(move || {
+        SubtitleController::generate(task, custom_path)
+    })
+    .await
+    .map_err(|e| format!("자막 생성 작업 실행 오류: {}", e))?
+}
+
+#[tauri::command]
+pub fn save_subtitle_file(path: String, content: String) -> Result<(), String> {
+    SubtitleController::save_subtitle_file(&path, &content)
+}
+
+#[tauri::command]
+pub fn read_script_file(path: String) -> Result<String, String> {
+    SubtitleController::read_script_file(&path)
+}
+

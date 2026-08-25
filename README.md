@@ -1,7 +1,7 @@
-# 🎙️ OmniRec Studio (옴니렉 스튜디오)
+# 🎬 OmniRec Studio (옴니렉 스튜디오)
 
-> **All-in-One Screen & Audio Recorder, Media Joiner & Audio Converter**  
-> 크로스플랫폼(Windows / macOS / Linux) 화면 녹화, 스튜디오급 오디오 녹음, 초고속 무손실 미디어 병합 및 WAV 포맷 변환을 제공하는 데스크톱 미디어 스튜디오입니다.
+> **All-in-One Screen & Audio Recorder, Subtitle Generator, Media Joiner & Audio Converter**  
+> 크로스플랫폼(Windows / macOS / Linux) 화면 녹화, 스튜디오급 오디오 녹음, 대본 기반 자막(SRT/VTT) 생성, 초고속 무손실 미디어 병합 및 WAV 포맷 변환을 제공하는 데스크톱 올인원 미디어 스튜디오입니다.
 
 [![Tauri](https://img.shields.io/badge/Tauri-v2.0-24C8D8?logo=tauri&logoColor=white)](https://tauri.app/)
 [![Rust](https://img.shields.io/badge/Rust-1.77%2B-DEA584?logo=rust&logoColor=white)](https://www.rust-lang.org/)
@@ -20,7 +20,7 @@
 - **플로팅 미니 컨트롤러 (Mini Controller)**: 녹화 시작 시 메인 창이 자동으로 최소화되고 컴팩트한 상단 플로팅 컨트롤러로 전환
 - **글로벌 단축키 지원**: 백그라운드에서도 작동하는 글로벌 핫키 (`F9`/`Ctrl+Shift+R`: 종료 및 저장, `F10`/`Ctrl+Shift+P`: 일시정지/재개)
 
-### 2. 🎧 스튜디오급 오디오 녹음 (Audio Recording Studio)
+### 2. 🎙️ 스튜디오급 오디오 녹음 (Audio Recording Studio)
 - **동시 믹싱 (Dual Channel Mixing)**: 시스템 사운드(WASAPI / CoreAudio)와 마이크 입력을 독립 볼륨 게인(0%~200%)으로 실시간 믹싱
 - **실시간 DSP 오디오 필터**:
   - **스마트 노이즈 게이트 (Noise Gate)**: 미세 팬 소음 및 화이트 노이즈 자동 차단 (-60dB ~ -20dB 임계값 조절)
@@ -29,7 +29,18 @@
   - **알림음 자동 차단**: 녹화/녹음 중 시스템 팝업 및 경고 알림음 자동 음소거 및 복구
 - **다양한 오디오 포맷 지원**: 무손실 `WAV` (16-bit PCM), 고음질 `M4A (AAC)`, 범용 `MP3`
 
-### 3. 🔄 WAV 오디오 포맷 변환기 (Audio Converter)
+### 3. 📝 대본 기반 자막 생성기 (Subtitle Generator / Script-to-Sub)
+- **대본과 음성 파일 결합**: 텍스트 대본(.txt, .md 등)과 음성/동영상 파일을 입력받아 정확한 타임스탬프의 자막(SRT/VTT)을 자동 생성
+- **FFmpeg 묵음 감지 & 발화 구간 분석**: `silencedetect` 필터를 통해 실제 음성 구간과 묵음 구간을 정밀 추출
+- **스마트 음성-대본 정렬 알고리즘**: 한글/영문/기호 음절 가중치 기반으로 대본을 발화 세그먼트에 지능적으로 매핑
+- **인터랙티브 자막 에디터**:
+  - 각 자막의 시작/종료 시간 및 자막 내용 인라인 편집
+  - 개별 구간 단독 즉시 재생 (`▶`) 및 행 추가/삭제
+  - 오디오 재생 시 현재 발화 자막 **실시간 하이라이트 동기화**
+  - 전체 자막 타임시프트 일괄 조정 (`-0.5s`, `-0.1s`, `+0.1s`, `+0.5s`) 및 검색 기능
+- **표준 포맷 내보내기 & 복사**: `.srt` / `.vtt` 파일 저장 및 클립보드 원클릭 복사
+
+### 4. 🔄 WAV 오디오 포맷 변환기 (Audio Converter)
 - **WAV ➔ MP3 / M4A 변환**: WAV 무손실 음원을 고음질 MP3(`libmp3lame`) 또는 고효율 M4A(`aac`)로 일괄/개별 변환
 - **세부 인코딩 설정**:
   - 오디오 비트레이트: `128 kbps`, `192 kbps`, `256 kbps (추천)`, `320 kbps (최고 음질)`
@@ -37,18 +48,20 @@
   - 오디오 채널: `원본 유지`, `Stereo (2ch)`, `Mono (1ch)`
   - 저장 위치: `원본 폴더 동일 위치`, `기본 저장 폴더`, `사용자 정의 폴더`
 - **실시간 진행률 및 속도 표시**: FFmpeg 파이프 연동을 통한 퍼센트(%), 현재 변환 파일, 배속(Speed, 예: 15.2x) 표시 및 즉시 재생/폴더 열기 지원
+- **자막 생성기 바로가기**: 변환 완료된 결과 파일을 클릭 한 번으로 자막 생성기로 전송
 
-### 4. 🔗 미디어 파일 연결 & 병합 (Media Joiner)
+### 5. 🧩 미디어 파일 연결 & 병합 (Media Joiner)
 - **무손실 직접 복사 (Direct Stream Copy Concat)**: 동일 코덱 및 규격의 동영상/오디오 파일들을 재인코딩 없이 0.1초 만에 무손실 병합
 - **스마트 리인코딩 병합**: 규격이 다른 파일들도 해상도/샘플레이트 자동 일치화 후 하나의 MP4/M4A/MP3 파일로 결합
 - **드래그 & 드롭 순서 변경**: 파일 순서 상하 이동 및 실시간 메타데이터(ffprobe) 분석
 
-### 5. 📂 히스토리 & 인앱 플레이어 (History & File Manager)
+### 6. 📁 히스토리 & 파일 관리자 (History & File Manager)
 - **녹화/녹음 목록 관리**: 파일별 해상도, 재생 시간, 파일 크기, 생성 일시 확인
+- **인라인 파일명 변경 (Rename)**: 히스토리 목록에서 연필 버튼 또는 Enter/Esc 키로 파일명을 즉시 변경
 - **인앱 오디오 미리듣기**: 별도 프로그램 실행 없이 즉시 파형 기반 오디오 재생/일시정지
-- **원클릭 빠른 연동**: 히스토리 파일들을 변환기(Audio Converter) 또는 병합기(Media Joiner)로 바로 전송
+- **원클릭 빠른 연동**: 히스토리 파일들을 자막 생성기, 변환기(Audio Converter) 또는 병합기(Media Joiner)로 바로 전송
 
-### 6. 🌐 크로스플랫폼 지원 (Cross-Platform)
+### 7. 🌐 크로스플랫폼 지원 (Cross-Platform)
 - **Windows**: WASAPI Loopback, GDI Grab (`gdigrab`), Windows Explorer 연동
 - **macOS**: CoreAudio, AVFoundation (`avfoundation`), Finder 연동, Apple Silicon & Intel Homebrew FFmpeg 자동 감지
 - **Linux**: PulseAudio/ALSA, X11 Grab (`x11grab`)
@@ -63,12 +76,12 @@
 | **Frontend** | React 19, TypeScript, Vite, Tailwind CSS |
 | **Icons & UI** | Lucide React |
 | **Audio Capture & DSP** | [cpal](https://github.com/RustAudio/cpal), Custom IIR Biquad Filter, Noise Gate, Stereo Linear Resampler |
-| **Media Processing** | FFmpeg, FFprobe (Process Pipe Streaming) |
+| **Media Processing** | FFmpeg, FFprobe (Process Pipe Streaming, silencedetect) |
 | **Cross-Platform Bridge** | `tauri-plugin-dialog`, `tauri-plugin-fs`, `tauri-plugin-opener`, `tauri-plugin-shell` |
 
 ---
 
-## 📦 시스템 요구 사항 및 설치 (Prerequisites)
+## 📋 시스템 요구 사항 및 설치 (Prerequisites)
 
 ### 1. 필수 의존성
 - **Node.js**: `v18.0.0` 이상
@@ -100,7 +113,7 @@ npm run tauri build
 
 ---
 
-## 📁 프로젝트 구조 (Project Architecture)
+## 📂 프로젝트 구조 (Project Architecture)
 
 ```
 omnirecr/
@@ -109,14 +122,15 @@ omnirecr/
 │   │   ├── AudioConverter.tsx    # WAV ➔ MP3/M4A 오디오 포맷 변환기
 │   │   ├── AudioRecorder.tsx     # 고음질 오디오 녹음기 UI & DSP 상태
 │   │   ├── AudioVisualizer.tsx   # 실시간 스테레오 VU 미터 시각화
-│   │   ├── HistoryList.tsx       # 녹화/녹음 히스토리 및 인앱 오디오 플레이어
+│   │   ├── HistoryList.tsx       # 녹화/녹음 히스토리 및 인라인 이름 변경 & 플레이어
 │   │   ├── MediaJoiner.tsx       # 동영상/오디오 무손실 및 리인코딩 병합기
 │   │   ├── MiniController.tsx    # 화면 녹화 시 상단 플로팅 미니바
 │   │   ├── Navbar.tsx            # 통합 내비게이션 바
 │   │   ├── ScreenRecorder.tsx    # 전체/영역 화면 녹화 인터페이스
 │   │   ├── SelectionOverlay.tsx  # 투명 전체화면 영역 드래그 오버레이
 │   │   ├── SettingsModal.tsx     # 팝업 환경 설정 모달
-│   │   └── SettingsView.tsx      # 풀페이지 환경 설정 탭
+│   │   ├── SettingsView.tsx      # 풀페이지 환경 설정 탭
+│   │   └── SubtitleGenerator.tsx # 대본-음성 결합 자막 생성 및 실시간 에디터
 │   ├── App.tsx                   # 메인 라우팅 & 이벤트 통합 관리
 │   └── types.ts                  # 데이터 타입 정의
 │
@@ -127,10 +141,11 @@ omnirecr/
 │   │   │   ├── engine.rs         # 시스템 루프백 & 마이크 스트림 믹서
 │   │   │   └── notifications.rs  # OS 알림음 제어
 │   │   ├── converter/            # FFmpeg 오디오 포맷 변환 컨트롤러
-│   │   ├── history/              # 파일 시스템 히스토리 및 OS 쉘 연동
+│   │   ├── history/              # 파일 시스템 히스토리, 이름 변경 및 OS 쉘 연동
 │   │   ├── merger/               # FFmpeg 무손실 및 Concat 병합 컨트롤러
 │   │   ├── recorder/             # 화면/오디오 녹화 세션 관리 (gdigrab/avfoundation)
 │   │   ├── settings/             # 설정 파일 입출력 및 FFmpeg/FFprobe 자동 탐색
+│   │   ├── subtitle/             # 대본-음성 정렬 및 SRT/VTT 자막 생성 엔진
 │   │   ├── commands.rs           # Tauri IPC 커맨드 핸들러
 │   │   ├── lib.rs                # 앱 초기화, 플러그인, 핫키 핸들러
 │   │   └── types.rs              # Rust 데이터 모델
@@ -141,6 +156,6 @@ omnirecr/
 
 ---
 
-## 📜 라이선스 (License)
+## 📄 라이선스 (License)
 
 이 프로젝트는 [MIT License](LICENSE)에 따라 배포됩니다.

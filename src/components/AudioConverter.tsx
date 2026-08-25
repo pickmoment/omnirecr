@@ -15,6 +15,7 @@ import {
   Music2,
   Check,
   Loader2,
+  FileText,
 } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
@@ -32,6 +33,7 @@ interface AudioConverterProps {
   onOpenExplorer: (path: string) => Promise<void>;
   onOpenDefaultPlayer: (path: string) => Promise<void>;
   onNavigateToHistory: () => void;
+  onSendToSubtitle?: (audioPath: string) => void;
 }
 
 export const AudioConverter: React.FC<AudioConverterProps> = ({
@@ -40,6 +42,7 @@ export const AudioConverter: React.FC<AudioConverterProps> = ({
   onOpenExplorer,
   onOpenDefaultPlayer,
   onNavigateToHistory,
+  onSendToSubtitle,
 }) => {
   const [filePaths, setFilePaths] = useState<string[]>(initialFiles);
   const [probes, setProbes] = useState<MediaProbeInfo[]>([]);
@@ -213,7 +216,7 @@ export const AudioConverter: React.FC<AudioConverterProps> = ({
   };
 
   return (
-    <div className="h-full flex flex-col p-6 space-y-6 overflow-y-auto max-w-5xl mx-auto">
+    <div className="min-h-full flex flex-col p-6 space-y-6 max-w-5xl mx-auto pb-10">
       {/* Header Banner */}
       <div className="bg-slate-900/80 border border-slate-800 rounded-2xl p-5 shadow-lg flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
         <div className="flex items-center gap-3.5">
@@ -666,6 +669,16 @@ export const AudioConverter: React.FC<AudioConverterProps> = ({
                   </div>
 
                   <div className="flex items-center gap-2 shrink-0">
+                    {onSendToSubtitle && (
+                      <button
+                        onClick={() => onSendToSubtitle(cPath)}
+                        className="flex items-center gap-1 px-2.5 py-1 rounded-lg bg-orange-950/60 border border-orange-700/50 hover:bg-orange-900/60 text-orange-300 text-xs font-medium transition"
+                        title="자막 생성기로 보내기"
+                      >
+                        <FileText className="w-3 h-3 text-orange-400" />
+                        <span>자막 생성</span>
+                      </button>
+                    )}
                     <button
                       onClick={() => onOpenDefaultPlayer(cPath)}
                       className="flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium transition"
