@@ -293,6 +293,36 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
     }, durationToPlay);
   };
 
+  // Snap currently playing audio position to start / end of specific subtitle
+  const handleSnapStart = (index: number) => {
+    if (!audioRef.current) return;
+    const t = audioRef.current.currentTime;
+    handleStartSecsChange(index, t);
+  };
+
+  const handleSnapEnd = (index: number) => {
+    if (!audioRef.current) return;
+    const t = audioRef.current.currentTime;
+    handleEndSecsChange(index, t);
+  };
+
+  const handleShiftSingle = (index: number, offsetSecs: number) => {
+    setSubtitles((prev) =>
+      prev.map((item, i) => {
+        if (i !== index) return item;
+        const newStart = Math.max(0, item.start_secs + offsetSecs);
+        const newEnd = Math.max(newStart + 0.15, item.end_secs + offsetSecs);
+        return {
+          ...item,
+          start_secs: newStart,
+          end_secs: newEnd,
+          start_formatted: formatSrtTimestamp(newStart),
+          end_formatted: formatSrtTimestamp(newEnd),
+        };
+      })
+    );
+  };
+
   // Subtitle Editing Operations
   const handleTextChange = (index: number, newText: string) => {
     setSubtitles((prev) =>
@@ -805,6 +835,9 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
                     총 {formatSecs(generateResult.total_duration)} / {generateResult.speech_segments_detected}개 구간 감지
                   </span>
                 )}
+                <span className="text-[10px] text-slate-400 bg-slate-800/80 px-2 py-0.5 rounded border border-slate-700/60 hidden lg:inline-block">
+                  💡 팁: 재생 중 [시작] / [종료] 버튼으로 현재 음성에 맞춰 1초 만에 싱크 조정 가능
+                </span>
               </div>
 
               {/* Time Shift & Search */}
@@ -889,21 +922,39 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
 
                     {/* Timestamps */}
                     <div className="flex items-center gap-1.5 text-xs font-mono shrink-0">
-                      <input
-                        type="number"
-                        step={0.1}
-                        value={sub.start_secs.toFixed(2)}
-                        onChange={(e) => handleStartSecsChange(sub.index - 1, parseFloat(e.target.value))}
-                        className="w-16 px-1.5 py-1 rounded bg-slate-950 border border-slate-800 text-emerald-400 font-mono text-center focus:outline-none focus:border-orange-500"
-                      />
+                      <div className="flex items-center gap-1">
+                        <button
+                          onClick={() => handleSnapStart(sub.index - 1)}
+                          title="현재 재생 위치를 시작 시간으로 맞춤 ([)"
+                          className="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-emerald-600 text-emerald-300 hover:text-white text-[10px] font-sans font-semibold border border-slate-700 transition"
+                        >
+                          시작
+                        </button>
+                        <input
+                          type="number"
+                          step={0.1}
+                          value={sub.start_secs.toFixed(2)}
+                          onChange={(e) => handleStartSecsChange(sub.index - 1, parseFloat(e.target.value))}
+                          className="w-16 px-1 py-1 rounded bg-slate-950 border border-slate-800 text-emerald-400 font-mono text-center focus:outline-none focus:border-orange-500"
+                        />
+                      </div>
                       <span className="text-slate-500">➔</span>
-                      <input
-                        type="number"
-                        step={0.1}
-                        value={sub.end_secs.toFixed(2)}
-                        onChange={(e) => handleEndSecsChange(sub.index - 1, parseFloat(e.target.value))}
-                        className="w-16 px-1.5 py-1 rounded bg-slate-950 border border-slate-800 text-cyan-400 font-mono text-center focus:outline-none focus:border-orange-500"
-                      />
+                      <div className="flex items-center gap-1">
+                        <input
+                          type="number"
+                          step={0.1}
+                          value={sub.end_secs.toFixed(2)}
+                          onChange={(e) => handleEndSecsChange(sub.index - 1, parseFloat(e.target.value))}
+                          className="w-16 px-1 py-1 rounded bg-slate-950 border border-slate-800 text-cyan-400 font-mono text-center focus:outline-none focus:border-orange-500"
+                        />
+                        <button
+                          onClick={() => handleSnapEnd(sub.index - 1)}
+                          title="현재 재생 위치를 종료 시간으로 맞춤 (])"
+                          className="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-cyan-600 text-cyan-300 hover:text-white text-[10px] font-sans font-semibold border border-slate-700 transition"
+                        >
+                          종료
+                        </button>
+                      </div>
                     </div>
 
                     {/* Text Input */}
@@ -916,8 +967,24 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
                       />
                     </div>
 
-                    {/* Action buttons */}
+                    {/* Single line fine shift & actions */}
                     <div className="flex items-center gap-1 shrink-0">
+                      <div className="flex items-center bg-slate-950 rounded-lg border border-slate-800 p-0.5 text-[10px]">
+                        <button
+                          onClick={() => handleShiftSingle(sub.index - 1, -0.1)}
+                          className="px-1 py-0.5 hover:bg-slate-800 text-slate-400 hover:text-slate-200 rounded"
+                          title="0.1초 당기기"
+                        >
+                          -0.1s
+                        </button>
+                        <button
+                          onClick={() => handleShiftSingle(sub.index - 1, 0.1)}
+                          className="px-1 py-0.5 hover:bg-slate-800 text-slate-400 hover:text-slate-200 rounded"
+                          title="0.1초 미루기"
+                        >
+                          +0.1s
+                        </button>
+                      </div>
                       <button
                         onClick={() => handleInsertItemAfter(sub.index - 1)}
                         title="아래에 새 자막 추가"

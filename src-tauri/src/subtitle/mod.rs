@@ -14,6 +14,13 @@ struct SpeechSegment {
     end: f64,
 }
 
+#[derive(Debug, Clone)]
+struct ParsedLine {
+    text: String,
+    explicit_start: Option<f64>,
+    explicit_end: Option<f64>,
+}
+
 impl SubtitleController {
     pub fn new() -> Self {
         Self
@@ -22,13 +29,11 @@ impl SubtitleController {
     /// Read text file content with utf-8 encoding fallback
     pub fn read_script_file(path: &str) -> Result<String, String> {
         let bytes = fs::read(path).map_err(|e| format!("Failed to read script file: {}", e))?;
-        
-        // Try UTF-8 first
+
         if let Ok(s) = String::from_utf8(bytes.clone()) {
             return Ok(s);
         }
 
-        // Try lossy utf-8
         let s = String::from_utf8_lossy(&bytes).to_string();
         Ok(s)
     }
@@ -49,7 +54,7 @@ impl SubtitleController {
     ) -> Result<SubtitleGenerateResult, String> {
         let audio_path = PathBuf::from(&task.audio_path);
         if !audio_path.exists() {
-            return Err(format!("Audio file does not exist: {}", task.audio_path));
+            return Err(format!("오디오 파일이 존재하지 않습니다: {}", task.audio_path));
         }
 
         // 1. Probe total duration of audio
@@ -57,39 +62,40 @@ impl SubtitleController {
             .unwrap_or(0.0);
 
         if duration <= 0.0 {
-            return Err("Failed to get audio duration or audio duration is 0 seconds.".to_string());
+            return Err("오디오 길이를 측정할 수 없거나 재생 시간이 0초입니다.".to_string());
         }
 
         // 2. Parse script lines
-        let script_lines = Self::split_and_clean_script(
+        let parsed_lines = Self::split_and_clean_script(
             &task.script_text,
             &task.split_mode,
             task.max_chars.max(5),
         );
 
-        if script_lines.is_empty() {
-            return Err("No valid text lines found in script.".to_string());
+        if parsed_lines.is_empty() {
+            return Err("대본에서 유효한 문장을 찾을 수 없습니다.".to_string());
         }
 
-        // 3. Detect silence / speech segments via FFmpeg
-        let min_silence = task.min_silence_duration_secs.unwrap_or(0.25).max(0.05);
-        let silence_thresh = task.silence_threshold_db.unwrap_or(-35.0);
-        let speech_segments = Self::detect_speech_segments(
+        // 3. High-precision VAD (Voice Activity Detection) via 16kHz PCM analysis
+        let user_thresh = task.silence_threshold_db.unwrap_or(-35.0);
+        let user_min_silence = task.min_silence_duration_secs.unwrap_or(0.25).max(0.05);
+
+        let speech_segments = Self::detect_speech_segments_pcm(
             &audio_path,
             duration,
-            silence_thresh,
-            min_silence,
+            user_thresh,
+            user_min_silence,
             custom_ffmpeg_path.as_deref(),
         );
 
         let speech_segments_detected = speech_segments.len();
 
-        // 4. Align script lines to audio timeline
+        // 4. Align script lines to detected voice activity
         let start_offset = task.start_offset_secs.unwrap_or(0.1).max(0.0);
         let end_margin = task.end_margin_secs.unwrap_or(0.2).max(0.0);
 
         let subtitles = Self::align_script_to_speech(
-            &script_lines,
+            &parsed_lines,
             &speech_segments,
             duration,
             start_offset,
@@ -139,74 +145,135 @@ impl SubtitleController {
             vtt_path: vtt_path_saved,
             total_duration: duration,
             speech_segments_detected,
-            script_lines_count: script_lines.len(),
+            script_lines_count: parsed_lines.len(),
         })
     }
 
     /// Split raw script into chunks according to splitting mode and max character limit
-    fn split_and_clean_script(raw: &str, mode: &str, max_chars: usize) -> Vec<String> {
-        // First check if script already has timestamp headers like [00:01.00]
-        let timestamp_regex = Regex::new(r"\[\d{1,2}:\d{2}(?:\.\d+)?\]").unwrap();
-        let mut cleaned_lines = Vec::new();
+    fn split_and_clean_script(raw: &str, mode: &str, max_chars: usize) -> Vec<ParsedLine> {
+        let lrc_regex = Regex::new(r"\[(\d{1,2}):(\d{2})(?:\.(\d+))?\]").unwrap();
+        let srt_time_regex = Regex::new(r"(\d{2}:\d{2}:\d{2}[,\.]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[,\.]\d{3})").unwrap();
+
+        let mut parsed_results = Vec::new();
 
         let raw_clean = raw.replace("\r\n", "\n").replace('\r', "\n");
         let raw_lines: Vec<&str> = raw_clean.lines().collect();
 
-        for line in raw_lines {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
+        let mut i = 0;
+        while i < raw_lines.len() {
+            let line = raw_lines[i].trim();
+            if line.is_empty() {
+                i += 1;
                 continue;
             }
 
-            // Remove timestamps if present in raw text lines
-            let no_ts = timestamp_regex.replace_all(trimmed, "").trim().to_string();
-            if no_ts.is_empty() {
+            // Check if this is an SRT block: index line followed by timestamp line
+            if let Some(caps) = srt_time_regex.captures(line) {
+                let st = Self::parse_time_str(&caps[1]);
+                let et = Self::parse_time_str(&caps[2]);
+                i += 1;
+                let mut text_acc = String::new();
+                while i < raw_lines.len() && !raw_lines[i].trim().is_empty() {
+                    if !text_acc.is_empty() {
+                        text_acc.push(' ');
+                    }
+                    text_acc.push_str(raw_lines[i].trim());
+                    i += 1;
+                }
+                if !text_acc.is_empty() {
+                    parsed_results.push(ParsedLine {
+                        text: text_acc,
+                        explicit_start: st,
+                        explicit_end: et,
+                    });
+                }
                 continue;
             }
 
+            // Check LRC timestamp [mm:ss.xx]
+            if let Some(caps) = lrc_regex.captures(line) {
+                let mins: f64 = caps[1].parse().unwrap_or(0.0);
+                let secs: f64 = caps[2].parse().unwrap_or(0.0);
+                let frac: f64 = caps.get(3).map(|m| format!("0.{}", m.as_str()).parse().unwrap_or(0.0)).unwrap_or(0.0);
+                let explicit_start = Some(mins * 60.0 + secs + frac);
+                let no_ts = lrc_regex.replace_all(line, "").trim().to_string();
+                if !no_ts.is_empty() {
+                    parsed_results.push(ParsedLine {
+                        text: no_ts,
+                        explicit_start,
+                        explicit_end: None,
+                    });
+                }
+                i += 1;
+                continue;
+            }
+
+            // Normal text line
             match mode {
                 "line" => {
-                    cleaned_lines.push(no_ts);
+                    parsed_results.push(ParsedLine {
+                        text: line.to_string(),
+                        explicit_start: None,
+                        explicit_end: None,
+                    });
                 }
                 "sentence" => {
-                    let sentences = Self::split_into_sentences(&no_ts);
+                    let sentences = Self::split_into_sentences(line);
                     for s in sentences {
                         if !s.is_empty() {
-                            cleaned_lines.push(s);
+                            parsed_results.push(ParsedLine {
+                                text: s,
+                                explicit_start: None,
+                                explicit_end: None,
+                            });
                         }
                     }
                 }
                 "length" => {
-                    let chunks = Self::split_by_char_length(&no_ts, max_chars);
+                    let chunks = Self::split_by_char_length(line, max_chars);
                     for c in chunks {
                         if !c.is_empty() {
-                            cleaned_lines.push(c);
+                            parsed_results.push(ParsedLine {
+                                text: c,
+                                explicit_start: None,
+                                explicit_end: None,
+                            });
                         }
                     }
                 }
                 _ => {
-                    // "auto": sentence split + length check
-                    let sentences = Self::split_into_sentences(&no_ts);
+                    // "auto": split sentences first, then length
+                    let sentences = Self::split_into_sentences(line);
                     for s in sentences {
                         if s.chars().count() > max_chars {
                             let chunks = Self::split_by_char_length(&s, max_chars);
                             for c in chunks {
                                 if !c.is_empty() {
-                                    cleaned_lines.push(c);
+                                    parsed_results.push(ParsedLine {
+                                        text: c,
+                                        explicit_start: None,
+                                        explicit_end: None,
+                                    });
                                 }
                             }
                         } else if !s.is_empty() {
-                            cleaned_lines.push(s);
+                            parsed_results.push(ParsedLine {
+                                text: s,
+                                explicit_start: None,
+                                explicit_end: None,
+                            });
                         }
                     }
                 }
             }
+
+            i += 1;
         }
 
-        cleaned_lines
+        parsed_results
     }
 
-    /// Split string into sentences by punctuation (. ? ! \n)
+    /// Split string into sentences by punctuation (. ? ! … 。)
     fn split_into_sentences(text: &str) -> Vec<String> {
         let mut result = Vec::new();
         let mut current = String::new();
@@ -217,7 +284,6 @@ impl SubtitleController {
             current.push(ch);
 
             if ch == '.' || ch == '?' || ch == '!' || ch == '…' || ch == '。' {
-                // Peek next char to avoid breaking decimals like 3.14 or abbreviations
                 let next_is_space_or_end = if i + 1 < len {
                     chars[i + 1].is_whitespace()
                 } else {
@@ -242,7 +308,7 @@ impl SubtitleController {
         result
     }
 
-    /// Split long text by character length while preserving word boundaries (spaces/punctuation)
+    /// Split long text by character length while preserving word boundaries
     fn split_by_char_length(text: &str, max_chars: usize) -> Vec<String> {
         if text.chars().count() <= max_chars {
             return vec![text.to_string()];
@@ -281,6 +347,19 @@ impl SubtitleController {
         chunks
     }
 
+    fn parse_time_str(s: &str) -> Option<f64> {
+        let clean = s.replace(',', ".");
+        let parts: Vec<&str> = clean.split(':').collect();
+        if parts.len() == 3 {
+            let h: f64 = parts[0].parse().ok()?;
+            let m: f64 = parts[1].parse().ok()?;
+            let sec: f64 = parts[2].parse().ok()?;
+            Some(h * 3600.0 + m * 60.0 + sec)
+        } else {
+            None
+        }
+    }
+
     /// Probe duration of audio/video using ffprobe or ffmpeg
     fn get_audio_duration(path: &Path, custom_ffmpeg_path: Option<&str>) -> Option<f64> {
         if let Ok(ffprobe_path) = SettingsManager::find_ffprobe(custom_ffmpeg_path) {
@@ -288,7 +367,7 @@ impl SubtitleController {
             #[cfg(windows)]
             {
                 use std::os::windows::process::CommandExt;
-                cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+                cmd.creation_flags(0x08000000);
             }
             cmd.args([
                 "-v",
@@ -312,7 +391,6 @@ impl SubtitleController {
             }
         }
 
-        // Fallback: use ffmpeg -i path
         if let Ok(ffmpeg_path) = SettingsManager::find_ffmpeg(custom_ffmpeg_path) {
             let mut cmd = Command::new(ffmpeg_path);
             #[cfg(windows)]
@@ -340,25 +418,20 @@ impl SubtitleController {
         None
     }
 
-    /// Detect speech intervals using ffmpeg silencedetect filter
-    fn detect_speech_segments(
+    /// High-precision Voice Activity Detection by decoding audio to 16kHz mono PCM
+    fn detect_speech_segments_pcm(
         path: &Path,
         total_duration: f64,
-        silence_thresh_db: f64,
+        user_thresh_db: f64,
         min_silence_secs: f64,
         custom_ffmpeg_path: Option<&str>,
     ) -> Vec<SpeechSegment> {
-        let mut segments = Vec::new();
         let ffmpeg_path = match SettingsManager::find_ffmpeg(custom_ffmpeg_path) {
             Ok(p) => p,
-            Err(_) => return segments,
+            Err(_) => return Vec::new(),
         };
 
-        let filter_arg = format!(
-            "silencedetect=noise={}dB:d={}",
-            silence_thresh_db, min_silence_secs
-        );
-
+        // Decode directly to 16kHz mono raw float32 PCM
         let mut cmd = Command::new(ffmpeg_path);
         #[cfg(windows)]
         {
@@ -369,62 +442,138 @@ impl SubtitleController {
             "-vn",
             "-i",
             path.to_str().unwrap_or_default(),
-            "-af",
-            &filter_arg,
             "-f",
-            "null",
-            "-",
+            "f32le",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "pipe:1",
         ]);
 
         let output = match cmd.output() {
-            Ok(o) => o,
-            Err(_) => return segments,
+            Ok(o) if o.status.success() || !o.stdout.is_empty() => o,
+            _ => return Vec::new(),
         };
 
-        let stderr_str = String::from_utf8_lossy(&output.stderr);
+        let raw_bytes = output.stdout;
+        if raw_bytes.len() < 4 * 1600 {
+            return Vec::new();
+        }
 
-        // Parse silence_start: X and silence_end: Y
-        let re_silence_start = Regex::new(r"silence_start:\s*(\d+(?:\.\d+)?)").unwrap();
-        let re_silence_end = Regex::new(r"silence_end:\s*(\d+(?:\.\d+)?)").unwrap();
+        // Convert u8 slice to f32 samples
+        let samples: Vec<f32> = raw_bytes
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect();
 
-        let mut silences: Vec<(f64, f64)> = Vec::new();
-        let mut current_silence_start: Option<f64> = None;
+        if samples.is_empty() {
+            return Vec::new();
+        }
 
-        for line in stderr_str.lines() {
-            if let Some(caps) = re_silence_start.captures(line) {
-                if let Ok(st) = caps[1].parse::<f64>() {
-                    current_silence_start = Some(st);
+        const FRAME_SIZE: usize = 160; // 10ms per frame at 16kHz
+        const FRAME_DURATION: f64 = 0.01;
+
+        let num_frames = samples.len() / FRAME_SIZE;
+        let mut frame_rms_db = Vec::with_capacity(num_frames);
+
+        for i in 0..num_frames {
+            let start = i * FRAME_SIZE;
+            let end = start + FRAME_SIZE;
+            let slice = &samples[start..end];
+
+            let mut sum_sq = 0.0;
+            for &s in slice {
+                sum_sq += s * s;
+            }
+            let rms = (sum_sq / FRAME_SIZE as f32).sqrt();
+            let db = if rms > 1e-6 {
+                20.0 * rms.log10()
+            } else {
+                -90.0
+            };
+            frame_rms_db.push(db);
+        }
+
+        // Estimate noise floor and peak speech energy dynamically
+        let mut sorted_db = frame_rms_db.clone();
+        sorted_db.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+        let noise_floor_idx = (num_frames as f64 * 0.15) as usize;
+        let speech_peak_idx = (num_frames as f64 * 0.90) as usize;
+
+        let noise_floor = sorted_db.get(noise_floor_idx).copied().unwrap_or(-50.0);
+        let speech_peak = sorted_db.get(speech_peak_idx).copied().unwrap_or(-15.0);
+
+        // Adaptive threshold: between noise floor and peak, clamped to reasonable range
+        let dynamic_threshold = (noise_floor + (speech_peak - noise_floor) * 0.35)
+            .max(-55.0)
+            .min(-22.0);
+
+        // Combine with user threshold
+        let effective_threshold = if user_thresh_db < -10.0 && user_thresh_db > -70.0 {
+            (dynamic_threshold * 0.7) + (user_thresh_db as f32 * 0.3)
+        } else {
+            dynamic_threshold
+        };
+
+        let min_speech_frames = (0.06 / FRAME_DURATION).round() as usize; // at least 60ms
+        let min_silence_frames = (min_silence_secs / FRAME_DURATION).round() as usize; // hold time
+
+        let mut segments: Vec<SpeechSegment> = Vec::new();
+        let mut in_speech = false;
+        let mut speech_start_frame = 0;
+        let mut silence_counter = 0;
+
+        for (frame_idx, &db) in frame_rms_db.iter().enumerate() {
+            let is_active = db >= effective_threshold;
+
+            if is_active {
+                if !in_speech {
+                    in_speech = true;
+                    // Pre-roll onset by 40ms to catch soft consonants
+                    speech_start_frame = frame_idx.saturating_sub(4);
+                }
+                silence_counter = 0;
+            } else if in_speech {
+                silence_counter += 1;
+                if silence_counter >= min_silence_frames {
+                    let speech_end_frame = frame_idx.saturating_sub(silence_counter).saturating_add(3);
+                    if speech_end_frame > speech_start_frame + min_speech_frames {
+                        let st = (speech_start_frame as f64 * FRAME_DURATION).max(0.0);
+                        let et = (speech_end_frame as f64 * FRAME_DURATION).min(total_duration);
+                        if et > st + 0.08 {
+                            segments.push(SpeechSegment { start: st, end: et });
+                        }
+                    }
+                    in_speech = false;
+                    silence_counter = 0;
                 }
             }
-            if let Some(caps) = re_silence_end.captures(line) {
-                if let Ok(end) = caps[1].parse::<f64>() {
-                    let start = current_silence_start.unwrap_or(0.0);
-                    silences.push((start, end));
-                    current_silence_start = None;
+        }
+
+        // Handle trailing speech at the end of the file
+        if in_speech {
+            let st = (speech_start_frame as f64 * FRAME_DURATION).max(0.0);
+            let et = (num_frames as f64 * FRAME_DURATION).min(total_duration);
+            if et > st + 0.08 {
+                segments.push(SpeechSegment { start: st, end: et });
+            }
+        }
+
+        // Merge adjacent segments that are closer than 180ms
+        let mut merged: Vec<SpeechSegment> = Vec::new();
+        for seg in segments {
+            if let Some(last) = merged.last_mut() {
+                if seg.start <= last.end + 0.18 {
+                    last.end = seg.end.max(last.end);
+                    continue;
                 }
             }
+            merged.push(seg);
         }
 
-        // Convert silences into speech segments
-        let mut last_speech_start = 0.0;
-        for (silence_start, silence_end) in silences {
-            if silence_start > last_speech_start + 0.15 {
-                segments.push(SpeechSegment {
-                    start: last_speech_start,
-                    end: silence_start,
-                });
-            }
-            last_speech_start = silence_end;
-        }
-
-        if last_speech_start < total_duration - 0.15 {
-            segments.push(SpeechSegment {
-                start: last_speech_start,
-                end: total_duration,
-            });
-        }
-
-        segments
+        merged
     }
 
     /// Calculate phonetic / reading weight of a line
@@ -432,24 +581,23 @@ impl SubtitleController {
         let mut weight: f64 = 0.0;
         for c in text.chars() {
             if c.is_alphanumeric() {
-                // Hangul or CJK characters take slightly more reading time
                 if (c >= '\u{AC00}' && c <= '\u{D7A3}') || (c >= '\u{4E00}' && c <= '\u{9FFF}') {
                     weight += 1.2;
                 } else {
-                    weight += 0.8;
+                    weight += 0.85;
                 }
             } else if c == ',' || c == '.' || c == '!' || c == '?' {
-                weight += 0.6;
-            } else {
+                weight += 0.5;
+            } else if !c.is_whitespace() {
                 weight += 0.2;
             }
         }
         weight.max(1.0_f64)
     }
 
-    /// Intelligent alignment of script lines into speech intervals
+    /// Global Optimal Alignment of Script Lines into Precise Speech Timelines
     fn align_script_to_speech(
-        lines: &[String],
+        lines: &[ParsedLine],
         speech_segments: &[SpeechSegment],
         total_duration: f64,
         start_offset: f64,
@@ -460,111 +608,142 @@ impl SubtitleController {
             return Vec::new();
         }
 
-        let weights: Vec<f64> = lines.iter().map(|l| Self::calculate_weight(l)).collect();
+        // Check if all lines have explicit timestamps
+        let has_explicit = lines.iter().any(|l| l.explicit_start.is_some());
+        if has_explicit {
+            let mut results = Vec::new();
+            for (i, line) in lines.iter().enumerate() {
+                let st = line.explicit_start.unwrap_or(start_offset + (i as f64 * 3.0));
+                let et = line.explicit_end.unwrap_or_else(|| {
+                    if i + 1 < lines.len() && lines[i + 1].explicit_start.is_some() {
+                        (lines[i + 1].explicit_start.unwrap() - 0.05).max(st + 0.3)
+                    } else {
+                        (st + 2.5).min(total_duration)
+                    }
+                });
+
+                results.push(SubtitleItem {
+                    index: i + 1,
+                    start_secs: st,
+                    end_secs: et,
+                    start_formatted: Self::format_srt_time(st),
+                    end_formatted: Self::format_srt_time(et),
+                    text: line.text.clone(),
+                });
+            }
+            return results;
+        }
+
+        let weights: Vec<f64> = lines.iter().map(|l| Self::calculate_weight(&l.text)).collect();
         let total_weight: f64 = weights.iter().sum();
 
-        let effective_start = start_offset;
-        let effective_end = (total_duration - end_margin).max(effective_start + 0.5);
+        // 1. If valid VAD speech segments were detected
+        if !speech_segments.is_empty() {
+            let num_segs = speech_segments.len();
 
-        let mut results = Vec::with_capacity(num_lines);
+            // Direct 1-to-1 match if count is identical
+            if num_lines == num_segs {
+                let mut results = Vec::new();
+                for (i, seg) in speech_segments.iter().enumerate() {
+                    let st = seg.start;
+                    let et = (seg.end).max(st + 0.3);
+                    results.push(SubtitleItem {
+                        index: i + 1,
+                        start_secs: st,
+                        end_secs: et,
+                        start_formatted: Self::format_srt_time(st),
+                        end_formatted: Self::format_srt_time(et),
+                        text: lines[i].text.clone(),
+                    });
+                }
+                return results;
+            }
 
-        // Case A: We have valid detected speech segments
-        if !speech_segments.is_empty() && speech_segments.len() >= (num_lines / 3).max(1) {
-            // Allocate lines to speech segments based on cumulative weights
+            // Cumulative Energy-Weighted Alignment across speech segments
+            let total_speech_time: f64 = speech_segments.iter().map(|s| (s.end - s.start).max(0.1)).sum();
 
-            // Compute total speech duration
-            let total_speech_time: f64 = speech_segments
-                .iter()
-                .map(|s| (s.end - s.start).max(0.1))
-                .sum();
-
-            if total_speech_time > 0.5 {
-                let mut line_idx = 0;
-                let mut current_line_weight_progress = 0.0;
-
-                for seg in speech_segments {
-                    let seg_duration = (seg.end - seg.start).max(0.1);
-                    let seg_weight_quota = (seg_duration / total_speech_time) * total_weight;
-
-                    let mut seg_lines: Vec<(usize, f64)> = Vec::new();
-                    let mut accumulated_in_seg = 0.0;
-
-                    while line_idx < num_lines {
-                        let line_w = weights[line_idx];
-                        let needed = line_w - current_line_weight_progress;
-
-                        if accumulated_in_seg + needed <= seg_weight_quota * 1.15
-                            || seg_lines.is_empty()
-                            || line_idx == num_lines - 1
-                        {
-                            seg_lines.push((line_idx, needed));
-                            accumulated_in_seg += needed;
-                            line_idx += 1;
-                            current_line_weight_progress = 0.0;
-                            if accumulated_in_seg >= seg_weight_quota {
-                                break;
-                            }
-                        } else {
-                            break;
-                        }
-                    }
-
-                    if !seg_lines.is_empty() {
-                        let seg_total_w: f64 = seg_lines.iter().map(|(_, w)| *w).sum();
-                        let mut curr_t = seg.start;
-
-                        for (idx, w) in seg_lines {
-                            let item_dur = (w / seg_total_w) * seg_duration;
-                            let item_start = curr_t;
-                            let item_end = (curr_t + item_dur - 0.05).max(item_start + 0.2);
-                            curr_t += item_dur;
-
-                            results.push(SubtitleItem {
-                                index: results.len() + 1,
-                                start_secs: item_start,
-                                end_secs: item_end,
-                                start_formatted: Self::format_srt_time(item_start),
-                                end_formatted: Self::format_srt_time(item_end),
-                                text: lines[idx].clone(),
-                            });
-                        }
-                    }
+            if total_speech_time > 0.4 {
+                let mut results: Vec<SubtitleItem> = Vec::with_capacity(num_lines);
+                let mut cum_weights = Vec::with_capacity(num_lines + 1);
+                cum_weights.push(0.0);
+                let mut acc_w = 0.0;
+                for w in &weights {
+                    acc_w += *w;
+                    cum_weights.push(acc_w);
                 }
 
-                // If any remaining lines not placed, evenly allocate in the end
-                while line_idx < num_lines {
-                    let last_end = results
-                        .last()
-                        .map(|r| r.end_secs + 0.08)
-                        .unwrap_or(effective_start);
-                    let end_t = (last_end + 1.5).min(total_duration);
+                // Map cumulative weight progress to speech intervals
+                let mut speech_cum_times = Vec::with_capacity(num_segs + 1);
+                speech_cum_times.push(0.0);
+                let mut acc_t = 0.0;
+                for s in speech_segments {
+                    acc_t += (s.end - s.start).max(0.1);
+                    speech_cum_times.push(acc_t);
+                }
+
+                let time_at_speech_progress = |progress_ratio: f64| -> f64 {
+                    let target_speech_t = (progress_ratio * total_speech_time).max(0.0).min(total_speech_time);
+                    for (i, s) in speech_segments.iter().enumerate() {
+                        let seg_start_cum = speech_cum_times[i];
+                        let seg_end_cum = speech_cum_times[i + 1];
+                        if target_speech_t >= seg_start_cum && target_speech_t <= seg_end_cum {
+                            let seg_dur = s.end - s.start;
+                            let frac = if seg_end_cum > seg_start_cum {
+                                (target_speech_t - seg_start_cum) / (seg_end_cum - seg_start_cum)
+                            } else {
+                                0.0
+                            };
+                            return s.start + frac * seg_dur;
+                        }
+                    }
+                    speech_segments.last().map(|s| s.end).unwrap_or(total_duration)
+                };
+
+                for i in 0..num_lines {
+                    let r_start = cum_weights[i] / total_weight;
+                    let r_end = cum_weights[i + 1] / total_weight;
+
+                    let mut item_start = time_at_speech_progress(r_start);
+                    let mut item_end = time_at_speech_progress(r_end);
+
+                    // Ensure clean bounds and readability
+                    if let Some(prev) = results.last() {
+                        if item_start < prev.end_secs + 0.05 {
+                            item_start = prev.end_secs + 0.05;
+                        }
+                    }
+
+                    item_end = item_end.max(item_start + 0.35);
+
                     results.push(SubtitleItem {
-                        index: results.len() + 1,
-                        start_secs: last_end,
-                        end_secs: end_t,
-                        start_formatted: Self::format_srt_time(last_end),
-                        end_formatted: Self::format_srt_time(end_t),
-                        text: lines[line_idx].clone(),
+                        index: i + 1,
+                        start_secs: item_start,
+                        end_secs: item_end,
+                        start_formatted: Self::format_srt_time(item_start),
+                        end_formatted: Self::format_srt_time(item_end),
+                        text: lines[i].text.clone(),
                     });
-                    line_idx += 1;
                 }
 
                 return results;
             }
         }
 
-        // Case B: Fallback proportional weight allocation across duration
+        // 2. Fallback: Proportional allocation across duration
+        let effective_start = start_offset;
+        let effective_end = (total_duration - end_margin).max(effective_start + 0.5);
         let available_duration = effective_end - effective_start;
-        let pause_between = (0.1_f64).min(available_duration / (num_lines as f64 * 3.0));
+        let pause_between = (0.08_f64).min(available_duration / (num_lines as f64 * 4.0));
         let active_duration = (available_duration - (num_lines as f64 * pause_between)).max(0.5);
 
+        let mut results = Vec::with_capacity(num_lines);
         let mut current_start = effective_start;
 
         for (i, line) in lines.iter().enumerate() {
             let weight = weights[i];
             let item_dur = (weight / total_weight) * active_duration;
             let item_start = current_start;
-            let item_end = item_start + item_dur.max(0.3);
+            let item_end = (item_start + item_dur).max(item_start + 0.3);
 
             results.push(SubtitleItem {
                 index: i + 1,
@@ -572,7 +751,7 @@ impl SubtitleController {
                 end_secs: item_end,
                 start_formatted: Self::format_srt_time(item_start),
                 end_formatted: Self::format_srt_time(item_end),
-                text: line.clone(),
+                text: line.text.clone(),
             });
 
             current_start = item_end + pause_between;
@@ -650,14 +829,17 @@ mod tests {
         let script = "안녕하세요! 반갑습니다.\nOmniRec 자막 생성기입니다.";
         let lines = SubtitleController::split_and_clean_script(script, "sentence", 30);
         assert_eq!(lines.len(), 3);
-        assert_eq!(lines[0], "안녕하세요!");
-        assert_eq!(lines[1], "반갑습니다.");
-        assert_eq!(lines[2], "OmniRec 자막 생성기입니다.");
+        assert_eq!(lines[0].text, "안녕하세요!");
+        assert_eq!(lines[1].text, "반갑습니다.");
+        assert_eq!(lines[2].text, "OmniRec 자막 생성기입니다.");
     }
 
     #[test]
     fn test_align_script_fallback() {
-        let lines = vec!["첫 번째 문장".to_string(), "두 번째 문장".to_string()];
+        let lines = vec![
+            ParsedLine { text: "첫 번째 문장".to_string(), explicit_start: None, explicit_end: None },
+            ParsedLine { text: "두 번째 문장".to_string(), explicit_start: None, explicit_end: None },
+        ];
         let subs = SubtitleController::align_script_to_speech(&lines, &[], 10.0, 0.1, 0.2);
         assert_eq!(subs.len(), 2);
         assert!(subs[0].start_secs >= 0.1);
@@ -665,4 +847,3 @@ mod tests {
         assert!(subs[1].end_secs <= 10.0);
     }
 }
-
