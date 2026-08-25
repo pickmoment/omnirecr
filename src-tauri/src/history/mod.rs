@@ -112,7 +112,16 @@ impl HistoryManager {
                 .map_err(|e| format!("Failed to open Windows Explorer: {}", e))?;
         }
 
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(target_os = "macos")]
+        {
+            Command::new("open")
+                .arg("-R")
+                .arg(path_str)
+                .spawn()
+                .map_err(|e| format!("Failed to reveal file in Finder: {}", e))?;
+        }
+
+        #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
         {
             let _ = opener::open(path_str);
         }
@@ -135,7 +144,15 @@ impl HistoryManager {
                 .map_err(|e| format!("Failed to open media file: {}", e))?;
         }
 
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(target_os = "macos")]
+        {
+            Command::new("open")
+                .arg(path_str)
+                .spawn()
+                .map_err(|e| format!("Failed to open media file on macOS: {}", e))?;
+        }
+
+        #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
         {
             Command::new("xdg-open")
                 .arg(path_str)

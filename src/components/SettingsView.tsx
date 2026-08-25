@@ -131,7 +131,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     className="rounded bg-slate-800 border-slate-700 text-blue-500 focus:ring-0 cursor-pointer"
                   />
                   <Volume2 className="w-4 h-4 text-blue-400" />
-                  <span>시스템 사운드 (WASAPI Loopback)</span>
+                  <span>시스템 사운드 (WASAPI / CoreAudio)</span>
                 </label>
                 <span className="text-xs font-mono font-bold text-blue-400">
                   {Math.round(localSettings.system_audio_volume * 100)}%
@@ -217,8 +217,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   <VolumeX className="w-3.5 h-3.5" />
                 </div>
                 <div>
-                  <div className="text-xs font-bold text-slate-200">Windows 시스템 알림음 자동 차단</div>
-                  <div className="text-[10px] text-slate-400">녹화 중 팝업/경고 알림음 자동 음소거 및 복구</div>
+                  <div className="text-xs font-bold text-slate-200">시스템 알림음 자동 차단 (Auto-Mute Notifications)</div>
+                  <div className="text-[10px] text-slate-400">녹화/녹음 중 시스템 팝업 및 경고 알림음 자동 음소거 및 종료 후 복구</div>
                 </div>
               </div>
               <input

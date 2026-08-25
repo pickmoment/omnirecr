@@ -1,6 +1,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+#[cfg(target_os = "windows")]
 use windows::Win32::Foundation::S_OK;
 
 pub struct NotificationSoundManager {

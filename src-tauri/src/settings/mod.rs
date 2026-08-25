@@ -58,6 +58,12 @@ impl SettingsManager {
 
         // 2. Common Windows paths
         let candidates = [
+            // macOS Homebrew & MacPorts paths
+            "/opt/homebrew/bin/ffmpeg",
+            "/usr/local/bin/ffmpeg",
+            "/opt/local/bin/ffmpeg",
+            "/usr/bin/ffmpeg",
+            // Windows common paths
             r"C:\Program Files\DownloadHelper CoApp\ffmpeg.exe",
             r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
             r"C:\ffmpeg\bin\ffmpeg.exe",
@@ -98,9 +104,12 @@ impl SettingsManager {
         if let Some(path_str) = custom_ffmpeg_path {
             let ffmpeg_path = PathBuf::from(path_str);
             if let Some(parent) = ffmpeg_path.parent() {
-                let probe = parent.join("ffprobe.exe");
+                let probe = parent.join("ffprobe");
+                let probe_exe = parent.join("ffprobe.exe");
                 if probe.is_file() {
                     return Ok(probe);
+                } else if probe_exe.is_file() {
+                    return Ok(probe_exe);
                 }
             }
         }
@@ -112,6 +121,12 @@ impl SettingsManager {
         }
 
         let candidates = [
+            // macOS Homebrew & MacPorts paths
+            "/opt/homebrew/bin/ffprobe",
+            "/usr/local/bin/ffprobe",
+            "/opt/local/bin/ffprobe",
+            "/usr/bin/ffprobe",
+            // Windows common paths
             r"C:\Program Files\DownloadHelper CoApp\ffprobe.exe",
             r"C:\Program Files\ffmpeg\bin\ffprobe.exe",
             r"C:\ffmpeg\bin\ffprobe.exe",

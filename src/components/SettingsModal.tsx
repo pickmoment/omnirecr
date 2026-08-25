@@ -136,8 +136,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     <VolumeX className="w-4 h-4" />
                   </div>
                   <div>
-                    <div className="text-xs font-bold text-slate-200">Windows 시스템 알림음 자동 음소거</div>
-                    <div className="text-[11px] text-slate-400">녹화/녹음 중 윈도우 팝업/경고 알림음을 백그라운드 자동 차단 및 종료 시 자동 복구</div>
+                    <div className="text-xs font-bold text-slate-200">시스템 알림음 자동 음소거</div>
+                    <div className="text-[11px] text-slate-400">녹화/녹음 중 팝업 및 경고 알림음을 백그라운드 자동 차단 및 종료 시 복구</div>
                   </div>
                 </div>
                 <input

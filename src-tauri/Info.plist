@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>OmniRec requires microphone access to record voice narration and audio.</string>
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>OmniRec requires screen recording permission to record your display.</string>
+</dict>
+</plist>

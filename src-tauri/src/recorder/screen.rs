@@ -43,21 +43,56 @@ impl ScreenRecorderSession {
         #[cfg(target_os = "windows")]
         cmd.creation_flags(CREATE_NO_WINDOW);
 
-        cmd.arg("-y") // Overwrite output
-            .arg("-f").arg("gdigrab")
-            .arg("-framerate").arg(settings.video_fps.to_string())
-            .arg("-draw_mouse").arg("1");
+        cmd.arg("-y"); // Overwrite output
 
-        if let Some(r) = region {
-            // Even dimensions required for libx264 yuv420p
-            let w = (r.width / 2) * 2;
-            let h = (r.height / 2) * 2;
-            cmd.arg("-offset_x").arg(r.x.to_string())
-                .arg("-offset_y").arg(r.y.to_string())
-                .arg("-video_size").arg(format!("{}x{}", w, h));
+        #[cfg(target_os = "windows")]
+        {
+            cmd.arg("-f").arg("gdigrab")
+                .arg("-framerate").arg(settings.video_fps.to_string())
+                .arg("-draw_mouse").arg("1");
+
+            if let Some(r) = region {
+                // Even dimensions required for libx264 yuv420p
+                let w = (r.width / 2) * 2;
+                let h = (r.height / 2) * 2;
+                cmd.arg("-offset_x").arg(r.x.to_string())
+                    .arg("-offset_y").arg(r.y.to_string())
+                    .arg("-video_size").arg(format!("{}x{}", w, h));
+            }
+
+            cmd.arg("-i").arg("desktop");
         }
 
-        cmd.arg("-i").arg("desktop");
+        #[cfg(target_os = "macos")]
+        {
+            // macOS AVFoundation screen capture: "1:none" captures default display without hardware audio
+            cmd.arg("-f").arg("avfoundation")
+                .arg("-framerate").arg(settings.video_fps.to_string())
+                .arg("-capture_cursor").arg("1")
+                .arg("-i").arg("1:none");
+
+            if let Some(r) = region {
+                let w = (r.width / 2) * 2;
+                let h = (r.height / 2) * 2;
+                cmd.arg("-vf").arg(format!("crop={}:{}:{}:{}", w, h, r.x, r.y));
+            }
+        }
+
+        #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+        {
+            cmd.arg("-f").arg("x11grab")
+                .arg("-framerate").arg(settings.video_fps.to_string())
+                .arg("-draw_mouse").arg("1");
+
+            if let Some(r) = region {
+                let w = (r.width / 2) * 2;
+                let h = (r.height / 2) * 2;
+                cmd.arg("-video_size").arg(format!("{}x{}", w, h))
+                    .arg("-i").arg(format!(":0.0+{},{}", r.x, r.y));
+            } else {
+                cmd.arg("-i").arg(":0.0");
+            }
+        }
 
         // Audio input via raw f32le PCM pipe
         let sample_rate = settings.audio_sample_rate.to_string();
