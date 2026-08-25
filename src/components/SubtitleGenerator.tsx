@@ -446,6 +446,32 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
     });
   };
 
+  // Scale / Stretch all subtitles proportionally to target end time (eliminate drift)
+  const handleScaleToFit = (targetEndSecs: number) => {
+    if (subtitles.length === 0 || targetEndSecs <= 0.5) return;
+    const firstStart = subtitles[0].start_secs;
+    const lastEnd = subtitles[subtitles.length - 1].end_secs;
+    const currentSpan = lastEnd - firstStart;
+    const targetSpan = targetEndSecs - firstStart;
+
+    if (currentSpan <= 0.1 || targetSpan <= 0.1) return;
+    const ratio = targetSpan / currentSpan;
+
+    setSubtitles((prev) =>
+      prev.map((item) => {
+        const newStart = firstStart + (item.start_secs - firstStart) * ratio;
+        const newEnd = firstStart + (item.end_secs - firstStart) * ratio;
+        return {
+          ...item,
+          start_secs: Math.max(0, newStart),
+          end_secs: Math.max(newStart + 0.2, newEnd),
+          start_formatted: formatSrtTimestamp(Math.max(0, newStart)),
+          end_formatted: formatSrtTimestamp(Math.max(newStart + 0.2, newEnd)),
+        };
+      })
+    );
+  };
+
   // Global Time Shift
   const handleShiftAll = (offsetSecs: number) => {
     setSubtitles((prev) =>
@@ -946,6 +972,28 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
                   <Check className={`w-3 h-3 ${autoScroll ? 'text-orange-400 opacity-100' : 'opacity-0'}`} />
                   <span>자동 스크롤</span>
                 </button>
+
+                {/* Scale to Duration / Fit Buttons */}
+                <div className="flex items-center bg-slate-950 rounded-lg border border-slate-800 p-0.5 text-[11px]">
+                  {duration > 0 && (
+                    <button
+                      onClick={() => handleScaleToFit(duration - 0.2)}
+                      className="px-2 py-0.5 hover:bg-orange-950/60 hover:text-orange-300 text-slate-300 rounded transition"
+                      title="전체 오디오 길이에 맞춰 뒤쪽 싱크를 비례 자동 맞춤"
+                    >
+                      🎯 오디오 길이에 맞춤
+                    </button>
+                  )}
+                  {currentTime > 1.0 && (
+                    <button
+                      onClick={() => handleScaleToFit(currentTime)}
+                      className="px-2 py-0.5 hover:bg-emerald-950/60 hover:text-emerald-300 text-slate-300 rounded transition"
+                      title="현재 재생 중인 위치까지 전체 자막을 비례 맞춤"
+                    >
+                      현재 위치에 끝 맞춤
+                    </button>
+                  )}
+                </div>
 
                 {/* Shift Buttons */}
                 <div className="flex items-center bg-slate-950 rounded-lg border border-slate-800 p-0.5 text-[11px]">

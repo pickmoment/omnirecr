@@ -595,7 +595,7 @@ impl SubtitleController {
         weight.max(1.0_f64)
     }
 
-    /// Global Optimal Alignment of Script Lines into Precise Speech Timelines
+    /// Global Optimal DP Alignment of Script Lines into Precise Speech Timelines with Zero Cumulative Drift
     fn align_script_to_speech(
         lines: &[ParsedLine],
         speech_segments: &[SpeechSegment],
@@ -637,13 +637,14 @@ impl SubtitleController {
         let weights: Vec<f64> = lines.iter().map(|l| Self::calculate_weight(&l.text)).collect();
         let total_weight: f64 = weights.iter().sum();
 
-        // 1. If valid VAD speech segments were detected
+        // If valid VAD speech segments were detected, use Dynamic Programming partition
         if !speech_segments.is_empty() {
-            let num_segs = speech_segments.len();
+            let m = speech_segments.len();
+            let n = num_lines;
 
             // Direct 1-to-1 match if count is identical
-            if num_lines == num_segs {
-                let mut results = Vec::new();
+            if n == m {
+                let mut results = Vec::with_capacity(n);
                 for (i, seg) in speech_segments.iter().enumerate() {
                     let st = seg.start;
                     let et = (seg.end).max(st + 0.3);
@@ -659,77 +660,158 @@ impl SubtitleController {
                 return results;
             }
 
-            // Cumulative Energy-Weighted Alignment across speech segments
-            let total_speech_time: f64 = speech_segments.iter().map(|s| (s.end - s.start).max(0.1)).sum();
+            // Total speech active time
+            let total_speech_time: f64 = speech_segments.iter().map(|s| (s.end - s.start).max(0.08)).sum();
 
-            if total_speech_time > 0.4 {
-                let mut results: Vec<SubtitleItem> = Vec::with_capacity(num_lines);
-                let mut cum_weights = Vec::with_capacity(num_lines + 1);
-                cum_weights.push(0.0);
-                let mut acc_w = 0.0;
-                for w in &weights {
-                    acc_w += *w;
-                    cum_weights.push(acc_w);
-                }
+            if total_speech_time > 0.3 {
+                // Case A: M >= N (More speech segments than script lines)
+                // Partition M segments into N contiguous groups using DP
+                if m >= n {
+                    // seg_dur[k] = duration of segment k
+                    let seg_durs: Vec<f64> = speech_segments.iter().map(|s| (s.end - s.start).max(0.08)).collect();
+                    let target_durs: Vec<f64> = weights.iter().map(|w| (w / total_weight) * total_speech_time).collect();
 
-                // Map cumulative weight progress to speech intervals
-                let mut speech_cum_times = Vec::with_capacity(num_segs + 1);
-                speech_cum_times.push(0.0);
-                let mut acc_t = 0.0;
-                for s in speech_segments {
-                    acc_t += (s.end - s.start).max(0.1);
-                    speech_cum_times.push(acc_t);
-                }
-
-                let time_at_speech_progress = |progress_ratio: f64| -> f64 {
-                    let target_speech_t = (progress_ratio * total_speech_time).max(0.0).min(total_speech_time);
-                    for (i, s) in speech_segments.iter().enumerate() {
-                        let seg_start_cum = speech_cum_times[i];
-                        let seg_end_cum = speech_cum_times[i + 1];
-                        if target_speech_t >= seg_start_cum && target_speech_t <= seg_end_cum {
-                            let seg_dur = s.end - s.start;
-                            let frac = if seg_end_cum > seg_start_cum {
-                                (target_speech_t - seg_start_cum) / (seg_end_cum - seg_start_cum)
-                            } else {
-                                0.0
-                            };
-                            return s.start + frac * seg_dur;
-                        }
+                    // cum_seg_dur[k] = sum_{0..k} seg_durs
+                    let mut cum_seg_dur = vec![0.0; m + 1];
+                    for k in 0..m {
+                        cum_seg_dur[k + 1] = cum_seg_dur[k] + seg_durs[k];
                     }
-                    speech_segments.last().map(|s| s.end).unwrap_or(total_duration)
-                };
 
-                for i in 0..num_lines {
-                    let r_start = cum_weights[i] / total_weight;
-                    let r_end = cum_weights[i + 1] / total_weight;
+                    // dp[i][j]: min cost to map first i lines (1..=n) to first j segments (1..=m)
+                    // parent[i][j]: optimal split point k
+                    let inf = 1e12_f64;
+                    let mut dp = vec![vec![inf; m + 1]; n + 1];
+                    let mut parent = vec![vec![0usize; m + 1]; n + 1];
 
-                    let mut item_start = time_at_speech_progress(r_start);
-                    let mut item_end = time_at_speech_progress(r_end);
+                    dp[0][0] = 0.0;
 
-                    // Ensure clean bounds and readability
-                    if let Some(prev) = results.last() {
-                        if item_start < prev.end_secs + 0.05 {
-                            item_start = prev.end_secs + 0.05;
+                    for i in 1..=n {
+                        let target_d = target_durs[i - 1];
+                        for j in i..=m {
+                            for k in (i - 1)..j {
+                                if dp[i - 1][k] >= inf {
+                                    continue;
+                                }
+                                let allocated_d = cum_seg_dur[j] - cum_seg_dur[k];
+                                let diff = allocated_d - target_d;
+                                let cost = dp[i - 1][k] + diff * diff;
+                                if cost < dp[i][j] {
+                                    dp[i][j] = cost;
+                                    parent[i][j] = k;
+                                }
+                            }
                         }
                     }
 
-                    item_end = item_end.max(item_start + 0.35);
+                    // Backtrack to find boundaries
+                    let mut boundaries = vec![0usize; n + 1];
+                    let mut curr_j = m;
+                    for i in (1..=n).rev() {
+                        boundaries[i] = curr_j;
+                        curr_j = parent[i][curr_j];
+                    }
+                    boundaries[0] = 0;
 
-                    results.push(SubtitleItem {
-                        index: i + 1,
-                        start_secs: item_start,
-                        end_secs: item_end,
-                        start_formatted: Self::format_srt_time(item_start),
-                        end_formatted: Self::format_srt_time(item_end),
-                        text: lines[i].text.clone(),
-                    });
+                    let mut results = Vec::with_capacity(n);
+                    for i in 0..n {
+                        let start_seg_idx = boundaries[i];
+                        let end_seg_idx = boundaries[i + 1] - 1;
+
+                        let st = speech_segments[start_seg_idx].start;
+                        let et = speech_segments[end_seg_idx].end.max(st + 0.3);
+
+                        results.push(SubtitleItem {
+                            index: i + 1,
+                            start_secs: st,
+                            end_secs: et,
+                            start_formatted: Self::format_srt_time(st),
+                            end_formatted: Self::format_srt_time(et),
+                            text: lines[i].text.clone(),
+                        });
+                    }
+
+                    return results;
                 }
 
-                return results;
+                // Case B: M < N (Fewer speech segments than script lines - rapid continuous speech)
+                // Partition N script lines into M groups using DP
+                if m < n {
+                    let seg_durs: Vec<f64> = speech_segments.iter().map(|s| (s.end - s.start).max(0.08)).collect();
+                    let line_target_durs: Vec<f64> = weights.iter().map(|w| (w / total_weight) * total_speech_time).collect();
+
+                    let mut cum_line_dur = vec![0.0; n + 1];
+                    for k in 0..n {
+                        cum_line_dur[k + 1] = cum_line_dur[k] + line_target_durs[k];
+                    }
+
+                    let inf = 1e12_f64;
+                    let mut dp = vec![vec![inf; n + 1]; m + 1];
+                    let mut parent = vec![vec![0usize; n + 1]; m + 1];
+
+                    dp[0][0] = 0.0;
+
+                    for j in 1..=m {
+                        let seg_d = seg_durs[j - 1];
+                        for i in j..=n {
+                            for k in (j - 1)..i {
+                                if dp[j - 1][k] >= inf {
+                                    continue;
+                                }
+                                let allocated_line_d = cum_line_dur[i] - cum_line_dur[k];
+                                let diff = allocated_line_d - seg_d;
+                                let cost = dp[j - 1][k] + diff * diff;
+                                if cost < dp[j][i] {
+                                    dp[j][i] = cost;
+                                    parent[j][i] = k;
+                                }
+                            }
+                        }
+                    }
+
+                    let mut boundaries = vec![0usize; m + 1];
+                    let mut curr_i = n;
+                    for j in (1..=m).rev() {
+                        boundaries[j] = curr_i;
+                        curr_i = parent[j][curr_i];
+                    }
+                    boundaries[0] = 0;
+
+                    let mut results = Vec::with_capacity(n);
+                    for j in 0..m {
+                        let start_line_idx = boundaries[j];
+                        let end_line_idx = boundaries[j + 1];
+                        let seg = &speech_segments[j];
+                        let seg_total_dur = (seg.end - seg.start).max(0.1);
+
+                        let lines_in_seg = end_line_idx - start_line_idx;
+                        let group_weight: f64 = (start_line_idx..end_line_idx).map(|idx| weights[idx]).sum();
+
+                        let mut curr_t = seg.start;
+                        for l_idx in start_line_idx..end_line_idx {
+                            let w = weights[l_idx];
+                            let frac = if group_weight > 0.0 { w / group_weight } else { 1.0 / lines_in_seg as f64 };
+                            let item_dur = frac * seg_total_dur;
+                            let item_start = curr_t;
+                            let item_end = (curr_t + item_dur).max(item_start + 0.25);
+                            curr_t += item_dur;
+
+                            results.push(SubtitleItem {
+                                index: results.len() + 1,
+                                start_secs: item_start,
+                                end_secs: item_end,
+                                start_formatted: Self::format_srt_time(item_start),
+                                end_formatted: Self::format_srt_time(item_end),
+                                text: lines[l_idx].text.clone(),
+                            });
+                        }
+                    }
+
+                    return results;
+                }
             }
         }
 
-        // 2. Fallback: Proportional allocation across duration
+        // Fallback: Proportional allocation across duration
         let effective_start = start_offset;
         let effective_end = (total_duration - end_margin).max(effective_start + 0.5);
         let available_duration = effective_end - effective_start;
