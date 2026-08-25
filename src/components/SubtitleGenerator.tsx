@@ -470,8 +470,9 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
       const delta = newStart - target.start_secs;
 
       return prev.map((item, i) => {
+        // Previous items (guard overlap)
         if (i < index) {
-          if (rippleEdit && delta < 0 && i === index - 1 && item.end_secs > newStart - 0.05) {
+          if (delta < 0 && i === index - 1 && item.end_secs > newStart - 0.05) {
             const adjEnd = Math.max(item.start_secs + 0.1, newStart - 0.05);
             return {
               ...item,
@@ -482,6 +483,7 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
           return item;
         }
 
+        // Current item
         if (i === index) {
           return {
             ...item,
@@ -492,7 +494,7 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
           };
         }
 
-        // Subsequent items (i > index)
+        // Subsequent items
         if (rippleEdit) {
           const cascadeStart = Math.max(0, item.start_secs + delta);
           const cascadeEnd = Math.max(cascadeStart + 0.15, item.end_secs + delta);
@@ -502,6 +504,17 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
             end_secs: cascadeEnd,
             start_formatted: formatSrtTimestamp(cascadeStart),
             end_formatted: formatSrtTimestamp(cascadeEnd),
+          };
+        } else if (i === index + 1 && item.start_secs < newEnd + 0.05) {
+          // Even if rippleEdit is OFF, resolve immediate overlap with next item
+          const adjNextStart = newEnd + 0.05;
+          const adjNextEnd = Math.max(adjNextStart + 0.2, item.end_secs);
+          return {
+            ...item,
+            start_secs: adjNextStart,
+            end_secs: adjNextEnd,
+            start_formatted: formatSrtTimestamp(adjNextStart),
+            end_formatted: formatSrtTimestamp(adjNextEnd),
           };
         }
 
@@ -526,8 +539,9 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
       if (Math.abs(delta) < 0.001) return prev;
 
       return prev.map((item, i) => {
+        // Previous items: auto resolve overlap when start is pulled earlier
         if (i < index) {
-          if (rippleEdit && delta < 0 && i === index - 1 && item.end_secs > newStart - 0.05) {
+          if (i === index - 1 && item.end_secs > newStart - 0.05) {
             const adjEnd = Math.max(item.start_secs + 0.1, newStart - 0.05);
             return {
               ...item,
@@ -538,8 +552,12 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
           return item;
         }
 
+        // Current item
         if (i === index) {
-          const itemEnd = rippleEdit ? Math.max(newStart + 0.15, target.end_secs + delta) : target.end_secs;
+          let itemEnd = rippleEdit ? Math.max(newStart + 0.15, target.end_secs + delta) : target.end_secs;
+          if (itemEnd <= newStart + 0.1) {
+            itemEnd = newStart + 0.3;
+          }
           return {
             ...item,
             start_secs: newStart,
@@ -549,7 +567,7 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
           };
         }
 
-        // Subsequent items (i > index)
+        // Subsequent items
         if (rippleEdit) {
           const cascadeStart = Math.max(0, item.start_secs + delta);
           const cascadeEnd = Math.max(cascadeStart + 0.15, item.end_secs + delta);
@@ -560,6 +578,20 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
             start_formatted: formatSrtTimestamp(cascadeStart),
             end_formatted: formatSrtTimestamp(cascadeEnd),
           };
+        } else if (i === index + 1) {
+          // Resolve overlap with immediate next item if current end encroaches
+          const currentEnd = Math.max(newStart + 0.15, target.end_secs);
+          if (item.start_secs < currentEnd + 0.05) {
+            const adjStart = currentEnd + 0.05;
+            const adjEnd = Math.max(adjStart + 0.2, item.end_secs);
+            return {
+              ...item,
+              start_secs: adjStart,
+              end_secs: adjEnd,
+              start_formatted: formatSrtTimestamp(adjStart),
+              end_formatted: formatSrtTimestamp(adjEnd),
+            };
+          }
         }
 
         return item;
@@ -578,6 +610,7 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
       return prev.map((item, i) => {
         if (i < index) return item;
 
+        // Current item
         if (i === index) {
           return {
             ...item,
@@ -586,7 +619,7 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
           };
         }
 
-        // Subsequent items (i > index)
+        // Subsequent items
         if (rippleEdit) {
           const cascadeStart = Math.max(0, item.start_secs + delta);
           const cascadeEnd = Math.max(cascadeStart + 0.15, item.end_secs + delta);
@@ -596,6 +629,17 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
             end_secs: cascadeEnd,
             start_formatted: formatSrtTimestamp(cascadeStart),
             end_formatted: formatSrtTimestamp(cascadeEnd),
+          };
+        } else if (i === index + 1 && item.start_secs < newEnd + 0.05) {
+          // Auto resolve overlap with next item: push next item start
+          const adjNextStart = newEnd + 0.05;
+          const adjNextEnd = Math.max(adjNextStart + 0.2, item.end_secs);
+          return {
+            ...item,
+            start_secs: adjNextStart,
+            end_secs: adjNextEnd,
+            start_formatted: formatSrtTimestamp(adjNextStart),
+            end_formatted: formatSrtTimestamp(adjNextEnd),
           };
         }
 
