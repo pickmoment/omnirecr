@@ -74,7 +74,6 @@ export async function runLocalWhisperTranscribe(
 
   onProgress?.('로컬 AI가 실제 음성 단어 및 타임코드를 분석 중입니다...', 60);
 
-  // Clone or ensure clean float buffer slice to avoid WASM memory detachment issues on re-run
   const cleanPcm = new Float32Array(audioPcm);
 
   let output;
@@ -114,66 +113,120 @@ export async function runLocalWhisperTranscribe(
 }
 
 /**
- * Split script into sentences or chunks according to user split mode
+ * Robust sentence and chunk splitter for subtitles
  */
 export function splitScriptIntoLines(
   rawText: string,
-  mode: SubtitleSplitMode = 'auto',
+  mode: SubtitleSplitMode = 'sentence',
   maxChars: number = 28
 ): string[] {
+  // 1. Remove timestamps like [00:01.00]
   const lrcRegex = /\[\d{1,2}:\d{2}(?:\.\d+)?\]/g;
-  const cleanRaw = rawText.replace(lrcRegex, '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-  const rawLines = cleanRaw.split('\n').map((l) => l.trim()).filter((l) => l.length > 0);
+  const srtRegex = /\d{2}:\d{2}:\d{2}[,\.]\d{3}\s*-->\s*\d{2}:\d{2}:\d{2}[,\.]\d{3}/g;
+  const cleanRaw = rawText
+    .replace(lrcRegex, '')
+    .replace(srtRegex, '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n');
 
-  const results: string[] = [];
+  // 2. Line mode: return non-empty lines directly
+  if (mode === 'line') {
+    return cleanRaw
+      .split('\n')
+      .map((l) => l.trim())
+      .filter((l) => l.length > 0);
+  }
 
-  for (const line of rawLines) {
-    if (mode === 'line') {
-      results.push(line);
-      continue;
-    }
+  // 3. Sentence / Auto / Length splitting
+  const initialLines = cleanRaw.split('\n').map((l) => l.trim()).filter((l) => l.length > 0);
+  const sentences: string[] = [];
 
-    // Sentence splitting by punctuation (. ? ! … 。)
-    const sentences: string[] = [];
+  for (const line of initialLines) {
+    // Regex splits by: . ? ! … 。 optionally followed by closing quotes, when not part of decimals (e.g. 3.14)
+    // We match sentence boundaries robustly
+    const parts: string[] = [];
     let cur = '';
+
     for (let i = 0; i < line.length; i++) {
       const ch = line[i];
       cur += ch;
-      if (ch === '.' || ch === '?' || ch === '!' || ch === '…' || ch === '。') {
-        const nextIsSpace = i + 1 >= line.length || /\s/.test(line[i + 1]);
-        if (nextIsSpace) {
-          if (cur.trim()) sentences.push(cur.trim());
-          cur = '';
+
+      const isEndingPunct = ch === '.' || ch === '?' || ch === '!' || ch === '…' || ch === '。' || ch === '~';
+      if (isEndingPunct) {
+        // Check if next char is decimal digit (e.g., 3.14)
+        const isDecimal = ch === '.' && i > 0 && /\d/.test(line[i - 1]) && i + 1 < line.length && /\d/.test(line[i + 1]);
+        if (!isDecimal) {
+          // Check if followed by closing quote or parenthesis
+          let nextIdx = i + 1;
+          while (nextIdx < line.length && /["'”’」』\)\]]/.test(line[nextIdx])) {
+            cur += line[nextIdx];
+            i = nextIdx;
+            nextIdx++;
+          }
+
+          if (cur.trim()) {
+            parts.push(cur.trim());
+            cur = '';
+          }
         }
       }
     }
-    if (cur.trim()) sentences.push(cur.trim());
 
-    for (const s of sentences) {
-      if (mode === 'sentence' || (mode === 'auto' && s.length <= maxChars)) {
-        results.push(s);
-      } else {
-        // Length chunking
-        const words = s.split(/\s+/);
-        let chunk = '';
-        for (const w of words) {
-          if (chunk.length + w.length + 1 > maxChars && chunk.length > 0) {
-            results.push(chunk.trim());
-            chunk = w;
-          } else {
-            chunk += (chunk ? ' ' : '') + w;
-          }
+    if (cur.trim()) {
+      parts.push(cur.trim());
+    }
+
+    // If no punctuation was found in this line, the whole line is treated as 1 sentence
+    if (parts.length === 0 && line.trim()) {
+      parts.push(line.trim());
+    }
+
+    for (const p of parts) {
+      if (mode === 'sentence') {
+        sentences.push(p);
+      } else if (mode === 'auto' || mode === 'length') {
+        if (p.length <= maxChars) {
+          sentences.push(p);
+        } else {
+          // Split long sentence by commas or spaces into sub-chunks
+          const subChunks = splitByLength(p, maxChars);
+          sentences.push(...subChunks);
         }
-        if (chunk.trim()) results.push(chunk.trim());
       }
     }
   }
 
-  return results.filter((r) => r.length > 0);
+  return sentences.filter((s) => s.length > 0);
+}
+
+function splitByLength(text: string, maxChars: number): string[] {
+  if (text.length <= maxChars) return [text];
+
+  const words = text.split(/\s+/).filter((w) => w.length > 0);
+  if (words.length <= 1) return [text];
+
+  const chunks: string[] = [];
+  let current = '';
+
+  for (const w of words) {
+    if (current.length + w.length + 1 > maxChars && current.length > 0) {
+      chunks.push(current.trim());
+      current = w;
+    } else {
+      current += (current ? ' ' : '') + w;
+    }
+  }
+
+  if (current.trim()) {
+    chunks.push(current.trim());
+  }
+
+  return chunks;
 }
 
 /**
  * Forced Alignment: Align user script lines with AI Whisper detected speech chunks
+ * using text search and token timestamp mapping
  */
 export function alignScriptWithWhisperChunks(
   scriptLines: string[],
@@ -182,7 +235,6 @@ export function alignScriptWithWhisperChunks(
 ): SubtitleItem[] {
   if (scriptLines.length === 0) return [];
 
-  // If no chunks produced by whisper, return simple fallback
   if (chunks.length === 0) {
     const durPerLine = totalDuration / scriptLines.length;
     return scriptLines.map((line, idx) => {
@@ -216,7 +268,6 @@ export function alignScriptWithWhisperChunks(
     });
   }
 
-  // If token list is empty, treat each chunk as a unit
   if (tokens.length === 0) {
     return chunks.map((c, idx) => ({
       index: idx + 1,
@@ -228,29 +279,59 @@ export function alignScriptWithWhisperChunks(
     }));
   }
 
-  // Calculate character length weight of each script line
-  const lineWeights = scriptLines.map((l) => Math.max(1, cleanText(l).length));
-  const totalLineWeight = lineWeights.reduce((a, b) => a + b, 0);
-
   const numLines = scriptLines.length;
   const numTokens = tokens.length;
 
-  let results: SubtitleItem[] = [];
+  // Compute character weight of each line
+  const lineWeights = scriptLines.map((l) => Math.max(1, cleanText(l).length));
+  const totalLineWeight = lineWeights.reduce((a, b) => a + b, 0);
+
+  const results: SubtitleItem[] = [];
   let tokenIdx = 0;
 
   for (let i = 0; i < numLines; i++) {
     const line = scriptLines[i];
-    const lineWeight = lineWeights[i];
-    const tokenQuota = Math.max(1, Math.round((lineWeight / totalLineWeight) * numTokens));
+    const lineClean = cleanText(line);
+    const lineWords = lineClean.split(/\s+/).filter((w) => w.length > 0);
 
-    const startToken = tokens[tokenIdx] || tokens[tokens.length - 1];
-    const endTokenIdx = Math.min(tokens.length - 1, tokenIdx + tokenQuota - 1);
-    const endToken = tokens[endTokenIdx] || startToken;
+    // Try to find the matching words in tokens starting from tokenIdx
+    let matchStartIdx = tokenIdx;
+    let matchEndIdx = tokenIdx;
+
+    const firstWord = lineWords[0];
+    const lastWord = lineWords[lineWords.length - 1];
+
+    // Search for firstWord within a search window of next 15 tokens
+    if (firstWord) {
+      for (let s = tokenIdx; s < Math.min(numTokens, tokenIdx + 15); s++) {
+        if (tokens[s].text.includes(firstWord) || firstWord.includes(tokens[s].text)) {
+          matchStartIdx = s;
+          break;
+        }
+      }
+    }
+
+    // Expected token count for this line
+    const expectedTokenCount = Math.max(1, Math.round((lineWeights[i] / totalLineWeight) * numTokens));
+    matchEndIdx = Math.min(numTokens - 1, matchStartIdx + expectedTokenCount - 1);
+
+    // Refine matchEndIdx with lastWord if possible
+    if (lastWord) {
+      for (let e = matchStartIdx; e < Math.min(numTokens, matchStartIdx + expectedTokenCount + 10); e++) {
+        if (tokens[e].text.includes(lastWord) || lastWord.includes(tokens[e].text)) {
+          matchEndIdx = e;
+          break;
+        }
+      }
+    }
+
+    const startToken = tokens[matchStartIdx] || tokens[tokenIdx] || tokens[0];
+    const endToken = tokens[matchEndIdx] || startToken;
 
     let startTime = startToken.start;
     let endTime = Math.max(startTime + 0.35, endToken.end);
 
-    // Prevent overlap with previous subtitle
+    // Ensure non-overlapping monotonicity
     if (results.length > 0) {
       const prevEnd = results[results.length - 1].end_secs;
       if (startTime < prevEnd + 0.05) {
@@ -268,14 +349,14 @@ export function alignScriptWithWhisperChunks(
       text: line,
     });
 
-    tokenIdx = Math.min(tokens.length - 1, tokenIdx + tokenQuota);
+    tokenIdx = Math.min(numTokens - 1, matchEndIdx + 1);
   }
 
   return results;
 }
 
 function cleanText(t: string): string {
-  return t.replace(/[.,?!…~'"`\-_/\\]/g, '').toLowerCase().trim();
+  return t.replace(/[.,?!…~'"`\-_/\\()\[\]]/g, '').toLowerCase().trim();
 }
 
 function formatSrtTime(secs: number): string {

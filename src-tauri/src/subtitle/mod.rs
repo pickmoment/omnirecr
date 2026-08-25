@@ -273,24 +273,31 @@ impl SubtitleController {
         parsed_results
     }
 
-    /// Split string into sentences by punctuation (. ? ! … 。)
+    /// Split string into sentences by punctuation (. ? ! … 。 ~)
     fn split_into_sentences(text: &str) -> Vec<String> {
         let mut result = Vec::new();
         let mut current = String::new();
         let chars: Vec<char> = text.chars().collect();
         let len = chars.len();
 
-        for (i, &ch) in chars.iter().enumerate() {
+        let mut i = 0;
+        while i < len {
+            let ch = chars[i];
             current.push(ch);
 
-            if ch == '.' || ch == '?' || ch == '!' || ch == '…' || ch == '。' {
-                let next_is_space_or_end = if i + 1 < len {
-                    chars[i + 1].is_whitespace()
-                } else {
-                    true
-                };
+            let is_punct = ch == '.' || ch == '?' || ch == '!' || ch == '…' || ch == '。' || ch == '~';
+            if is_punct {
+                // Check if decimal number like 3.14
+                let is_decimal = ch == '.' && i > 0 && chars[i - 1].is_ascii_digit() && i + 1 < len && chars[i + 1].is_ascii_digit();
+                if !is_decimal {
+                    // Include any trailing quotes or brackets
+                    let mut next_idx = i + 1;
+                    while next_idx < len && (chars[next_idx] == '"' || chars[next_idx] == '\'' || chars[next_idx] == '”' || chars[next_idx] == '’' || chars[next_idx] == '」' || chars[next_idx] == '』' || chars[next_idx] == ')' || chars[next_idx] == ']') {
+                        current.push(chars[next_idx]);
+                        i = next_idx;
+                        next_idx += 1;
+                    }
 
-                if next_is_space_or_end {
                     let trimmed = current.trim().to_string();
                     if !trimmed.is_empty() {
                         result.push(trimmed);
@@ -298,6 +305,8 @@ impl SubtitleController {
                     current.clear();
                 }
             }
+
+            i += 1;
         }
 
         let remaining = current.trim().to_string();
