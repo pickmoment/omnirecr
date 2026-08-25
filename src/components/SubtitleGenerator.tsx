@@ -72,6 +72,7 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
   const [duration, setDuration] = useState<number>(0);
   const [isMuted, setIsMuted] = useState<boolean>(false);
   const [highlightedIndex, setHighlightedIndex] = useState<number | null>(null);
+  const [autoScroll, setAutoScroll] = useState<boolean>(true);
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const subtitleListRef = useRef<HTMLDivElement | null>(null);
@@ -138,6 +139,18 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
       }
     };
   }, [audioBlobUrl]);
+
+  // Auto scroll to active subtitle during playback
+  useEffect(() => {
+    if (!autoScroll || !isPlaying || highlightedIndex === null) return;
+
+    if (activeItemRef.current && subtitleListRef.current) {
+      activeItemRef.current.scrollIntoView({
+        behavior: 'smooth',
+        block: 'nearest',
+      });
+    }
+  }, [highlightedIndex, isPlaying, autoScroll]);
 
   // Handle select script file
   const handleSelectScriptFile = async () => {
@@ -919,6 +932,20 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
                     className="pl-8 pr-2.5 py-1 text-xs bg-slate-950 border border-slate-800 rounded-lg text-slate-200 focus:outline-none focus:border-orange-500/60 w-32 focus:w-44 transition-all"
                   />
                 </div>
+
+                {/* Auto Scroll Toggle */}
+                <button
+                  onClick={() => setAutoScroll(!autoScroll)}
+                  className={`px-2 py-1 rounded-lg text-[11px] font-medium border transition flex items-center gap-1 ${
+                    autoScroll
+                      ? 'bg-orange-950/60 border-orange-600/50 text-orange-300 shadow-sm'
+                      : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200'
+                  }`}
+                  title="재생 중 현재 자막 위치로 자동 스크롤"
+                >
+                  <Check className={`w-3 h-3 ${autoScroll ? 'text-orange-400 opacity-100' : 'opacity-0'}`} />
+                  <span>자동 스크롤</span>
+                </button>
 
                 {/* Shift Buttons */}
                 <div className="flex items-center bg-slate-950 rounded-lg border border-slate-800 p-0.5 text-[11px]">
