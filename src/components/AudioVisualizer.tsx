@@ -42,7 +42,7 @@ export const AudioVisualizer: React.FC<AudioVisualizerProps> = ({
         <div className="flex items-center justify-between text-xs">
           <span className="flex items-center gap-1.5 text-slate-300 font-medium">
             <Volume2 className={`w-3.5 h-3.5 ${systemAudioEnabled ? 'text-blue-400' : 'text-slate-600'}`} />
-            <span>시스템 사운드 (WASAPI)</span>
+            <span>시스템 사운드</span>
           </span>
           <span className="text-[11px] font-mono text-slate-400">
             {systemAudioEnabled && isRecording ? `${sysLevelDb.toFixed(1)} dB` : 'OFF'}

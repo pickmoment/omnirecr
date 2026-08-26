@@ -2,7 +2,7 @@
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "omnirecr",
   "version": "0.1.0",
-  "identifier": "com.omnirec.app",
+  "identifier": "com.omnirec",
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:5173",
@@ -29,7 +29,7 @@
         "width": 800,
         "height": 600,
         "resizable": false,
-        "fullscreen": true,
+        "fullscreen": false,
         "decorations": false,
         "transparent": true,
         "alwaysOnTop": true,
@@ -67,7 +67,8 @@
     ],
     "macOS": {
       "frameworks": [],
-      "minimumSystemVersion": "10.13",
+      "minimumSystemVersion": "13.0",
+      "signingIdentity": "-",
       "infoPlist": "Info.plist"
     }
   }

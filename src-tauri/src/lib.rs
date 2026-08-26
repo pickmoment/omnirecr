@@ -13,6 +13,7 @@ use commands::AppState;
 use converter::AudioConverterController;
 use merger::MergerController;
 use recorder::RecorderController;
+use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -36,6 +37,14 @@ pub fn run() {
         .manage(app_state)
         .setup(move |app| {
             recorder.set_app_handle(app.handle().clone());
+            if let Some(window) = app.get_webview_window("selection-overlay") {
+                let _ = window.hide();
+                let _ = window.set_fullscreen(false);
+            }
+            if let Some(window) = app.get_webview_window("mini-controller") {
+                let _ = window.hide();
+            }
+
 
             #[cfg(target_os = "windows")]
             start_global_hotkeys(app.handle().clone(), recorder_for_hotkey);

@@ -6,5 +6,7 @@
     <string>OmniRec requires microphone access to record voice narration and audio.</string>
     <key>NSScreenCaptureUsageDescription</key>
     <string>OmniRec requires screen recording permission to record your display.</string>
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>OmniRec requires system audio access to record sound played by your Mac.</string>
 </dict>
 </plist>

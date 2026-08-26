@@ -26,6 +26,9 @@ impl ScreenRecorderSession {
         region: Option<RectRegion>,
         event_sender: Sender<AudioEngineEvent>,
     ) -> Result<Self, String> {
+        #[cfg(target_os = "macos")]
+        crate::audio::macos::ensure_screen_capture_permission()?;
+
         let ffmpeg_path = SettingsManager::find_ffmpeg(settings.custom_ffmpeg_path.as_deref())?;
 
         let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();

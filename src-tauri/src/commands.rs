@@ -60,7 +60,18 @@ pub fn start_screen_record(
     // Small delay to allow window minimize animation to finish on Windows
     std::thread::sleep(std::time::Duration::from_millis(300));
 
-    state.recorder.start_screen(&settings, region)
+    let result = state.recorder.start_screen(&settings, region);
+    if result.is_err() {
+        if let Some(mini_win) = app.get_webview_window("mini-controller") {
+            let _ = mini_win.hide();
+        }
+        if let Some(main_win) = app.get_webview_window("main") {
+            let _ = main_win.unminimize();
+            let _ = main_win.show();
+            let _ = main_win.set_focus();
+        }
+    }
+    result
 }
 
 #[tauri::command]

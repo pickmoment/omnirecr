@@ -60,18 +60,37 @@ impl AudioCaptureEngine {
         let auto_stop_enabled = settings.auto_stop_enabled;
         let auto_stop_sec = settings.auto_stop_seconds;
 
-        let target_sample_rate = settings.audio_sample_rate as f32;
+        let target_sample_rate_hz = settings.audio_sample_rate;
+        let target_sample_rate = target_sample_rate_hz as f32;
+
+        let (sys_tx, sys_rx) = channel::<Vec<f32>>();
+
+        #[cfg(target_os = "macos")]
+        let mac_system_capture = if system_enabled {
+            Some(crate::audio::macos::MacSystemAudioCapture::start(
+                sys_tx.clone(),
+                target_sample_rate_hz,
+            )?)
+        } else {
+            None
+        };
 
         let handle = thread::spawn(move || {
             let host = cpal::default_host();
 
-            let (sys_tx, sys_rx) = channel::<Vec<f32>>();
             let (mic_tx, mic_rx) = channel::<Vec<f32>>();
 
+            #[cfg(target_os = "macos")]
+            let sys_actual_rate = target_sample_rate;
+            #[cfg(not(target_os = "macos"))]
             let mut sys_actual_rate = target_sample_rate;
             let mut mic_actual_rate = target_sample_rate;
 
-            // 1. WASAPI Loopback (System Audio) Capture
+            // 1. Platform system-output capture
+            #[cfg(target_os = "macos")]
+            let _sys_stream = mac_system_capture;
+
+            #[cfg(not(target_os = "macos"))]
             let _sys_stream = if system_enabled {
                 if let Some(device) = host.default_output_device() {
                     let default_cfg = device.default_output_config().ok();
