@@ -143,9 +143,11 @@ impl NoiseGate {
 
         // Smooth envelope follower with fast attack and natural decay
         if abs_sample > self.envelope {
-            self.envelope = self.attack_coeff * self.envelope + (1.0 - self.attack_coeff) * abs_sample;
+            self.envelope =
+                self.attack_coeff * self.envelope + (1.0 - self.attack_coeff) * abs_sample;
         } else {
-            self.envelope = self.release_coeff * self.envelope + (1.0 - self.release_coeff) * abs_sample;
+            self.envelope =
+                self.release_coeff * self.envelope + (1.0 - self.release_coeff) * abs_sample;
         }
 
         // Gate state machine with hysteresis and hold timer
@@ -173,9 +175,11 @@ impl NoiseGate {
 
         // Smooth gain transition (anti-click)
         if target_gain > self.current_gain {
-            self.current_gain = self.attack_coeff * self.current_gain + (1.0 - self.attack_coeff) * target_gain;
+            self.current_gain =
+                self.attack_coeff * self.current_gain + (1.0 - self.attack_coeff) * target_gain;
         } else {
-            self.current_gain = self.release_coeff * self.current_gain + (1.0 - self.release_coeff) * target_gain;
+            self.current_gain =
+                self.release_coeff * self.current_gain + (1.0 - self.release_coeff) * target_gain;
         }
 
         sample * self.current_gain
@@ -369,7 +373,11 @@ mod tests {
 
         let ratio_30hz = (out_30hz_energy / (in_30hz_energy * 0.79)).sqrt();
         // 30Hz should be significantly attenuated (>10dB attenuation, ratio < 0.3)
-        assert!(ratio_30hz < 0.35, "30Hz signal must be attenuated by HPF, got ratio: {}", ratio_30hz);
+        assert!(
+            ratio_30hz < 0.35,
+            "30Hz signal must be attenuated by HPF, got ratio: {}",
+            ratio_30hz
+        );
 
         // Test 1000Hz signal passes through
         let mut hpf_1k = BiquadHighPass80Hz::new(sample_rate);
@@ -385,7 +393,11 @@ mod tests {
             }
         }
         let ratio_1k = (out_1k_energy / (in_1k_energy * 0.79)).sqrt();
-        assert!((ratio_1k - 1.0).abs() < 0.05, "1000Hz signal should pass with unity gain, got: {}", ratio_1k);
+        assert!(
+            (ratio_1k - 1.0).abs() < 0.05,
+            "1000Hz signal should pass with unity gain, got: {}",
+            ratio_1k
+        );
     }
 
     #[test]
@@ -405,7 +417,11 @@ mod tests {
 
         // Noise should be attenuated to near the floor (-36dB gain reduction)
         let avg_out = output_sum / 2800.0;
-        assert!(avg_out < 0.0001, "Low level noise must be heavily attenuated by noise gate, got: {}", avg_out);
+        assert!(
+            avg_out < 0.0001,
+            "Low level noise must be heavily attenuated by noise gate, got: {}",
+            avg_out
+        );
     }
 
     #[test]
@@ -438,5 +454,32 @@ mod tests {
             "Resampled output frames count mismatch: got {}, expected ~48000",
             output_frames
         );
+    }
+
+    #[test]
+    fn resampling_48khz_capture_to_44_1khz_preserves_pitch_and_duration() {
+        let mut resampler = StereoLinearResampler::new(48_000.0, 44_100.0);
+        let mut output = Vec::new();
+
+        for chunk_start in (0..48_000).step_by(480) {
+            let chunk_end = (chunk_start + 480).min(48_000);
+            let mut input = Vec::with_capacity((chunk_end - chunk_start) * 2);
+            for frame in chunk_start..chunk_end {
+                let t = frame as f32 / 48_000.0;
+                let sample = (2.0 * std::f32::consts::PI * 440.0 * t).sin();
+                input.push(sample);
+                input.push(sample);
+            }
+            resampler.process_interleaved(&input, &mut output);
+        }
+
+        let left: Vec<f32> = output.chunks_exact(2).map(|frame| frame[0]).collect();
+        let positive_crossings = left
+            .windows(2)
+            .filter(|samples| samples[0] <= 0.0 && samples[1] > 0.0)
+            .count();
+
+        assert!((left.len() as i32 - 44_100).abs() <= 2);
+        assert!((positive_crossings as i32 - 440).abs() <= 1);
     }
 }

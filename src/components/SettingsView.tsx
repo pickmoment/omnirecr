@@ -177,24 +177,27 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             </div>
 
             {/* Sample Rate */}
-            <div className="p-3.5 bg-slate-950/60 rounded-xl border border-slate-800 flex items-center justify-between">
-              <span className="text-xs font-semibold text-slate-300">오디오 샘플레이트 (Sample Rate)</span>
-              <div className="flex items-center gap-1.5">
-                {[44100, 48000].map((sr) => (
-                  <button
-                    key={sr}
-                    type="button"
-                    onClick={() => handleChange({ audio_sample_rate: sr })}
-                    className={`px-3 py-1 rounded-lg border text-xs font-mono font-bold transition ${
-                      localSettings.audio_sample_rate === sr
-                        ? 'bg-blue-600 border-blue-500 text-white'
-                        : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-200'
-                    }`}
-                  >
-                    {sr / 1000} kHz
-                  </button>
-                ))}
+            <div className="p-3.5 bg-slate-950/60 rounded-xl border border-slate-800 space-y-2">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-semibold text-slate-300">출력 샘플레이트 (Output Sample Rate)</span>
+                <div className="flex items-center gap-1.5">
+                  {[44100, 48000].map((sr) => (
+                    <button
+                      key={sr}
+                      type="button"
+                      onClick={() => handleChange({ audio_sample_rate: sr })}
+                      className={`px-3 py-1 rounded-lg border text-xs font-mono font-bold transition ${
+                        localSettings.audio_sample_rate === sr
+                          ? 'bg-blue-600 border-blue-500 text-white'
+                          : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-200'
+                      }`}
+                    >
+                      {sr / 1000} kHz
+                    </button>
+                  ))}
+                </div>
               </div>
+              <p className="text-[10px] text-slate-500">macOS 시스템 오디오는 내부적으로 48kHz로 캡처한 뒤 선택한 출력 레이트로 변환됩니다.</p>
             </div>
           </div>
         </div>

@@ -1,7 +1,10 @@
 use std::sync::mpsc::Sender;
 
 use screencapturekit::cm::CMSampleBufferExt;
+
 use screencapturekit::prelude::*;
+
+pub const SYSTEM_AUDIO_SAMPLE_RATE_HZ: u32 = 48_000;
 
 pub fn ensure_screen_capture_permission() -> Result<(), String> {
     let access = core_graphics::access::ScreenCaptureAccess;
@@ -20,7 +23,7 @@ pub struct MacSystemAudioCapture {
 }
 
 impl MacSystemAudioCapture {
-    pub fn start(sender: Sender<Vec<f32>>, sample_rate: u32) -> Result<Self, String> {
+    pub fn start(sender: Sender<Vec<f32>>) -> Result<Self, String> {
         ensure_screen_capture_permission()?;
         let content = SCShareableContent::get().map_err(|error| {
             format!("Unable to access macOS screen and system audio content: {error}")
@@ -39,7 +42,7 @@ impl MacSystemAudioCapture {
             .with_width(2)
             .with_height(2)
             .with_captures_audio(true)
-            .with_sample_rate(sample_rate as i32)
+            .with_sample_rate(SYSTEM_AUDIO_SAMPLE_RATE_HZ as i32)
             .with_channel_count(2)
             .with_excludes_current_process_audio(true);
 
