@@ -9,13 +9,15 @@ use crate::settings::SettingsManager;
 use crate::subtitle::SubtitleController;
 use crate::types::{
     AudioConvertTaskPayload, HistoryItem, MediaProbeInfo, MergeTaskPayload, RecordingStateStatus,
-    RecordingStatus, RectRegion, Settings, SubtitleGenerateResult, SubtitleGenerateTask,
+    RecordingStatus, RectRegion, ScreenCaptureInfo, Settings, SubtitleGenerateResult,
+    SubtitleGenerateTask,
 };
 
 pub struct AppState {
     pub recorder: Arc<RecorderController>,
     pub merger: Arc<MergerController>,
     pub converter: Arc<AudioConverterController>,
+    pub last_screen_capture: Arc<parking_lot::Mutex<Option<ScreenCaptureInfo>>>,
 }
 
 #[tauri::command]
@@ -221,15 +223,27 @@ pub fn cancel_conversion(state: State<AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn show_selection_overlay(app: AppHandle) -> Result<(), String> {
+pub fn show_selection_overlay(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    use tauri::Emitter;
+
     // 1. Hide main window so user sees clean screen
     if let Some(main_win) = app.get_webview_window("main") {
         let _ = main_win.hide();
     }
 
+    // Small delay to allow window to minimize/hide cleanly
     std::thread::sleep(std::time::Duration::from_millis(150));
 
-    // 2. Show fullscreen transparent overlay
+    // 2. Capture screenshot of the screen while main window is hidden
+    let capture_info = crate::recorder::capture::capture_screen_for_overlay().ok();
+    *state.last_screen_capture.lock() = capture_info.clone();
+
+    // 3. Emit screenshot to selection overlay
+    if let Some(info) = &capture_info {
+        let _ = app.emit("selection_screen_captured", info);
+    }
+
+    // 4. Show fullscreen overlay
     if let Some(window) = app.get_webview_window("selection-overlay") {
         let _ = window.set_fullscreen(true);
         let _ = window.set_always_on_top(true);
@@ -239,6 +253,11 @@ pub fn show_selection_overlay(app: AppHandle) -> Result<(), String> {
     } else {
         Err("Overlay window not found".to_string())
     }
+}
+
+#[tauri::command]
+pub fn get_selection_screen_capture(state: State<'_, AppState>) -> Option<ScreenCaptureInfo> {
+    state.last_screen_capture.lock().clone()
 }
 
 #[tauri::command]

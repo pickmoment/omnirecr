@@ -10,6 +10,14 @@ pub struct RectRegion {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScreenCaptureInfo {
+    pub image_data_url: String,
+    pub physical_width: u32,
+    pub physical_height: u32,
+    pub scale_factor: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
     pub output_dir: String,
     pub audio_format: String, // "mp3" | "m4a"

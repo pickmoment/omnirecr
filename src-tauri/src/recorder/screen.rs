@@ -56,13 +56,14 @@ impl ScreenRecorderSession {
 
             if let Some(r) = region {
                 // Even dimensions required for libx264 yuv420p
-                let w = (r.width / 2) * 2;
-                let h = (r.height / 2) * 2;
-                cmd.arg("-offset_x").arg(r.x.to_string())
-                    .arg("-offset_y").arg(r.y.to_string())
+                let w = ((r.width / 2) * 2).max(2);
+                let h = ((r.height / 2) * 2).max(2);
+                let x = r.x.max(0);
+                let y = r.y.max(0);
+                cmd.arg("-offset_x").arg(x.to_string())
+                    .arg("-offset_y").arg(y.to_string())
                     .arg("-video_size").arg(format!("{}x{}", w, h));
             }
-
             cmd.arg("-i").arg("desktop");
         }
 
@@ -75,12 +76,13 @@ impl ScreenRecorderSession {
                 .arg("-i").arg("1:none");
 
             if let Some(r) = region {
-                let w = (r.width / 2) * 2;
-                let h = (r.height / 2) * 2;
-                cmd.arg("-vf").arg(format!("crop={}:{}:{}:{}", w, h, r.x, r.y));
+                let w = ((r.width / 2) * 2).max(2);
+                let h = ((r.height / 2) * 2).max(2);
+                let x = r.x.max(0);
+                let y = r.y.max(0);
+                cmd.arg("-vf").arg(format!("crop={}:{}:{}:{}", w, h, x, y));
             }
         }
-
         #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
         {
             cmd.arg("-f").arg("x11grab")
@@ -88,10 +90,12 @@ impl ScreenRecorderSession {
                 .arg("-draw_mouse").arg("1");
 
             if let Some(r) = region {
-                let w = (r.width / 2) * 2;
-                let h = (r.height / 2) * 2;
+                let w = ((r.width / 2) * 2).max(2);
+                let h = ((r.height / 2) * 2).max(2);
+                let x = r.x.max(0);
+                let y = r.y.max(0);
                 cmd.arg("-video_size").arg(format!("{}x{}", w, h))
-                    .arg("-i").arg(format!(":0.0+{},{}", r.x, r.y));
+                    .arg("-i").arg(format!(":0.0+{},{}", x, y));
             } else {
                 cmd.arg("-i").arg(":0.0");
             }

@@ -5,6 +5,13 @@ export interface RectRegion {
   height: number;
 }
 
+export interface ScreenCaptureInfo {
+  image_data_url: string;
+  physical_width: number;
+  physical_height: number;
+  scale_factor: number;
+}
+
 export type AudioFormat = 'mp3' | 'm4a' | 'wav';
 
 export interface Settings {
