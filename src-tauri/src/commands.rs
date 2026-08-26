@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use tauri::{AppHandle, Manager, Position, PhysicalPosition, State};
+use tauri::{AppHandle, Manager, PhysicalPosition, Position, Size, State};
 
 use crate::converter::AudioConverterController;
 use crate::history::HistoryManager;
@@ -9,7 +9,7 @@ use crate::settings::SettingsManager;
 use crate::subtitle::SubtitleController;
 use crate::types::{
     AudioConvertTaskPayload, HistoryItem, MediaProbeInfo, MergeTaskPayload, RecordingStateStatus,
-    RecordingStatus, RectRegion, ScreenCaptureInfo, Settings, SubtitleGenerateResult,
+    RecordingStatus, RectRegion, SelectionScreenInfo, Settings, SubtitleGenerateResult,
     SubtitleGenerateTask,
 };
 
@@ -17,7 +17,7 @@ pub struct AppState {
     pub recorder: Arc<RecorderController>,
     pub merger: Arc<MergerController>,
     pub converter: Arc<AudioConverterController>,
-    pub last_screen_capture: Arc<parking_lot::Mutex<Option<ScreenCaptureInfo>>>,
+    pub last_selection_screen: Arc<parking_lot::Mutex<Option<SelectionScreenInfo>>>,
 }
 
 #[tauri::command]
@@ -226,38 +226,60 @@ pub fn cancel_conversion(state: State<AppState>) -> Result<(), String> {
 pub fn show_selection_overlay(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     use tauri::Emitter;
 
-    // 1. Hide main window so user sees clean screen
+    let window = app
+        .get_webview_window("selection-overlay")
+        .ok_or_else(|| "Overlay window not found".to_string())?;
+    let monitor = window
+        .current_monitor()
+        .map_err(|e| e.to_string())?
+        .or(window.primary_monitor().map_err(|e| e.to_string())?)
+        .ok_or_else(|| "영역을 선택할 디스플레이를 찾을 수 없습니다.".to_string())?;
+
+    let screen_info = SelectionScreenInfo {
+        physical_width: monitor.size().width,
+        physical_height: monitor.size().height,
+        scale_factor: monitor.scale_factor(),
+    };
+    *state.last_selection_screen.lock() = Some(screen_info.clone());
+
     if let Some(main_win) = app.get_webview_window("main") {
-        let _ = main_win.hide();
+        main_win.hide().map_err(|e| e.to_string())?;
     }
 
-    // Small delay to allow window to minimize/hide cleanly
-    std::thread::sleep(std::time::Duration::from_millis(150));
-
-    // 2. Capture screenshot of the screen while main window is hidden
-    let capture_info = crate::recorder::capture::capture_screen_for_overlay().ok();
-    *state.last_screen_capture.lock() = capture_info.clone();
-
-    // 3. Emit screenshot to selection overlay
-    if let Some(info) = &capture_info {
-        let _ = app.emit("selection_screen_captured", info);
-    }
-
-    // 4. Show fullscreen overlay
-    if let Some(window) = app.get_webview_window("selection-overlay") {
-        let _ = window.set_fullscreen(true);
-        let _ = window.set_always_on_top(true);
-        let _ = window.show();
-        let _ = window.set_focus();
+    let show_result = (|| -> Result<(), String> {
+        window.set_fullscreen(false).map_err(|e| e.to_string())?;
+        window
+            .set_position(Position::Physical(*monitor.position()))
+            .map_err(|e| e.to_string())?;
+        window
+            .set_size(Size::Physical(*monitor.size()))
+            .map_err(|e| e.to_string())?;
+        window.set_always_on_top(true).map_err(|e| e.to_string())?;
+        window.show().map_err(|e| e.to_string())?;
+        window.set_focus().map_err(|e| e.to_string())?;
         Ok(())
-    } else {
-        Err("Overlay window not found".to_string())
+    })();
+    if let Err(error) = show_result {
+        let _ = window.hide();
+        restore_main_window(&app);
+        return Err(error);
     }
+
+    let _ = app.emit("selection_screen_ready", &screen_info);
+    Ok(())
 }
 
 #[tauri::command]
-pub fn get_selection_screen_capture(state: State<'_, AppState>) -> Option<ScreenCaptureInfo> {
-    state.last_screen_capture.lock().clone()
+pub fn get_selection_screen_info(state: State<'_, AppState>) -> Option<SelectionScreenInfo> {
+    state.last_selection_screen.lock().clone()
+}
+
+fn restore_main_window(app: &AppHandle) {
+    if let Some(main_win) = app.get_webview_window("main") {
+        let _ = main_win.show();
+        let _ = main_win.unminimize();
+        let _ = main_win.set_focus();
+    }
 }
 
 #[tauri::command]
@@ -266,12 +288,7 @@ pub fn hide_selection_overlay(app: AppHandle) -> Result<(), String> {
         let _ = window.hide();
     }
 
-    // Restore main window
-    if let Some(main_win) = app.get_webview_window("main") {
-        let _ = main_win.show();
-        let _ = main_win.unminimize();
-        let _ = main_win.set_focus();
-    }
+    restore_main_window(&app);
 
     Ok(())
 }
@@ -283,12 +300,7 @@ pub fn confirm_selection_region(app: AppHandle, region: RectRegion) -> Result<()
         let _ = window.hide();
     }
 
-    // Restore main window
-    if let Some(main_win) = app.get_webview_window("main") {
-        let _ = main_win.show();
-        let _ = main_win.unminimize();
-        let _ = main_win.set_focus();
-    }
+    restore_main_window(&app);
 
     let _ = app.emit("region_selected", &region);
     Ok(())

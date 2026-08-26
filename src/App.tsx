@@ -278,7 +278,7 @@ export const App: React.FC = () => {
     try {
       await invoke('show_selection_overlay');
     } catch (err) {
-      console.error(err);
+      alert(`영역 선택을 열 수 없습니다: ${err}`);
     }
   };
 

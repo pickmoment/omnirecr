@@ -10,8 +10,7 @@ pub struct RectRegion {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ScreenCaptureInfo {
-    pub image_data_url: String,
+pub struct SelectionScreenInfo {
     pub physical_width: u32,
     pub physical_height: u32,
     pub scale_factor: f64,

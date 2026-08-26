@@ -1,5 +1,4 @@
 pub mod audio;
-pub mod capture;
 pub mod screen;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};

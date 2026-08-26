@@ -2,31 +2,31 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { Check, X, Crop, Monitor, Sparkles } from 'lucide-react';
-import type { RectRegion, ScreenCaptureInfo } from '../types';
+import type { RectRegion, SelectionScreenInfo } from '../types';
 
 export const SelectionOverlay: React.FC = () => {
-  const [screenshot, setScreenshot] = useState<ScreenCaptureInfo | null>(null);
+  const [screenInfo, setScreenInfo] = useState<SelectionScreenInfo | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [startPoint, setStartPoint] = useState<{ x: number; y: number } | null>(null);
   const [currentRect, setCurrentRect] = useState<RectRegion | null>(null);
 
-  // Fetch or listen for the screenshot captured just before showing the overlay
   useEffect(() => {
     let isMounted = true;
 
-    invoke<ScreenCaptureInfo | null>('get_selection_screen_capture')
+    invoke<SelectionScreenInfo | null>('get_selection_screen_info')
       .then((data) => {
         if (isMounted && data) {
-          setScreenshot(data);
+          setScreenInfo(data);
         }
       })
       .catch((err) => {
-        console.error('Failed to get selection screen capture:', err);
+        console.error('Failed to get selection screen info:', err);
       });
 
-    const unlistenPromise = listen<ScreenCaptureInfo>('selection_screen_captured', (event) => {
+    const unlistenPromise = listen<SelectionScreenInfo>('selection_screen_ready', (event) => {
       if (isMounted && event.payload) {
-        setScreenshot(event.payload);
+        setScreenInfo(event.payload);
+        setCurrentRect(null);
       }
     });
 
@@ -39,8 +39,8 @@ export const SelectionOverlay: React.FC = () => {
   const screenW = typeof window !== 'undefined' ? window.innerWidth : 1920;
   const screenH = typeof window !== 'undefined' ? window.innerHeight : 1080;
 
-  const scaleX = screenshot && screenW > 0 ? screenshot.physical_width / screenW : (typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1);
-  const scaleY = screenshot && screenH > 0 ? screenshot.physical_height / screenH : (typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1);
+  const scaleX = screenInfo && screenW > 0 ? screenInfo.physical_width / screenW : (typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1);
+  const scaleY = screenInfo && screenH > 0 ? screenInfo.physical_height / screenH : (typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1);
 
   // Converts CSS logical viewport rectangle to physical pixel rectangle for FFmpeg
   const getPhysicalRegion = useCallback(
@@ -61,8 +61,8 @@ export const SelectionOverlay: React.FC = () => {
       invoke('confirm_selection_region', { region: physical });
     } else {
       // Confirm full screen with exact physical dimensions
-      const fullPhysWidth = screenshot?.physical_width || Math.round(screenW * scaleX);
-      const fullPhysHeight = screenshot?.physical_height || Math.round(screenH * scaleY);
+      const fullPhysWidth = screenInfo?.physical_width || Math.round(screenW * scaleX);
+      const fullPhysHeight = screenInfo?.physical_height || Math.round(screenH * scaleY);
       const fullRect: RectRegion = {
         x: 0,
         y: 0,
@@ -71,7 +71,7 @@ export const SelectionOverlay: React.FC = () => {
       };
       invoke('confirm_selection_region', { region: fullRect });
     }
-  }, [currentRect, getPhysicalRegion, screenshot, screenW, screenH, scaleX, scaleY]);
+  }, [currentRect, getPhysicalRegion, screenInfo, screenW, screenH, scaleX, scaleY]);
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -160,15 +160,6 @@ export const SelectionOverlay: React.FC = () => {
         background: 'transparent',
       }}
     >
-      {/* 1. Captured Desktop Screen Backdrop (Ensures video/YouTube is 100% visible with 0 occlusion) */}
-      {screenshot?.image_data_url && (
-        <img
-          src={screenshot.image_data_url}
-          alt="Desktop"
-          className="absolute inset-0 w-full h-full object-fill pointer-events-none select-none z-0"
-          draggable={false}
-        />
-      )}
 
       {/* 2. Dimming Backdrop Rectangles around selection box (Leaves selected crop area 100% clear) */}
       {hasSelection ? (
@@ -250,8 +241,8 @@ export const SelectionOverlay: React.FC = () => {
           <button
             onClick={() => {
               const minDim = Math.min(
-                screenshot?.physical_width || 1080,
-                screenshot?.physical_height || 1080
+                screenInfo?.physical_width || 1080,
+                screenInfo?.physical_height || 1080
               );
               handleApplyPreset(minDim, minDim);
             }}

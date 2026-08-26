@@ -5,8 +5,7 @@ export interface RectRegion {
   height: number;
 }
 
-export interface ScreenCaptureInfo {
-  image_data_url: string;
+export interface SelectionScreenInfo {
   physical_width: number;
   physical_height: number;
   scale_factor: number;

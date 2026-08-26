@@ -25,7 +25,7 @@ pub fn run() {
         recorder: recorder.clone(),
         merger,
         converter,
-        last_screen_capture: Arc::new(parking_lot::Mutex::new(None)),
+        last_selection_screen: Arc::new(parking_lot::Mutex::new(None)),
     };
 
     let recorder_for_hotkey = recorder.clone();
@@ -76,7 +76,7 @@ pub fn run() {
             commands::convert_audio_files,
             commands::cancel_conversion,
             commands::show_selection_overlay,
-            commands::get_selection_screen_capture,
+            commands::get_selection_screen_info,
             commands::hide_selection_overlay,
             commands::confirm_selection_region,
             commands::save_subtitle_file,
