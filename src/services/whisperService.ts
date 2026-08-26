@@ -96,8 +96,10 @@ export async function runLocalWhisperTranscribe(
   if (output && Array.isArray(output.chunks)) {
     for (const c of output.chunks) {
       if (c && c.timestamp && Array.isArray(c.timestamp)) {
-        const start = Math.max(0, c.timestamp[0] ?? 0);
-        const end = Math.max(start + 0.1, c.timestamp[1] ?? start + 1.0);
+        const rawStart = typeof c.timestamp[0] === 'number' && !isNaN(c.timestamp[0]) ? c.timestamp[0] : 0;
+        const rawEnd = typeof c.timestamp[1] === 'number' && !isNaN(c.timestamp[1]) ? c.timestamp[1] : rawStart + 0.5;
+        const start = Math.max(0, rawStart);
+        const end = Math.max(start + 0.1, rawEnd);
         chunks.push({
           text: (c.text || '').trim(),
           timestamp: [start, end],
@@ -282,56 +284,195 @@ export function alignScriptWithWhisperChunks(
   const numLines = scriptLines.length;
   const numTokens = tokens.length;
 
-  // Compute character weight of each line
+  // --- Pre-build prefix-concatenated strings to avoid repeated slice+join ---
+  // prefixStr[i] = tokens[0..i-1] joined by space; prefixLen[i] = prefixStr[i].length
+  // Substring for tokens [a..b] = prefixStr[b+1].substring(prefixLen[a])
+  const tokenTexts = tokens.map((t) => t.text);
+  const prefixStr: string[] = new Array(numTokens + 1);
+  const prefixLen: number[] = new Array(numTokens + 1);
+  prefixStr[0] = '';
+  prefixLen[0] = 0;
+  for (let i = 0; i < numTokens; i++) {
+    prefixStr[i + 1] = i === 0 ? tokenTexts[i] : prefixStr[i] + ' ' + tokenTexts[i];
+    prefixLen[i + 1] = prefixStr[i + 1].length;
+  }
+
+  // Helper: get concatenated text for tokens [a..b] without allocation
+  function rangeText(a: number, b: number): string {
+    // Offset into prefixStr[b+1] starting after prefixStr[a]
+    const startOffset = a === 0 ? 0 : prefixLen[a] + 1; // +1 for the space separator
+    return prefixStr[b + 1].substring(startOffset);
+  }
+
+  // Compute character weight of each line for proportional token allocation
   const lineWeights = scriptLines.map((l) => Math.max(1, cleanText(l).length));
   const totalLineWeight = lineWeights.reduce((a, b) => a + b, 0);
 
-  const results: SubtitleItem[] = [];
-  let tokenIdx = 0;
+  // Proportional token allocation
+  const proportionalSizes: number[] = [];
+  for (let i = 0; i < numLines; i++) {
+    proportionalSizes.push(Math.max(1, Math.round((lineWeights[i] / totalLineWeight) * numTokens)));
+  }
+  let totalAllocated = proportionalSizes.reduce((a, b) => a + b, 0);
+  while (totalAllocated < numTokens) {
+    let maxIdx = 0;
+    for (let j = 1; j < numLines; j++) {
+      if (proportionalSizes[j] > proportionalSizes[maxIdx]) maxIdx = j;
+    }
+    proportionalSizes[maxIdx]++;
+    totalAllocated++;
+  }
+  while (totalAllocated > numTokens && numLines > 0) {
+    let maxIdx = 0;
+    for (let j = 1; j < numLines; j++) {
+      if (proportionalSizes[j] > proportionalSizes[maxIdx]) maxIdx = j;
+    }
+    if (proportionalSizes[maxIdx] > 1) {
+      proportionalSizes[maxIdx]--;
+      totalAllocated--;
+    } else {
+      break;
+    }
+  }
+
+  // --- Pre-allocate reusable DP buffers for LCS (max line length ~200 chars) ---
+  let dpBufSize = 0;
+  for (let i = 0; i < numLines; i++) {
+    const len = cleanText(scriptLines[i]).length;
+    if (len > dpBufSize) dpBufSize = len;
+  }
+  dpBufSize += 1;
+  let dpPrev = new Uint16Array(dpBufSize);
+  let dpCurr = new Uint16Array(dpBufSize);
+
+  // Inline LCS ratio using pre-allocated buffers — avoids per-call allocation
+  function lcsRatioFast(a: string, b: string): number {
+    let short = a, long = b;
+    if (a.length > b.length) { short = b; long = a; }
+    const m = short.length;
+    const n = long.length;
+    if (m === 0 || n === 0) return 0;
+
+    // Grow buffers if needed (rare — only if candidate text exceeds initial estimate)
+    if (m + 1 > dpPrev.length) {
+      dpPrev = new Uint16Array(m + 1);
+      dpCurr = new Uint16Array(m + 1);
+    }
+
+    dpPrev.fill(0, 0, m + 1);
+
+    for (let j = 1; j <= n; j++) {
+      dpCurr[0] = 0;
+      const bChar = long.charCodeAt(j - 1);
+      for (let i = 1; i <= m; i++) {
+        if (short.charCodeAt(i - 1) === bChar) {
+          dpCurr[i] = dpPrev[i - 1] + 1;
+        } else {
+          dpCurr[i] = dpCurr[i - 1] > dpPrev[i] ? dpCurr[i - 1] : dpPrev[i];
+        }
+      }
+      const swap = dpPrev; dpPrev = dpCurr; dpCurr = swap;
+    }
+
+    const lcsLen = dpPrev[m];
+    return (2 * lcsLen) / (m + n);
+  }
+
+  // --- Phase 1: Coarse-then-fine fuzzy alignment ---
+  interface LineMatch {
+    startToken: number;
+    endToken: number;
+    score: number;
+  }
+
+  const lineMatches: LineMatch[] = new Array(numLines);
+  let searchFloor = 0;
+
+  // Early-exit threshold: a near-perfect match means no need to keep scanning
+  const GOOD_ENOUGH = 0.85;
 
   for (let i = 0; i < numLines; i++) {
-    const line = scriptLines[i];
-    const lineClean = cleanText(line);
-    const lineWords = lineClean.split(/\s+/).filter((w) => w.length > 0);
+    const lineClean = cleanText(scriptLines[i]);
+    const expectedCount = proportionalSizes[i];
 
-    // Try to find the matching words in tokens starting from tokenIdx
-    let matchStartIdx = tokenIdx;
-    let matchEndIdx = tokenIdx;
+    const remainingLines = numLines - i - 1;
+    const searchCeiling = Math.min(numTokens, numTokens - remainingLines);
 
-    const firstWord = lineWords[0];
-    const lastWord = lineWords[lineWords.length - 1];
+    const windowHalf = Math.max(15, Math.round(expectedCount * 2));
+    const scanFrom = searchFloor; // monotonicity: never go back
+    const scanTo = Math.min(searchCeiling, searchFloor + expectedCount + windowHalf);
 
-    // Search for firstWord within a search window of next 15 tokens
-    if (firstWord) {
-      for (let s = tokenIdx; s < Math.min(numTokens, tokenIdx + 15); s++) {
-        if (tokens[s].text.includes(firstWord) || firstWord.includes(tokens[s].text)) {
-          matchStartIdx = s;
-          break;
-        }
+    let bestScore = -Infinity;
+    let bestStart = searchFloor;
+    let bestEnd = Math.min(numTokens - 1, searchFloor + expectedCount - 1);
+
+    const minSpan = Math.max(1, Math.round(expectedCount * 0.5));
+    const maxSpan = Math.min(scanTo - scanFrom, Math.round(expectedCount * 2.0));
+
+    // Coarse pass: stride 2 over start positions, only expectedCount span
+    let coarseBestStart = scanFrom;
+    let coarseBestScore = -Infinity;
+
+    for (let start = scanFrom; start < scanTo; start += 2) {
+      const end = Math.min(numTokens - 1, start + expectedCount - 1);
+      if (end < start || end >= searchCeiling + 3) continue;
+
+      const candidate = rangeText(start, end);
+      const score = lcsRatioFast(lineClean, candidate);
+
+      if (score > coarseBestScore) {
+        coarseBestScore = score;
+        coarseBestStart = start;
+        if (score >= GOOD_ENOUGH) break;
       }
     }
 
-    // Expected token count for this line
-    const expectedTokenCount = Math.max(1, Math.round((lineWeights[i] / totalLineWeight) * numTokens));
-    matchEndIdx = Math.min(numTokens - 1, matchStartIdx + expectedTokenCount - 1);
+    // Fine pass: dense search around coarse winner ± 3 positions, with span variations
+    const fineFrom = Math.max(scanFrom, coarseBestStart - 3);
+    const fineTo = Math.min(scanTo, coarseBestStart + 4);
 
-    // Refine matchEndIdx with lastWord if possible
-    if (lastWord) {
-      for (let e = matchStartIdx; e < Math.min(numTokens, matchStartIdx + expectedTokenCount + 10); e++) {
-        if (tokens[e].text.includes(lastWord) || lastWord.includes(tokens[e].text)) {
-          matchEndIdx = e;
-          break;
+    for (let start = fineFrom; start < fineTo; start++) {
+      for (let spanDelta = -2; spanDelta <= 3; spanDelta++) {
+        const span = expectedCount + spanDelta;
+        if (span < minSpan || span > maxSpan) continue;
+        const end = Math.min(numTokens - 1, start + span - 1);
+        if (end < start || end >= searchCeiling + 3) continue;
+
+        const candidate = rangeText(start, end);
+        const score = lcsRatioFast(lineClean, candidate);
+
+        if (score > bestScore) {
+          bestScore = score;
+          bestStart = start;
+          bestEnd = end;
+          if (score >= 0.95) break; // near-perfect in fine pass — stop
         }
       }
+      if (bestScore >= 0.95) break;
     }
 
-    const startToken = tokens[matchStartIdx] || tokens[tokenIdx] || tokens[0];
-    const endToken = tokens[matchEndIdx] || startToken;
+    // Use coarse result if fine pass didn't beat it
+    if (coarseBestScore > bestScore) {
+      bestScore = coarseBestScore;
+      bestStart = coarseBestStart;
+      bestEnd = Math.min(numTokens - 1, coarseBestStart + expectedCount - 1);
+    }
 
-    let startTime = startToken.start;
-    let endTime = Math.max(startTime + 0.35, endToken.end);
+    lineMatches[i] = { startToken: bestStart, endToken: bestEnd, score: bestScore };
+    searchFloor = bestEnd + 1;
+  }
 
-    // Ensure non-overlapping monotonicity
+  // --- Phase 2: Build subtitle items from Whisper's actual speech timestamps ---
+  const results: SubtitleItem[] = [];
+
+  for (let i = 0; i < numLines; i++) {
+    const match = lineMatches[i];
+    const startTok = tokens[match.startToken] || tokens[0];
+    const endTok = tokens[match.endToken] || startTok;
+
+    let startTime = startTok.start;
+    let endTime = Math.max(startTime + 0.35, endTok.end);
+
     if (results.length > 0) {
       const prevEnd = results[results.length - 1].end_secs;
       if (startTime < prevEnd + 0.05) {
@@ -340,16 +481,15 @@ export function alignScriptWithWhisperChunks(
       endTime = Math.max(startTime + 0.35, endTime);
     }
 
+
     results.push({
       index: i + 1,
       start_secs: startTime,
       end_secs: endTime,
       start_formatted: formatSrtTime(startTime),
       end_formatted: formatSrtTime(endTime),
-      text: line,
+      text: scriptLines[i],
     });
-
-    tokenIdx = Math.min(numTokens - 1, matchEndIdx + 1);
   }
 
   return results;
@@ -434,3 +574,4 @@ function formatSrtTime(secs: number): string {
   const h = Math.floor(totalMillis / (1000 * 60 * 60));
   return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')},${String(ms).padStart(3, '0')}`;
 }
+

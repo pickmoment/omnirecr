@@ -170,18 +170,6 @@ export const Navbar: React.FC<NavbarProps> = ({
           )}
         </div>
 
-        {/* Settings quick button */}
-        <button
-          onClick={() => onSelectTab('settings')}
-          title="환경 설정으로 이동"
-          className={`p-2 rounded-lg border transition-all duration-150 ${
-            currentTab === 'settings'
-              ? 'bg-slate-800 text-white border-slate-700'
-              : 'text-slate-400 hover:text-white hover:bg-slate-800 border-slate-800/80'
-          }`}
-        >
-          <SettingsIcon className="w-4 h-4" />
-        </button>
       </div>
     </header>
   );
