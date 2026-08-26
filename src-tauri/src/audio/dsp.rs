@@ -1,6 +1,7 @@
 use std::time::{Duration, Instant};
 
 /// 2nd order Butterworth High-pass filter (80 Hz cutoff)
+/// Removes low-frequency microphone rumble, AC hum (50/60Hz), and handling vibrations
 #[derive(Debug, Clone)]
 pub struct BiquadHighPass80Hz {
     b0: f32,
@@ -53,7 +54,9 @@ impl BiquadHighPass80Hz {
 
     #[inline]
     pub fn process_mono(&mut self, sample: f32) -> f32 {
-        let y = self.b0 * sample + self.b1 * self.x1_l + self.b2 * self.x2_l - self.a1 * self.y1_l - self.a2 * self.y2_l;
+        let y = self.b0 * sample + self.b1 * self.x1_l + self.b2 * self.x2_l
+            - self.a1 * self.y1_l
+            - self.a2 * self.y2_l;
         self.x2_l = self.x1_l;
         self.x1_l = sample;
         self.y2_l = self.y1_l;
@@ -63,13 +66,17 @@ impl BiquadHighPass80Hz {
 
     #[inline]
     pub fn process_stereo(&mut self, left: f32, right: f32) -> (f32, f32) {
-        let y_l = self.b0 * left + self.b1 * self.x1_l + self.b2 * self.x2_l - self.a1 * self.y1_l - self.a2 * self.y2_l;
+        let y_l = self.b0 * left + self.b1 * self.x1_l + self.b2 * self.x2_l
+            - self.a1 * self.y1_l
+            - self.a2 * self.y2_l;
         self.x2_l = self.x1_l;
         self.x1_l = left;
         self.y2_l = self.y1_l;
         self.y1_l = y_l;
 
-        let y_r = self.b0 * right + self.b1 * self.x1_r + self.b2 * self.x2_r - self.a1 * self.y1_r - self.a2 * self.y2_r;
+        let y_r = self.b0 * right + self.b1 * self.x1_r + self.b2 * self.x2_r
+            - self.a1 * self.y1_r
+            - self.a2 * self.y2_r;
         self.x2_r = self.x1_r;
         self.x1_r = right;
         self.y2_r = self.y1_r;
@@ -79,54 +86,92 @@ impl BiquadHighPass80Hz {
     }
 }
 
-/// Smart Noise Gate with smooth envelope gain ramping
+/// Smart Studio Noise Gate with Hysteresis, Hold Buffer, and Smooth Gain Transition
 #[derive(Debug, Clone)]
 pub struct NoiseGate {
-    threshold_linear: f32,
+    open_threshold_linear: f32,
+    close_threshold_linear: f32,
     envelope: f32,
     attack_coeff: f32,
     release_coeff: f32,
     current_gain: f32,
+    hold_samples: usize,
+    hold_counter: usize,
+    is_open: bool,
+    attenuation_floor: f32,
 }
 
 impl NoiseGate {
     pub fn new(threshold_db: f32, sample_rate: f32) -> Self {
-        let threshold_linear = 10.0f32.powf(threshold_db / 20.0);
-        let attack_time_sec = 0.005; // 5ms attack
-        let release_time_sec = 0.100; // 100ms release
+        let open_threshold_linear = 10.0f32.powf(threshold_db / 20.0);
+        // Hysteresis: close threshold is 3.5dB lower than open threshold to prevent chatter
+        let close_threshold_linear = 10.0f32.powf((threshold_db - 3.5) / 20.0);
+
+        let attack_time_sec = 0.003; // 3ms fast attack
+        let release_time_sec = 0.120; // 120ms natural release
+        let hold_time_sec = 0.045; // 45ms hold buffer for natural voice pauses
 
         let attack_coeff = (-1.0 / (attack_time_sec * sample_rate)).exp();
         let release_coeff = (-1.0 / (release_time_sec * sample_rate)).exp();
+        let hold_samples = (hold_time_sec * sample_rate).round() as usize;
+
+        // Attenuation floor at -36dB (0.0158), attenuates noise floor by >98% while avoiding harsh pumping
+        let attenuation_floor = 10.0f32.powf(-36.0 / 20.0);
 
         Self {
-            threshold_linear,
+            open_threshold_linear,
+            close_threshold_linear,
             envelope: 0.0,
             attack_coeff,
             release_coeff,
             current_gain: 0.0,
+            hold_samples,
+            hold_counter: 0,
+            is_open: false,
+            attenuation_floor,
         }
     }
 
     pub fn set_threshold_db(&mut self, threshold_db: f32) {
-        self.threshold_linear = 10.0f32.powf(threshold_db / 20.0);
+        self.open_threshold_linear = 10.0f32.powf(threshold_db / 20.0);
+        self.close_threshold_linear = 10.0f32.powf((threshold_db - 3.5) / 20.0);
     }
 
     #[inline]
     pub fn process_sample(&mut self, sample: f32) -> f32 {
         let abs_sample = sample.abs();
+
+        // Smooth envelope follower with fast attack and natural decay
         if abs_sample > self.envelope {
             self.envelope = self.attack_coeff * self.envelope + (1.0 - self.attack_coeff) * abs_sample;
         } else {
             self.envelope = self.release_coeff * self.envelope + (1.0 - self.release_coeff) * abs_sample;
         }
 
-        let target_gain = if self.envelope >= self.threshold_linear {
+        // Gate state machine with hysteresis and hold timer
+        if self.envelope >= self.open_threshold_linear {
+            self.is_open = true;
+            self.hold_counter = self.hold_samples;
+        } else if self.is_open {
+            if self.envelope < self.close_threshold_linear {
+                if self.hold_counter > 0 {
+                    self.hold_counter -= 1;
+                } else {
+                    self.is_open = false;
+                }
+            } else {
+                // In hysteresis band between close and open thresholds: maintain hold
+                self.hold_counter = self.hold_samples;
+            }
+        }
+
+        let target_gain = if self.is_open {
             1.0
         } else {
-            0.0
+            self.attenuation_floor
         };
 
-        // Smooth gain transition
+        // Smooth gain transition (anti-click)
         if target_gain > self.current_gain {
             self.current_gain = self.attack_coeff * self.current_gain + (1.0 - self.attack_coeff) * target_gain;
         } else {
@@ -217,15 +262,15 @@ impl SilenceDetector {
     }
 }
 
-/// Simple and fast linear interpolation stereo resampler
+/// Robust fractional linear resampler with continuous phase and boundary history across stream chunks
 #[derive(Debug, Clone)]
 pub struct StereoLinearResampler {
     from_rate: f32,
     to_rate: f32,
     ratio: f32, // from_rate / to_rate
-    phase: f32,
-    last_l: f32,
-    last_r: f32,
+    input_pos: f32,
+    prev_l: f32,
+    prev_r: f32,
 }
 
 impl StereoLinearResampler {
@@ -235,9 +280,9 @@ impl StereoLinearResampler {
             from_rate,
             to_rate,
             ratio,
-            phase: 0.0,
-            last_l: 0.0,
-            last_r: 0.0,
+            input_pos: 0.0,
+            prev_l: 0.0,
+            prev_r: 0.0,
         }
     }
 
@@ -253,28 +298,37 @@ impl StereoLinearResampler {
             return;
         }
 
-        let mut i = 0;
-        while i < num_frames {
-            while self.phase < 1.0 && i < num_frames {
-                let curr_l = input[i * 2];
-                let curr_r = input[i * 2 + 1];
+        let mut pos = self.input_pos;
+        while (pos as usize) < num_frames {
+            let idx = pos as usize;
+            let frac = pos - (idx as f32);
 
-                let out_l = self.last_l + (curr_l - self.last_l) * self.phase;
-                let out_r = self.last_r + (curr_r - self.last_r) * self.phase;
+            let s0_l = if idx == 0 {
+                self.prev_l
+            } else {
+                input[(idx - 1) * 2]
+            };
+            let s0_r = if idx == 0 {
+                self.prev_r
+            } else {
+                input[(idx - 1) * 2 + 1]
+            };
 
-                output.push(out_l);
-                output.push(out_r);
+            let s1_l = input[idx * 2];
+            let s1_r = input[idx * 2 + 1];
 
-                self.phase += self.ratio;
-            }
+            let out_l = s0_l + (s1_l - s0_l) * frac;
+            let out_r = s0_r + (s1_r - s0_r) * frac;
 
-            if self.phase >= 1.0 {
-                self.phase -= 1.0;
-                self.last_l = input[i * 2];
-                self.last_r = input[i * 2 + 1];
-                i += 1;
-            }
+            output.push(out_l);
+            output.push(out_r);
+
+            pos += self.ratio;
         }
+
+        self.input_pos = pos - (num_frames as f32);
+        self.prev_l = input[(num_frames - 1) * 2];
+        self.prev_r = input[(num_frames - 1) * 2 + 1];
     }
 }
 
@@ -288,4 +342,101 @@ pub fn linear_to_db(linear: f32) -> f32 {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
 
+    #[test]
+    fn test_highpass_80hz_attenuation() {
+        let sample_rate = 48000.0;
+        let mut hpf = BiquadHighPass80Hz::new(sample_rate);
+
+        // 30Hz sine wave (below cutoff) vs 1000Hz sine wave (above cutoff)
+        let num_samples = 4800; // 100ms
+        let mut in_30hz_energy = 0.0f32;
+        let mut out_30hz_energy = 0.0f32;
+
+        for i in 0..num_samples {
+            let t = i as f32 / sample_rate;
+            let sample = (2.0 * std::f32::consts::PI * 30.0 * t).sin();
+            in_30hz_energy += sample * sample;
+            let filtered = hpf.process_mono(sample);
+            if i > 1000 {
+                // steady state
+                out_30hz_energy += filtered * filtered;
+            }
+        }
+
+        let ratio_30hz = (out_30hz_energy / (in_30hz_energy * 0.79)).sqrt();
+        // 30Hz should be significantly attenuated (>10dB attenuation, ratio < 0.3)
+        assert!(ratio_30hz < 0.35, "30Hz signal must be attenuated by HPF, got ratio: {}", ratio_30hz);
+
+        // Test 1000Hz signal passes through
+        let mut hpf_1k = BiquadHighPass80Hz::new(sample_rate);
+        let mut out_1k_energy = 0.0f32;
+        let mut in_1k_energy = 0.0f32;
+        for i in 0..num_samples {
+            let t = i as f32 / sample_rate;
+            let sample = (2.0 * std::f32::consts::PI * 1000.0 * t).sin();
+            in_1k_energy += sample * sample;
+            let filtered = hpf_1k.process_mono(sample);
+            if i > 1000 {
+                out_1k_energy += filtered * filtered;
+            }
+        }
+        let ratio_1k = (out_1k_energy / (in_1k_energy * 0.79)).sqrt();
+        assert!((ratio_1k - 1.0).abs() < 0.05, "1000Hz signal should pass with unity gain, got: {}", ratio_1k);
+    }
+
+    #[test]
+    fn test_noise_gate_suppresses_low_amplitude_noise() {
+        let sample_rate = 48000.0;
+        let mut gate = NoiseGate::new(-40.0, sample_rate); // -40dB threshold (~0.01 linear)
+
+        // Feed background hiss of amplitude 0.002 (-54dB)
+        let mut output_sum = 0.0f32;
+        for i in 0..4800 {
+            let sample = if i % 2 == 0 { 0.002 } else { -0.002 };
+            let out = gate.process_sample(sample);
+            if i > 2000 {
+                output_sum += out.abs();
+            }
+        }
+
+        // Noise should be attenuated to near the floor (-36dB gain reduction)
+        let avg_out = output_sum / 2800.0;
+        assert!(avg_out < 0.0001, "Low level noise must be heavily attenuated by noise gate, got: {}", avg_out);
+    }
+
+    #[test]
+    fn test_resampler_streaming_continuity() {
+        let mut resampler = StereoLinearResampler::new(44100.0, 48000.0);
+        let chunk_size = 256;
+        let total_input_frames = 44100;
+        let mut output = Vec::new();
+
+        let mut input_buffer = Vec::with_capacity(chunk_size * 2);
+        for frame in 0..total_input_frames {
+            let t = frame as f32 / 44100.0;
+            let s = (2.0 * std::f32::consts::PI * 440.0 * t).sin();
+            input_buffer.push(s);
+            input_buffer.push(s);
+
+            if input_buffer.len() == chunk_size * 2 {
+                resampler.process_interleaved(&input_buffer, &mut output);
+                input_buffer.clear();
+            }
+        }
+        if !input_buffer.is_empty() {
+            resampler.process_interleaved(&input_buffer, &mut output);
+        }
+
+        let output_frames = output.len() / 2;
+        // 44100 -> 48000 expected exactly ~48000 frames
+        assert!(
+            (output_frames as i32 - 48000).abs() <= 2,
+            "Resampled output frames count mismatch: got {}, expected ~48000",
+            output_frames
+        );
+    }
+}

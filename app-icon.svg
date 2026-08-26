@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <!-- Background Gradient -->
+    <linearGradient id="bgGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#6366F1" />
+      <stop offset="50%" stop-color="#2563EB" />
+      <stop offset="100%" stop-color="#22D3EE" />
+    </linearGradient>
+
+    <!-- Top Highlight -->
+    <linearGradient id="borderHighlight" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.35" />
+      <stop offset="100%" stop-color="#FFFFFF" stop-opacity="0.05" />
+    </linearGradient>
+
+    <!-- Drop Shadow Filter -->
+    <filter id="dropShadow" x="-15%" y="-10%" width="130%" height="135%" filterUnits="userSpaceOnUse">
+      <feDropShadow dx="0" dy="32" stdDeviation="36" flood-color="#1e1b4b" flood-opacity="0.45" />
+      <feDropShadow dx="0" dy="12" stdDeviation="16" flood-color="#2563eb" flood-opacity="0.35" />
+    </filter>
+
+    <!-- Icon Glow/Shadow -->
+    <filter id="iconShadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="6" stdDeviation="8" flood-color="#0f172a" flood-opacity="0.25" />
+    </filter>
+  </defs>
+
+  <!-- Shadow & Main Rounded Rect (Squircle) -->
+  <g filter="url(#dropShadow)">
+    <rect x="80" y="80" width="864" height="864" rx="196" ry="196" fill="url(#bgGradient)" />
+  </g>
+
+  <!-- Subtle Inner Border Highlight -->
+  <rect x="82" y="82" width="860" height="860" rx="194" ry="194" fill="none" stroke="url(#borderHighlight)" stroke-width="4" />
+
+  <!-- Activity Icon centered: 520px x 520px in 1024x1024 -> offset (252, 252), scale 520/24 = 21.6667 -->
+  <g transform="translate(252, 252) scale(21.666667)" filter="url(#iconShadow)">
+    <path
+      d="M22 12h-2.48a2 2 0 0 0-1.93 1.46l-2.35 8.36a.25.25 0 0 1-.48 0L9.24 2.18a.25.25 0 0 0-.48 0l-2.35 8.36A2 2 0 0 1 4.49 12H2"
+      fill="none"
+      stroke="#FFFFFF"
+      stroke-width="2.2"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+    />
+  </g>
+</svg>

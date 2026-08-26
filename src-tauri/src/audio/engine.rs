@@ -243,7 +243,7 @@ impl AudioCaptureEngine {
 
             let mut noise_gate_l = NoiseGate::new(noise_gate_db, target_sample_rate);
             let mut noise_gate_r = NoiseGate::new(noise_gate_db, target_sample_rate);
-            let mut hpf = BiquadHighPass80Hz::new(target_sample_rate);
+            let mut hpf_mic = BiquadHighPass80Hz::new(target_sample_rate);
             let mut silence_detector = SilenceDetector::new(
                 auto_pause_enabled,
                 auto_pause_sec,
@@ -278,14 +278,20 @@ impl AudioCaptureEngine {
                     mic_queue.extend(resampled_temp.drain(..));
                 }
 
-                // Limit queue sizes to prevent latency buildup
+                // Limit queue sizes to prevent latency buildup (always aligned to stereo frames)
                 if sys_queue.len() > max_queue_samples {
                     let excess = sys_queue.len() - max_queue_samples;
-                    sys_queue.drain(..excess);
+                    let excess_aligned = (excess / 2) * 2;
+                    if excess_aligned > 0 {
+                        sys_queue.drain(..excess_aligned);
+                    }
                 }
                 if mic_queue.len() > max_queue_samples {
                     let excess = mic_queue.len() - max_queue_samples;
-                    mic_queue.drain(..excess);
+                    let excess_aligned = (excess / 2) * 2;
+                    if excess_aligned > 0 {
+                        mic_queue.drain(..excess_aligned);
+                    }
                 }
 
                 let is_paused_now = paused_clone.load(Ordering::SeqCst);
@@ -310,22 +316,24 @@ impl AudioCaptureEngine {
                     let scaled_sys_l = sys_l * sys_gain;
                     let scaled_sys_r = sys_r * sys_gain;
 
-                    let mut scaled_mic_l = mic_l * mic_gain;
-                    let mut scaled_mic_r = mic_r * mic_gain;
+                    let mut proc_mic_l = mic_l * mic_gain;
+                    let mut proc_mic_r = mic_r * mic_gain;
 
-                    if noise_gate_enabled {
-                        scaled_mic_l = noise_gate_l.process_sample(scaled_mic_l);
-                        scaled_mic_r = noise_gate_r.process_sample(scaled_mic_r);
-                    }
-
-                    let mut mix_l = scaled_sys_l + scaled_mic_l;
-                    let mut mix_r = scaled_sys_r + scaled_mic_r;
-
+                    // 1. High-Pass Filter (80Hz Low-cut) on mic first to remove 50/60Hz rumble and handling noise
                     if hpf_enabled {
-                        let (fl, fr) = hpf.process_stereo(mix_l, mix_r);
-                        mix_l = fl;
-                        mix_r = fr;
+                        let (fl, fr) = hpf_mic.process_stereo(proc_mic_l, proc_mic_r);
+                        proc_mic_l = fl;
+                        proc_mic_r = fr;
                     }
+
+                    // 2. Smart Studio Noise Gate on clean mic signal (hysteresis + hold + smooth ramp + floor)
+                    if noise_gate_enabled {
+                        proc_mic_l = noise_gate_l.process_sample(proc_mic_l);
+                        proc_mic_r = noise_gate_r.process_sample(proc_mic_r);
+                    }
+
+                    let mut mix_l = scaled_sys_l + proc_mic_l;
+                    let mut mix_r = scaled_sys_r + proc_mic_r;
 
                     mix_l = mix_l.clamp(-1.0, 1.0);
                     mix_r = mix_r.clamp(-1.0, 1.0);
