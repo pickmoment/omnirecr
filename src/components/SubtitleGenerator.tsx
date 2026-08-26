@@ -1293,7 +1293,7 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
             {/* Big Action Button */}
             <button
               onClick={handleGenerate}
-              disabled={isGenerating || !audioPath || !scriptText.trim()}
+              disabled={isGenerating || !audioPath || (generationWorkflow === 'with-script' && !scriptText.trim())}
               className="w-full mt-auto py-3 rounded-xl bg-gradient-to-r from-amber-500 via-orange-500 to-yellow-500 hover:from-amber-600 hover:via-orange-600 hover:to-yellow-600 disabled:opacity-50 disabled:cursor-not-allowed text-white font-bold text-sm shadow-lg shadow-orange-500/25 flex items-center justify-center gap-2 transition"
             >
               {isGenerating ? (
