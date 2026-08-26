@@ -24,11 +24,23 @@ pub struct Settings {
     pub noise_gate_threshold_db: f32, // e.g. -45.0 dB
     pub highpass_filter_enabled: bool, // 80Hz Low-cut filter
     pub mute_notifications: bool,     // Auto mute windows notifications during recording
+    #[serde(default = "default_macos_shortcut_start")]
+    pub macos_shortcut_start: String,
+    #[serde(default = "default_macos_shortcut_stop")]
+    pub macos_shortcut_stop: String,
     pub auto_pause_enabled: bool,
     pub auto_pause_seconds: f32,      // default 1.0s
     pub auto_stop_enabled: bool,
     pub auto_stop_seconds: f32,       // default 5.0s
     pub custom_ffmpeg_path: Option<String>,
+}
+
+fn default_macos_shortcut_start() -> String {
+    "OmniRec 녹화 시작".to_string()
+}
+
+fn default_macos_shortcut_stop() -> String {
+    "OmniRec 녹화 종료".to_string()
 }
 
 impl Default for Settings {
@@ -53,6 +65,8 @@ impl Default for Settings {
             noise_gate_threshold_db: -45.0,
             highpass_filter_enabled: true,
             mute_notifications: true,
+            macos_shortcut_start: default_macos_shortcut_start(),
+            macos_shortcut_stop: default_macos_shortcut_stop(),
             auto_pause_enabled: false,
             auto_pause_seconds: 1.0,
             auto_stop_enabled: false,

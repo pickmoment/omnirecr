@@ -35,6 +35,15 @@ pub fn check_ffmpeg_status(custom_ffmpeg_path: Option<String>) -> Result<String,
 }
 
 #[tauri::command]
+pub async fn run_macos_shortcut(shortcut_name: String) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        crate::audio::notifications::NotificationSoundManager::run_macos_shortcut(&shortcut_name)
+    })
+    .await
+    .map_err(|e| format!("단축어 실행 작업 실패: {e}"))?
+}
+
+#[tauri::command]
 pub fn start_screen_record(
     app: AppHandle,
     state: State<AppState>,

@@ -37,6 +37,8 @@ const defaultSettings: Settings = {
   noise_gate_threshold_db: -45.0,
   highpass_filter_enabled: true,
   mute_notifications: true,
+  macos_shortcut_start: 'OmniRec 녹화 시작',
+  macos_shortcut_stop: 'OmniRec 녹화 종료',
   auto_pause_enabled: false,
   auto_pause_seconds: 1.0,
   auto_stop_enabled: false,

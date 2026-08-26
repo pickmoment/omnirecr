@@ -21,6 +21,8 @@ export interface Settings {
   noise_gate_threshold_db: number; // -60 to -20
   highpass_filter_enabled: boolean;
   mute_notifications: boolean;
+  macos_shortcut_start: string;
+  macos_shortcut_stop: string;
   auto_pause_enabled: boolean;
   auto_pause_seconds: number;
   auto_stop_enabled: boolean;

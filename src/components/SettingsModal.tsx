@@ -15,6 +15,8 @@ import {
 import { open } from '@tauri-apps/plugin-dialog';
 import { invoke } from '@tauri-apps/api/core';
 import type { Settings } from '../types';
+const isMacOS = navigator.userAgent.includes('Mac OS');
+
 
 interface SettingsModalProps {
   isOpen: boolean;
@@ -32,6 +34,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [localSettings, setLocalSettings] = useState<Settings>(settings);
   const [isSaved, setIsSaved] = useState(false);
   const [ffmpegTestMsg, setFfmpegTestMsg] = useState<string | null>(null);
+  const [shortcutTestMsg, setShortcutTestMsg] = useState<string | null>(null);
 
   // Sync props to local state when modal opens
   useEffect(() => {
@@ -40,6 +43,16 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       setFfmpegTestMsg(null);
     }
   }, [isOpen, settings]);
+
+  const handleTestShortcut = async (shortcutName: string, label: string) => {
+    setShortcutTestMsg(`${label} 단축어 실행 중...`);
+    try {
+      await invoke('run_macos_shortcut', { shortcutName });
+      setShortcutTestMsg(`${label} 단축어 실행 성공`);
+    } catch (err) {
+      setShortcutTestMsg(`${label} 단축어 실행 실패: ${err}`);
+    }
+  };
 
   if (!isOpen) return null;
 
@@ -129,23 +142,63 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             </div>
 
             <div className="space-y-2.5">
-              {/* Windows Notification Sound Auto Mute */}
-              <div className="p-3.5 rounded-2xl bg-slate-950/60 border border-slate-800/80 flex items-center justify-between hover:bg-slate-950/90 transition">
-                <div className="flex items-center gap-2.5">
-                  <div className="w-8 h-8 rounded-lg bg-amber-500/10 border border-amber-500/20 text-amber-400 flex items-center justify-center shrink-0">
-                    <VolumeX className="w-4 h-4" />
+              <div className="p-3.5 rounded-2xl bg-slate-950/60 border border-slate-800/80 space-y-3 hover:bg-slate-950/90 transition">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2.5">
+                    <div className="w-8 h-8 rounded-lg bg-amber-500/10 border border-amber-500/20 text-amber-400 flex items-center justify-center shrink-0">
+                      <VolumeX className="w-4 h-4" />
+                    </div>
+                    <div>
+                      <div className="text-xs font-bold text-slate-200">
+                        {isMacOS ? '녹화 중 집중 모드 자동 실행' : '시스템 알림음 자동 음소거'}
+                      </div>
+                      <div className="text-[11px] text-slate-400">
+                        {isMacOS
+                          ? '녹화/녹음 시작·종료 시 지정한 macOS 단축어를 실행합니다.'
+                          : '녹화/녹음 중 Windows 시스템 알림음을 음소거하고 종료 시 복구합니다.'}
+                      </div>
+                    </div>
                   </div>
-                  <div>
-                    <div className="text-xs font-bold text-slate-200">시스템 알림음 자동 음소거</div>
-                    <div className="text-[11px] text-slate-400">녹화/녹음 중 팝업 및 경고 알림음을 백그라운드 자동 차단 및 종료 시 복구</div>
-                  </div>
+                  <input
+                    type="checkbox"
+                    checked={localSettings.mute_notifications}
+                    onChange={(e) => handleChange({ mute_notifications: e.target.checked })}
+                    className="w-4 h-4 rounded bg-slate-800 border-slate-700 text-emerald-500 focus:ring-0 cursor-pointer"
+                  />
                 </div>
-                <input
-                  type="checkbox"
-                  checked={localSettings.mute_notifications}
-                  onChange={(e) => handleChange({ mute_notifications: e.target.checked })}
-                  className="w-4 h-4 rounded bg-slate-800 border-slate-700 text-emerald-500 focus:ring-0 cursor-pointer"
-                />
+
+                {isMacOS && localSettings.mute_notifications && (
+                  <div className="pt-3 border-t border-slate-900 space-y-2.5">
+                    {([
+                      ['시작', 'macos_shortcut_start'],
+                      ['종료', 'macos_shortcut_stop'],
+                    ] as const).map(([label, field]) => (
+                      <div key={field} className="flex items-center gap-2">
+                        <span className="w-8 text-[10px] font-semibold text-slate-400">{label}</span>
+                        <input
+                          type="text"
+                          value={localSettings[field]}
+                          onChange={(e) => setLocalSettings((prev) => ({ ...prev, [field]: e.target.value }))}
+                          onBlur={() => handleChange({ [field]: localSettings[field] })}
+                          placeholder={`macOS ${label} 단축어 이름`}
+                          className="min-w-0 flex-1 px-3 py-1.5 bg-slate-900 border border-slate-800 rounded-lg text-[11px] text-slate-300 focus:outline-none focus:border-amber-500/50"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => handleTestShortcut(localSettings[field], label)}
+                          disabled={!localSettings[field].trim()}
+                          className="px-2.5 py-1.5 rounded-lg bg-amber-600/20 border border-amber-500/30 text-[10px] font-semibold text-amber-300 hover:bg-amber-600/30 disabled:opacity-40 disabled:cursor-not-allowed transition"
+                        >
+                          실행
+                        </button>
+                      </div>
+                    ))}
+                    <p className="text-[10px] text-slate-500">
+                      단축어 앱에서 시작은 집중 모드 켜기, 종료는 집중 모드 끄기로 만든 뒤 정확한 이름을 입력하세요.
+                    </p>
+                    {shortcutTestMsg && <p className="text-[10px] text-amber-300">{shortcutTestMsg}</p>}
+                  </div>
+                )}
               </div>
 
               {/* Smart Noise Gate */}

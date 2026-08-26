@@ -83,8 +83,10 @@ impl AudioRecorderSession {
 
         let mut notification_manager = None;
         if settings.mute_notifications {
-            let notif = NotificationSoundManager::new();
-            notif.mute_system_notifications();
+            let notif = NotificationSoundManager::new(settings);
+            if let Err(error) = notif.mute_system_notifications() {
+                log::warn!("Failed to suppress notifications: {error}");
+            }
             notification_manager = Some(notif);
         }
 
@@ -112,7 +114,9 @@ impl AudioRecorderSession {
         self.audio_engine.stop();
 
         if let Some(notif) = self.notification_manager.take() {
-            notif.restore_system_notifications();
+            if let Err(error) = notif.restore_system_notifications() {
+                log::warn!("Failed to restore notifications: {error}");
+            }
         }
 
         let start = Instant::now();

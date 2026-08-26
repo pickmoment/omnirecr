@@ -1,3 +1,4 @@
+use crate::types::Settings;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -6,44 +7,83 @@ use windows::Win32::Foundation::S_OK;
 
 pub struct NotificationSoundManager {
     is_muted: Arc<AtomicBool>,
+    macos_shortcut_start: String,
+    macos_shortcut_stop: String,
 }
 
 impl NotificationSoundManager {
-    pub fn new() -> Self {
+    pub fn new(settings: &Settings) -> Self {
         Self {
             is_muted: Arc::new(AtomicBool::new(false)),
+            macos_shortcut_start: settings.macos_shortcut_start.clone(),
+            macos_shortcut_stop: settings.macos_shortcut_stop.clone(),
         }
     }
 
-    #[cfg(target_os = "windows")]
-    pub fn mute_system_notifications(&self) {
+    pub fn mute_system_notifications(&self) -> Result<(), String> {
         if self.is_muted.load(Ordering::SeqCst) {
-            return;
+            return Ok(());
         }
 
+        #[cfg(target_os = "windows")]
         unsafe {
-            let _ = Self::set_system_sounds_mute(true);
+            Self::set_system_sounds_mute(true).map_err(|e| e.to_string())?;
         }
+
+        #[cfg(target_os = "macos")]
+        Self::run_macos_shortcut(&self.macos_shortcut_start)?;
+
         self.is_muted.store(true, Ordering::SeqCst);
+        Ok(())
     }
 
-    #[cfg(target_os = "windows")]
-    pub fn restore_system_notifications(&self) {
+    pub fn restore_system_notifications(&self) -> Result<(), String> {
         if !self.is_muted.load(Ordering::SeqCst) {
-            return;
+            return Ok(());
         }
 
+        #[cfg(target_os = "windows")]
         unsafe {
-            let _ = Self::set_system_sounds_mute(false);
+            Self::set_system_sounds_mute(false).map_err(|e| e.to_string())?;
         }
+
+        #[cfg(target_os = "macos")]
+        Self::run_macos_shortcut(&self.macos_shortcut_stop)?;
+
         self.is_muted.store(false, Ordering::SeqCst);
+        Ok(())
     }
 
-    #[cfg(not(target_os = "windows"))]
-    pub fn mute_system_notifications(&self) {}
+    #[cfg(target_os = "macos")]
+    pub fn run_macos_shortcut(shortcut_name: &str) -> Result<(), String> {
+        use std::process::Command;
 
-    #[cfg(not(target_os = "windows"))]
-    pub fn restore_system_notifications(&self) {}
+        let shortcut_name = shortcut_name.trim();
+        if shortcut_name.is_empty() {
+            return Err("macOS 단축어 이름이 비어 있습니다.".to_string());
+        }
+
+        let output = Command::new("/usr/bin/shortcuts")
+            .args(["run", shortcut_name])
+            .output()
+            .map_err(|e| format!("단축어 실행 실패: {e}"))?;
+
+        if output.status.success() {
+            Ok(())
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            if stderr.is_empty() {
+                Err(format!("단축어 실행 실패: {}", output.status))
+            } else {
+                Err(format!("단축어 실행 실패: {stderr}"))
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn run_macos_shortcut(_shortcut_name: &str) -> Result<(), String> {
+        Err("macOS에서만 단축어를 실행할 수 있습니다.".to_string())
+    }
 
     #[cfg(target_os = "windows")]
     unsafe fn set_system_sounds_mute(mute: bool) -> Result<(), Box<dyn std::error::Error>> {
@@ -68,9 +108,7 @@ impl NotificationSoundManager {
         for i in 0..count {
             if let Ok(session_control) = session_enum.GetSession(i) {
                 if let Ok(session_control2) = session_control.cast::<IAudioSessionControl2>() {
-                    let is_system_sound = session_control2.IsSystemSoundsSession() == S_OK;
-                    
-                    if is_system_sound {
+                    if session_control2.IsSystemSoundsSession() == S_OK {
                         if let Ok(simple_volume) = session_control.cast::<ISimpleAudioVolume>() {
                             let _ = simple_volume.SetMute(mute, std::ptr::null());
                         }
@@ -85,6 +123,6 @@ impl NotificationSoundManager {
 
 impl Drop for NotificationSoundManager {
     fn drop(&mut self) {
-        self.restore_system_notifications();
+        let _ = self.restore_system_notifications();
     }
 }

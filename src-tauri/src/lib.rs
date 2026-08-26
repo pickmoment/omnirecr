@@ -55,6 +55,7 @@ pub fn run() {
             commands::get_settings,
             commands::save_settings,
             commands::check_ffmpeg_status,
+            commands::run_macos_shortcut,
             commands::start_screen_record,
             commands::start_audio_record,
             commands::pause_record,
