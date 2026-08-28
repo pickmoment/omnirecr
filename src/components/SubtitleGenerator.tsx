@@ -63,7 +63,8 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
   const [scriptText, setScriptText] = useState<string>('');
   const [audioPath, setAudioPath] = useState<string>(initialAudioPath || '');
   const [syncEngine, setSyncEngine] = useState<'ai-whisper' | 'vad'>('ai-whisper');
-  const [whisperModel, setWhisperModel] = useState<'Xenova/whisper-tiny' | 'Xenova/whisper-base'>('Xenova/whisper-tiny');
+  const [whisperModel, setWhisperModel] = useState<'Xenova/whisper-tiny' | 'Xenova/whisper-base' | 'Xenova/whisper-small'>('Xenova/whisper-base');
+  const [whisperLanguage, setWhisperLanguage] = useState<string>('korean');
   const [splitMode, setSplitMode] = useState<SubtitleSplitMode>('auto');
   const [maxChars, setMaxChars] = useState<number>(28);
   const [silenceThresholdDb, setSilenceThresholdDb] = useState<number>(-35.0);
@@ -252,7 +253,8 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
           (msg, pct) => {
             setAiStatusMsg(msg);
             if (pct) setAiProgress(pct);
-          }
+          },
+          whisperLanguage
         );
 
         let finalSubtitles: SubtitleItem[] = [];
@@ -1124,35 +1126,73 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
               </div>
 
               {syncEngine === 'ai-whisper' && (
-                <div className="pt-2 border-t border-slate-800/80 flex items-center justify-between gap-2">
-                  <span className="text-[11px] text-slate-300">AI 모델 선택:</span>
-                  <div className="flex items-center gap-1">
-                    <button
-                      onClick={() => {
-                        resetWhisperPipeline();
-                        setWhisperModel('Xenova/whisper-tiny');
-                      }}
-                      className={`px-2 py-1 rounded-lg text-[10px] font-semibold transition ${
-                        whisperModel === 'Xenova/whisper-tiny'
-                          ? 'bg-orange-600 text-white shadow-sm'
-                          : 'bg-slate-800 text-slate-400 hover:text-slate-200'
-                      }`}
-                    >
-                      Whisper Tiny (39MB • 초고속)
-                    </button>
-                    <button
-                      onClick={() => {
-                        resetWhisperPipeline();
-                        setWhisperModel('Xenova/whisper-base');
-                      }}
-                      className={`px-2 py-1 rounded-lg text-[10px] font-semibold transition ${
-                        whisperModel === 'Xenova/whisper-base'
-                          ? 'bg-orange-600 text-white shadow-sm'
-                          : 'bg-slate-800 text-slate-400 hover:text-slate-200'
-                      }`}
-                    >
-                      Whisper Base (73MB • 고정확도)
-                    </button>
+                <div className="pt-2 border-t border-slate-800/80 space-y-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-[11px] text-slate-300">AI 모델:</span>
+                    <div className="flex items-center gap-1">
+                      <button
+                        onClick={() => {
+                          resetWhisperPipeline();
+                          setWhisperModel('Xenova/whisper-tiny');
+                        }}
+                        className={`px-2 py-1 rounded-lg text-[10px] font-semibold transition ${
+                          whisperModel === 'Xenova/whisper-tiny'
+                            ? 'bg-orange-600 text-white shadow-sm'
+                            : 'bg-slate-800 text-slate-400 hover:text-slate-200'
+                        }`}
+                      >
+                        Tiny (39MB • 초고속)
+                      </button>
+                      <button
+                        onClick={() => {
+                          resetWhisperPipeline();
+                          setWhisperModel('Xenova/whisper-base');
+                        }}
+                        className={`px-2 py-1 rounded-lg text-[10px] font-semibold transition ${
+                          whisperModel === 'Xenova/whisper-base'
+                            ? 'bg-orange-600 text-white shadow-sm'
+                            : 'bg-slate-800 text-slate-400 hover:text-slate-200'
+                        }`}
+                      >
+                        Base (73MB • 표준 권장)
+                      </button>
+                      <button
+                        onClick={() => {
+                          resetWhisperPipeline();
+                          setWhisperModel('Xenova/whisper-small');
+                        }}
+                        className={`px-2 py-1 rounded-lg text-[10px] font-semibold transition ${
+                          whisperModel === 'Xenova/whisper-small'
+                            ? 'bg-orange-600 text-white shadow-sm'
+                            : 'bg-slate-800 text-slate-400 hover:text-slate-200'
+                        }`}
+                      >
+                        Small (240MB • 고정밀)
+                      </button>
+                    </div>
+                  </div>
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-[11px] text-slate-300">인식 언어:</span>
+                    <div className="flex items-center gap-1">
+                      {[
+                        { id: 'korean', label: '한국어' },
+                        { id: 'english', label: '영어' },
+                        { id: 'japanese', label: '일본어' },
+                        { id: 'auto', label: '자동 감지' },
+                      ].map((lang) => (
+                        <button
+                          key={lang.id}
+                          onClick={() => setWhisperLanguage(lang.id)}
+                          className={`px-2 py-0.5 rounded-md text-[10px] font-medium transition ${
+                            whisperLanguage === lang.id
+                              ? 'bg-orange-600 text-white font-semibold'
+                              : 'bg-slate-900 text-slate-400 hover:text-slate-200 border border-slate-800'
+                          }`}
+                        >
+                          {lang.label}
+                        </button>
+                      ))}
+                    </div>
                   </div>
                 </div>
               )}

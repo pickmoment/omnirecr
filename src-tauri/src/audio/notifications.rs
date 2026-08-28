@@ -7,7 +7,9 @@ use windows::Win32::Foundation::S_OK;
 
 pub struct NotificationSoundManager {
     is_muted: Arc<AtomicBool>,
+    #[allow(dead_code)]
     macos_shortcut_start: String,
+    #[allow(dead_code)]
     macos_shortcut_stop: String,
 }
 
