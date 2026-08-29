@@ -12,6 +12,7 @@ import {
 } from 'lucide-react';
 import type { RectRegion, Settings, RecordingStatus } from '../types';
 import { AudioVisualizer } from './AudioVisualizer';
+import { formatFileSize, formatTimer } from '../utils/format';
 
 interface ScreenRecorderProps {
   settings: Settings;
@@ -45,25 +46,6 @@ export const ScreenRecorder: React.FC<ScreenRecorderProps> = ({
   const isRecording = recordingStatus.status === 'recording';
   const isPaused = recordingStatus.status === 'paused';
   const isBusy = recordingStatus.status === 'stopping';
-
-  const formatTimer = (seconds: number) => {
-    const s = Math.floor(seconds);
-    const hrs = Math.floor(s / 3600);
-    const mins = Math.floor((s % 3600) / 60);
-    const secs = s % 60;
-    if (hrs > 0) {
-      return `${String(hrs).padStart(2, '0')}:${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
-    }
-    return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
-  };
-
-  const formatFileSize = (bytes: number) => {
-    if (bytes <= 0) return '0 B';
-    const k = 1024;
-    const sizes = ['B', 'KB', 'MB', 'GB'];
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
-    return `${(bytes / Math.pow(k, i)).toFixed(i > 1 ? 2 : 1)} ${sizes[i]}`;
-  };
 
   const getLiveSize = () => {
     if (!isRecording && !isPaused) return 0;

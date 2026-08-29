@@ -29,21 +29,22 @@ import { open, save } from '@tauri-apps/plugin-dialog';
 import type {
   Settings,
   SubtitleGenerateResult,
-  SubtitleGenerateTask,
   SubtitleItem,
   SubtitleSplitMode,
 } from '../types';
+import { resetWhisperPipeline } from '../services/whisperService';
 import {
-  runLocalWhisperTranscribe,
-  alignScriptWithWhisperChunks,
-  generateSubtitlesFromAiChunks,
-  splitScriptIntoLines,
-  resetWhisperPipeline,
-} from '../services/whisperService';
+  buildSrt,
+  buildVtt,
+  formatSrtTimestamp,
+  generateSubtitles,
+} from '../services/subtitleGeneration';
 
 interface SubtitleGeneratorProps {
   settings: Settings;
   initialAudioPath?: string | null;
+  /** 대본 스튜디오의 TTS 녹음에서 넘어온 원본 대본 (대본+AI 싱크 모드 자동 세팅) */
+  initialScriptText?: string | null;
   onOpenExplorer: (path: string) => Promise<void>;
   onSettingsChange: (partial: Partial<Settings>) => void;
 }
@@ -57,6 +58,7 @@ const SAMPLE_SCRIPT = `안녕하세요! OmniRec 스튜디오에 오신 것을 �
 export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
   settings,
   initialAudioPath,
+  initialScriptText,
   onOpenExplorer,
   onSettingsChange,
 }) => {
@@ -64,14 +66,31 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
   const [generationWorkflow, setGenerationWorkflow] = useState<'with-script' | 'ai-only'>(settings.subtitle_generation_workflow);
   const [scriptText, setScriptText] = useState<string>('');
   const [audioPath, setAudioPath] = useState<string>(initialAudioPath || '');
-  const [syncEngine, setSyncEngine] = useState<'ai-whisper' | 'vad'>(settings.subtitle_sync_engine);
-  const [whisperModel, setWhisperModel] = useState<'Xenova/whisper-tiny' | 'Xenova/whisper-base' | 'Xenova/whisper-small'>(settings.subtitle_whisper_model);
   const [whisperLanguage, setWhisperLanguage] = useState<string>(settings.subtitle_whisper_language);
-  const [splitMode, setSplitMode] = useState<SubtitleSplitMode>(settings.subtitle_split_mode);
-  const [splitOnComma, setSplitOnComma] = useState<boolean>(settings.subtitle_split_on_comma);
-  const [maxChars, setMaxChars] = useState<number>(settings.subtitle_max_chars);
-  const [silenceThresholdDb, setSilenceThresholdDb] = useState<number>(settings.subtitle_silence_threshold_db);
-  const [minSilenceDuration, setMinSilenceDuration] = useState<number>(settings.subtitle_min_silence_duration);
+
+  // 자막 옵션은 settings 를 단일 출처로 삼는다.
+  // 예전에는 이 화면이 값을 따로 들고 있어 자막 일괄 생성 화면과 어긋날 수 있었다.
+  const syncEngine = settings.subtitle_sync_engine;
+  const whisperModel = settings.subtitle_whisper_model;
+  const splitMode = settings.subtitle_split_mode;
+  const splitOnComma = settings.subtitle_split_on_comma;
+  const maxChars = settings.subtitle_max_chars;
+  const silenceThresholdDb = settings.subtitle_silence_threshold_db;
+  const minSilenceDuration = settings.subtitle_min_silence_duration;
+
+  const setSyncEngine = (value: 'ai-whisper' | 'vad') =>
+    onSettingsChange({ subtitle_sync_engine: value });
+  const setWhisperModel = (value: Settings['subtitle_whisper_model']) =>
+    onSettingsChange({ subtitle_whisper_model: value });
+  const setSplitMode = (value: SubtitleSplitMode) =>
+    onSettingsChange({ subtitle_split_mode: value });
+  const setSplitOnComma = (value: boolean) =>
+    onSettingsChange({ subtitle_split_on_comma: value });
+  const setMaxChars = (value: number) => onSettingsChange({ subtitle_max_chars: value });
+  const setSilenceThresholdDb = (value: number) =>
+    onSettingsChange({ subtitle_silence_threshold_db: value });
+  const setMinSilenceDuration = (value: number) =>
+    onSettingsChange({ subtitle_min_silence_duration: value });
   const [startOffsetSecs, setStartOffsetSecs] = useState<number>(settings.subtitle_start_offset_secs);
   const [autoSave, setAutoSave] = useState<boolean>(settings.subtitle_auto_save);
 
@@ -104,7 +123,8 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
   const segmentTimerRef = useRef<number | null>(null);
   const isFirstSettingsSyncRef = useRef(true);
 
-  // Persist subtitle generator option choices back into settings.json (debounced to avoid spamming disk writes on slider drag)
+  // 아직 settings 를 단일 출처로 옮기지 않은 항목만 되돌려 저장한다.
+  // (자막 옵션은 위 setter 들이 즉시 settings 에 쓴다)
   useEffect(() => {
     if (isFirstSettingsSyncRef.current) {
       isFirstSettingsSyncRef.current = false;
@@ -113,14 +133,7 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
     const timer = window.setTimeout(() => {
       onSettingsChange({
         subtitle_generation_workflow: generationWorkflow,
-        subtitle_sync_engine: syncEngine,
-        subtitle_whisper_model: whisperModel,
         subtitle_whisper_language: whisperLanguage,
-        subtitle_split_mode: splitMode,
-        subtitle_split_on_comma: splitOnComma,
-        subtitle_max_chars: maxChars,
-        subtitle_silence_threshold_db: silenceThresholdDb,
-        subtitle_min_silence_duration: minSilenceDuration,
         subtitle_start_offset_secs: startOffsetSecs,
         subtitle_auto_save: autoSave,
         subtitle_auto_scroll: autoScroll,
@@ -130,14 +143,7 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
     return () => window.clearTimeout(timer);
   }, [
     generationWorkflow,
-    syncEngine,
-    whisperModel,
     whisperLanguage,
-    splitMode,
-    splitOnComma,
-    maxChars,
-    silenceThresholdDb,
-    minSilenceDuration,
     startOffsetSecs,
     autoSave,
     autoScroll,
@@ -169,6 +175,14 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
       loadAudioFile(initialAudioPath);
     }
   }, [initialAudioPath]);
+
+  // 대본 스튜디오에서 넘어온 대본을 그대로 채우고 "대본 + AI 싱크" 모드로 전환한다.
+  useEffect(() => {
+    if (initialScriptText) {
+      setScriptText(initialScriptText);
+      setGenerationWorkflow('with-script');
+    }
+  }, [initialScriptText]);
 
   // Load audio file into HTML5 Audio via blob
   const loadAudioFile = async (path: string) => {
@@ -259,6 +273,8 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
   };
 
   // Generate Subtitles (Local AI Whisper or High-Precision VAD DP)
+  // 실제 파이프라인은 services/subtitleGeneration.ts 에 있다.
+  // 자막 일괄 생성과 동일한 코드를 쓰기 위해 여기서는 UI 상태만 다룬다.
   const handleGenerate = async () => {
     if (!audioPath.trim()) {
       setErrorMsg('음성 또는 영상 미디어 파일을 선택해 주세요.');
@@ -278,106 +294,47 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
     setAiProgress(0);
 
     try {
-      if (generationWorkflow === 'ai-only' || syncEngine === 'ai-whisper') {
-        // --- 1. LOCAL AI WHISPER MODE ---
-        setAiStatusMsg('오디오 16kHz PCM 데이터를 추출하는 중...');
-        setAiProgress(5);
+      const outcome = await generateSubtitles({
+        audioPath,
+        scriptText,
+        workflow: generationWorkflow,
+        syncEngine,
+        whisperModel,
+        whisperLanguage,
+        splitMode,
+        splitOnComma,
+        maxChars,
+        silenceThresholdDb,
+        minSilenceDuration,
+        startOffsetSecs,
+        autoSave,
+        outputDir: settings.output_dir,
+        onProgress: (message, percent) => {
+          setAiStatusMsg(message);
+          if (percent) setAiProgress(percent);
+        },
+      });
 
-        const rawSamples = await invoke<number[]>('extract_audio_pcm_16k', { path: audioPath });
-        if (!rawSamples || rawSamples.length === 0) {
-          throw new Error('오디오 데이터를 읽을 수 없습니다.');
-        }
-
-        const floatArray = new Float32Array(rawSamples);
-        const audioDur = floatArray.length / 16000;
-
-        const whisperResult = await runLocalWhisperTranscribe(
-          floatArray,
-          whisperModel,
-          (msg, pct) => {
-            setAiStatusMsg(msg);
-            if (pct) setAiProgress(pct);
-          },
-          whisperLanguage
-        );
-
-        let finalSubtitles: SubtitleItem[] = [];
-
-        if (generationWorkflow === 'ai-only') {
-          // --- AI-ONLY DIRECT TRANSCRIPTION (No Script) ---
-          finalSubtitles = generateSubtitlesFromAiChunks(whisperResult.chunks, maxChars);
-          if (whisperResult.text && !scriptText.trim()) {
-            setScriptText(whisperResult.text);
-          }
-        } else {
-          // --- SCRIPT + AI FORCED ALIGNMENT ---
-          const lines = splitScriptIntoLines(scriptText, splitMode, maxChars, splitOnComma);
-          if (lines.length === 0) {
-            throw new Error('대본에서 유효한 텍스트 문장을 찾을 수 없습니다.');
-          }
-          finalSubtitles = alignScriptWithWhisperChunks(lines, whisperResult.chunks, audioDur);
-        }
-
-        const srtContent = buildCurrentSrt(finalSubtitles);
-        const vttContent = buildCurrentVtt(finalSubtitles);
-
-        let srtSaved: string | undefined = undefined;
-        let vttSaved: string | undefined = undefined;
-
-        if (autoSave) {
-          const stem = audioPath.split(/[\\/]/).pop()?.replace(/\.[^/.]+$/, '') || 'subtitles';
-          const lastSlash = Math.max(audioPath.lastIndexOf('/'), audioPath.lastIndexOf('\\'));
-          const targetDir = settings.output_dir?.trim() || (lastSlash > 0 ? audioPath.substring(0, lastSlash) : '.');
-          const srtFile = `${targetDir}/${stem}.srt`;
-          const vttFile = `${targetDir}/${stem}.vtt`;
-
-          try {
-            await invoke('save_subtitle_file', { path: srtFile, content: srtContent });
-            srtSaved = srtFile;
-          } catch {}
-          try {
-            await invoke('save_subtitle_file', { path: vttFile, content: vttContent });
-            vttSaved = vttFile;
-          } catch {}
-        }
-
-        setSubtitles(finalSubtitles);
-        setGenerateResult({
-          subtitles: finalSubtitles,
-          srt_content: srtContent,
-          vtt_content: vttContent,
-          srt_path: srtSaved,
-          vtt_path: vttSaved,
-          total_duration: audioDur,
-          speech_segments_detected: whisperResult.chunks.length,
-          script_lines_count: finalSubtitles.length,
-        });
-        setSavedPaths({ srt: srtSaved, vtt: vttSaved });
-
-      } else {
-        // --- 2. HIGH-PRECISION VAD + DP MODE ---
-        const task: SubtitleGenerateTask = {
-          audio_path: audioPath,
-          script_text: scriptText,
-          split_mode: splitMode,
-          split_on_comma: splitOnComma,
-          max_chars: maxChars,
-          min_silence_duration_secs: minSilenceDuration,
-          silence_threshold_db: silenceThresholdDb,
-          start_offset_secs: startOffsetSecs,
-          end_margin_secs: 0.2,
-          auto_save: autoSave,
-          output_dir: settings.output_dir || null,
-        };
-
-        const result = await invoke<SubtitleGenerateResult>('generate_subtitles', { task });
-        setGenerateResult(result);
-        setSubtitles(result.subtitles);
-        setSavedPaths({
-          srt: result.srt_path || undefined,
-          vtt: result.vtt_path || undefined,
-        });
+      // 대본 없는 AI 전사 모드에서는 인식 결과를 대본 칸에 채워 준다.
+      if (generationWorkflow === 'ai-only' && outcome.transcribedText && !scriptText.trim()) {
+        setScriptText(outcome.transcribedText);
       }
+
+      setSubtitles(outcome.subtitles);
+      setGenerateResult({
+        subtitles: outcome.subtitles,
+        srt_content: outcome.srtContent,
+        vtt_content: outcome.vttContent,
+        srt_path: outcome.srtPath,
+        vtt_path: outcome.vttPath,
+        total_duration: outcome.totalDuration,
+        speech_segments_detected: outcome.segmentsDetected,
+        script_lines_count: outcome.subtitles.length,
+      });
+      setSavedPaths({
+        srt: outcome.srtPath || undefined,
+        vtt: outcome.vttPath || undefined,
+      });
 
       if (!audioBlobUrl) {
         await loadAudioFile(audioPath);
@@ -401,45 +358,9 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
     return `${String(mins).padStart(2, '0')}:${String(remSecs).padStart(2, '0')}.${String(ms).padStart(3, '0')}`;
   };
 
-  const formatSrtTimestamp = (secs: number) => {
-    const totalMillis = Math.round(Math.max(0, secs) * 1000);
-    const ms = totalMillis % 1000;
-    const s = Math.floor(totalMillis / 1000) % 60;
-    const m = Math.floor(totalMillis / (1000 * 60)) % 60;
-    const h = Math.floor(totalMillis / (1000 * 60 * 60));
-    return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')},${String(ms).padStart(3, '0')}`;
-  };
-
-  const formatVttTimestamp = (secs: number) => {
-    const totalMillis = Math.round(Math.max(0, secs) * 1000);
-    const ms = totalMillis % 1000;
-    const s = Math.floor(totalMillis / 1000) % 60;
-    const m = Math.floor(totalMillis / (1000 * 60)) % 60;
-    const h = Math.floor(totalMillis / (1000 * 60 * 60));
-    return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}.${String(ms).padStart(3, '0')}`;
-  };
-
-  // Re-generate SRT & VTT string from current subtitles array
-  const buildCurrentSrt = (items: SubtitleItem[]) => {
-    return items
-      .map(
-        (item, idx) =>
-          `${idx + 1}\n${formatSrtTimestamp(item.start_secs)} --> ${formatSrtTimestamp(item.end_secs)}\n${item.text}\n`
-      )
-      .join('\n');
-  };
-
-  const buildCurrentVtt = (items: SubtitleItem[]) => {
-    return (
-      'WEBVTT\n\n' +
-      items
-        .map(
-          (item, idx) =>
-            `${idx + 1}\n${formatVttTimestamp(item.start_secs)} --> ${formatVttTimestamp(item.end_secs)}\n${item.text}\n`
-        )
-        .join('\n')
-    );
-  };
+  // 자막 문자열 생성은 공용 서비스(services/subtitleGeneration.ts)를 그대로 쓴다.
+  const buildCurrentSrt = (items: SubtitleItem[]) => buildSrt(items);
+  const buildCurrentVtt = (items: SubtitleItem[]) => buildVtt(items);
 
   // Audio playback tracking & sync highlighting
   const handleTimeUpdate = () => {

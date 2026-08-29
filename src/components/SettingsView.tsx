@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import {
+  BookText,
   Sliders,
   Folder,
   Terminal,
@@ -438,6 +439,150 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   />
                 </div>
               )}
+            </div>
+          </div>
+        </div>
+
+        {/* Section 3.5: 대본 & TTS 자동 녹음 */}
+        <div className="bg-slate-900/80 border border-slate-800 rounded-2xl p-5 shadow-lg space-y-4">
+          <div className="flex items-center justify-between">
+            <span className="text-sm font-bold text-slate-200 flex items-center gap-2">
+              <BookText className="w-4 h-4 text-emerald-400" />
+              대본 & TTS 자동 녹음
+            </span>
+            <span className="text-xs text-emerald-400 font-mono">Script Studio</span>
+          </div>
+
+          <p className="text-[11px] text-slate-400">
+            "대본 & TTS" 탭의 자동 녹음이 쓰는 값입니다. 그 화면의 "자동화 세부 설정"과 같은 설정이라
+            어느 쪽에서 바꿔도 함께 반영됩니다.
+          </p>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            <div className="p-3.5 rounded-xl bg-slate-950/60 border border-slate-800 space-y-2">
+              <div className="flex items-center justify-between">
+                <span className="text-slate-300 text-[11px] font-medium">낭독 종료 판정 무음</span>
+                <span className="font-mono text-xs font-bold text-emerald-400">
+                  {localSettings.tts_auto_stop_seconds.toFixed(1)}초
+                </span>
+              </div>
+              <input
+                type="range"
+                min={1}
+                max={10}
+                step={0.5}
+                value={localSettings.tts_auto_stop_seconds}
+                onChange={(e) => handleChange({ tts_auto_stop_seconds: parseFloat(e.target.value) })}
+                className="w-full h-1 bg-slate-800 rounded appearance-none cursor-pointer accent-emerald-500"
+              />
+            </div>
+
+            <div className="p-3.5 rounded-xl bg-slate-950/60 border border-slate-800 space-y-2">
+              <div className="flex items-center justify-between">
+                <span className="text-slate-300 text-[11px] font-medium">소리 감지 임계값</span>
+                <span className="font-mono text-xs font-bold text-emerald-400">
+                  {localSettings.tts_speech_threshold_db} dB
+                </span>
+              </div>
+              <input
+                type="range"
+                min={-60}
+                max={-20}
+                step={1}
+                value={localSettings.tts_speech_threshold_db}
+                onChange={(e) =>
+                  handleChange({ tts_speech_threshold_db: parseFloat(e.target.value) })
+                }
+                className="w-full h-1 bg-slate-800 rounded appearance-none cursor-pointer accent-emerald-500"
+              />
+            </div>
+
+            <div className="p-3.5 rounded-xl bg-slate-950/60 border border-slate-800 space-y-2">
+              <div className="flex items-center justify-between">
+                <span className="text-slate-300 text-[11px] font-medium">재생 시작 대기</span>
+                <span className="font-mono text-xs font-bold text-emerald-400">
+                  {localSettings.tts_start_timeout_secs}초
+                </span>
+              </div>
+              <input
+                type="range"
+                min={5}
+                max={90}
+                step={5}
+                value={localSettings.tts_start_timeout_secs}
+                onChange={(e) =>
+                  handleChange({ tts_start_timeout_secs: parseInt(e.target.value, 10) })
+                }
+                className="w-full h-1 bg-slate-800 rounded appearance-none cursor-pointer accent-emerald-500"
+              />
+            </div>
+
+            <div className="p-3.5 rounded-xl bg-slate-950/60 border border-slate-800 space-y-2">
+              <div className="flex items-center justify-between">
+                <span className="text-slate-300 text-[11px] font-medium">대본 사이 간격</span>
+                <span className="font-mono text-xs font-bold text-emerald-400">
+                  {localSettings.tts_gap_secs}초
+                </span>
+              </div>
+              <input
+                type="range"
+                min={0}
+                max={15}
+                step={1}
+                value={localSettings.tts_gap_secs}
+                onChange={(e) => handleChange({ tts_gap_secs: parseInt(e.target.value, 10) })}
+                className="w-full h-1 bg-slate-800 rounded appearance-none cursor-pointer accent-emerald-500"
+              />
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-4">
+            <label className="flex items-center gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={localSettings.tts_mic_enabled}
+                onChange={(e) => handleChange({ tts_mic_enabled: e.target.checked })}
+                className="w-4 h-4 accent-emerald-500"
+              />
+              <span className="text-[11px] font-semibold text-slate-300">
+                TTS 녹음에 마이크도 함께 담기
+              </span>
+            </label>
+            <label className="flex items-center gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={localSettings.tts_batch_continue_on_error}
+                onChange={(e) => handleChange({ tts_batch_continue_on_error: e.target.checked })}
+                className="w-4 h-4 accent-emerald-500"
+              />
+              <span className="text-[11px] font-semibold text-slate-300">
+                일괄 처리 중 실패해도 계속 진행
+              </span>
+            </label>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            <div>
+              <label className="text-[11px] font-semibold text-slate-400 mb-1 block">
+                Typecast 편집기 주소
+              </label>
+              <input
+                value={localSettings.typecast_editor_url}
+                onChange={(e) => handleChange({ typecast_editor_url: e.target.value })}
+                placeholder="https://studio.typecast.ai/text-to-speech"
+                className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-xs text-slate-200 font-mono placeholder:text-slate-600 focus:outline-none focus:border-emerald-600"
+              />
+            </div>
+            <div>
+              <label className="text-[11px] font-semibold text-slate-400 mb-1 block">
+                Typecast 로그인 주소
+              </label>
+              <input
+                value={localSettings.typecast_signin_url}
+                onChange={(e) => handleChange({ typecast_signin_url: e.target.value })}
+                placeholder="https://studio.typecast.ai/sign-in"
+                className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-xs text-slate-200 font-mono placeholder:text-slate-600 focus:outline-none focus:border-emerald-600"
+              />
             </div>
           </div>
         </div>

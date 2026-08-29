@@ -21,9 +21,29 @@ pub struct AudioRecorderSession {
 }
 
 impl AudioRecorderSession {
+    /// 파일 이름에 쓸 수 없는 문자를 걷어내고 길이를 제한한다.
+    fn sanitize_prefix(raw: &str) -> Option<String> {
+        let cleaned: String = raw
+            .trim()
+            .chars()
+            .map(|c| match c {
+                '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\n' | '\r' | '\t' => '_',
+                c => c,
+            })
+            .take(40)
+            .collect();
+        let cleaned = cleaned.trim().trim_matches('.').to_string();
+        if cleaned.is_empty() {
+            None
+        } else {
+            Some(cleaned)
+        }
+    }
+
     pub fn start(
         settings: &Settings,
         event_sender: Sender<AudioEngineEvent>,
+        file_name_prefix: Option<&str>,
     ) -> Result<Self, String> {
         let ffmpeg_path = SettingsManager::find_ffmpeg(settings.custom_ffmpeg_path.as_deref())?;
 
@@ -35,7 +55,10 @@ impl AudioRecorderSession {
         };
 
         let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
-        let filename = format!("Audio_Record_{}.{}", timestamp, ext);
+        let prefix = file_name_prefix
+            .and_then(Self::sanitize_prefix)
+            .unwrap_or_else(|| "Audio_Record".to_string());
+        let filename = format!("{}_{}.{}", prefix, timestamp, ext);
         let output_dir = if settings.output_dir.trim().is_empty() {
             dirs::audio_dir().or_else(|| dirs::video_dir()).unwrap_or_else(|| PathBuf::from("."))
         } else {

@@ -1,11 +1,14 @@
 pub mod audio;
+pub mod clipboard;
 pub mod commands;
 pub mod converter;
 pub mod history;
 pub mod merger;
 pub mod recorder;
+pub mod script;
 pub mod settings;
 pub mod subtitle;
+pub mod tts;
 pub mod types;
 
 use std::sync::Arc;
@@ -64,6 +67,7 @@ pub fn run() {
             commands::toggle_pause_record,
             commands::stop_record,
             commands::get_recording_status,
+            commands::get_last_recorded_path,
             commands::list_history_files,
             commands::delete_history_file,
             commands::rename_history_file,
@@ -79,9 +83,32 @@ pub fn run() {
             commands::get_selection_screen_info,
             commands::hide_selection_overlay,
             commands::confirm_selection_region,
+            commands::generate_subtitles,
             commands::save_subtitle_file,
             commands::read_script_file,
             commands::extract_audio_pcm_16k,
+            commands::list_scripts,
+            commands::save_script,
+            commands::delete_script,
+            commands::duplicate_script,
+            commands::import_script_file,
+            commands::export_script_file,
+            commands::attach_script_recording,
+            commands::open_typecast_browser,
+            commands::close_typecast_browser,
+            commands::focus_typecast_browser,
+            commands::navigate_typecast_browser,
+            commands::typecast_go_back,
+            commands::typecast_reload,
+            commands::clear_typecast_session,
+            commands::get_typecast_browser_state,
+            commands::mark_typecast_login,
+            commands::copy_text_to_clipboard,
+            commands::notify_typecast,
+            commands::typecast_prepare_script,
+            commands::typecast_play,
+            commands::typecast_stop_playback,
+            commands::typecast_probe,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

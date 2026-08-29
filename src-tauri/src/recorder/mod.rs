@@ -87,14 +87,18 @@ impl RecorderController {
         Ok(path.to_string_lossy().to_string())
     }
 
-    pub fn start_audio(&self, settings: &Settings) -> Result<String, String> {
+    pub fn start_audio(
+        &self,
+        settings: &Settings,
+        file_name_prefix: Option<String>,
+    ) -> Result<String, String> {
         let mut session_guard = self.session.lock();
         if session_guard.is_some() {
             return Err("A recording is already in progress.".to_string());
         }
 
         let (tx, rx): (Sender<AudioEngineEvent>, Receiver<AudioEngineEvent>) = channel();
-        let session = AudioRecorderSession::start(settings, tx)?;
+        let session = AudioRecorderSession::start(settings, tx, file_name_prefix.as_deref())?;
         let path = session.output_path.clone();
 
         *session_guard = Some(ActiveSession::Audio(session));
@@ -208,6 +212,14 @@ impl RecorderController {
         }
 
         Ok(path.to_string_lossy().to_string())
+    }
+
+    /// 마지막으로 저장된 녹음 결과 경로(자동 종료 포함).
+    pub fn last_recorded_path(&self) -> Option<String> {
+        self.last_stopped_path
+            .lock()
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string())
     }
 
     pub fn get_status(&self) -> RecordingStatus {
@@ -375,7 +387,13 @@ impl RecorderController {
                                     mic_vu_level: -60.0,
                                 };
                                 let _ = app.emit("recording_status_change", &payload);
-                                let _ = app.emit("auto_stop_triggered", true);
+                                // 자동 종료로 저장된 결과 파일 경로를 함께 전달해
+                                // TTS 녹음 워크플로우가 결과를 대본에 연결할 수 있게 한다.
+                                let saved_path = last_stopped_path_arc
+                                    .lock()
+                                    .as_ref()
+                                    .map(|p| p.to_string_lossy().to_string());
+                                let _ = app.emit("auto_stop_triggered", saved_path);
                             }
                             break;
                         }

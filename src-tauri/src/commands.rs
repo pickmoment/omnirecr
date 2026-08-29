@@ -7,10 +7,12 @@ use crate::merger::MergerController;
 use crate::recorder::RecorderController;
 use crate::settings::SettingsManager;
 use crate::subtitle::SubtitleController;
+use crate::script::ScriptManager;
+use crate::tts::TypecastController;
 use crate::types::{
     AudioConvertTaskPayload, HistoryItem, MediaProbeInfo, MergeTaskPayload, RecordingStateStatus,
-    RecordingStatus, RectRegion, SelectionScreenInfo, Settings, SubtitleGenerateResult,
-    SubtitleGenerateTask,
+    RecordingStatus, RectRegion, ScriptDraft, ScriptItem, SelectionScreenInfo, Settings,
+    SubtitleGenerateResult, SubtitleGenerateTask, TypecastBrowserState,
 };
 
 pub struct AppState {
@@ -87,10 +89,31 @@ pub fn start_screen_record(
 
 #[tauri::command]
 pub fn start_audio_record(
+    app: AppHandle,
     state: State<AppState>,
     settings: Settings,
+    file_name_prefix: Option<String>,
+    show_mini_controller: Option<bool>,
 ) -> Result<String, String> {
-    state.recorder.start_audio(&settings)
+    let result = state.recorder.start_audio(&settings, file_name_prefix);
+
+    // TTS 낭독 녹음처럼 다른 창(Typecast)에서 작업하는 동안에는
+    // 항상 위에 뜨는 미니 컨트롤러로 정지/일시정지를 할 수 있게 한다.
+    // (화면 녹화와 달리 메인 창을 최소화하지는 않는다.)
+    if result.is_ok() && show_mini_controller.unwrap_or(false) {
+        if let Some(mini_win) = app.get_webview_window("mini-controller") {
+            if let Ok(Some(monitor)) = mini_win.primary_monitor() {
+                let screen_w = monitor.size().width as i32;
+                let mini_x = (screen_w - 360) / 2;
+                let _ =
+                    mini_win.set_position(Position::Physical(PhysicalPosition { x: mini_x, y: 20 }));
+            }
+            let _ = mini_win.set_always_on_top(true);
+            let _ = mini_win.show();
+        }
+    }
+
+    result
 }
 
 #[tauri::command]
@@ -137,6 +160,11 @@ pub fn stop_record(app: AppHandle, state: State<AppState>) -> Result<String, Str
 #[tauri::command]
 pub fn get_recording_status(state: State<AppState>) -> RecordingStatus {
     state.recorder.get_status()
+}
+
+#[tauri::command]
+pub fn get_last_recorded_path(state: State<AppState>) -> Option<String> {
+    state.recorder.last_recorded_path()
 }
 
 #[tauri::command]
@@ -343,3 +371,137 @@ pub async fn extract_audio_pcm_16k(path: String) -> Result<Vec<f32>, String> {
     .map_err(|e| format!("PCM 추출 작업 실패: {}", e))?
 }
 
+
+// ─────────────────────────────────────────────────────────────
+// 대본 관리 (Script Library)
+// ─────────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub fn list_scripts() -> Vec<ScriptItem> {
+    ScriptManager::list()
+}
+
+#[tauri::command]
+pub fn save_script(draft: ScriptDraft) -> Result<ScriptItem, String> {
+    ScriptManager::upsert(draft)
+}
+
+#[tauri::command]
+pub fn delete_script(id: String) -> Result<(), String> {
+    ScriptManager::delete(&id)
+}
+
+#[tauri::command]
+pub fn duplicate_script(id: String) -> Result<ScriptItem, String> {
+    ScriptManager::duplicate(&id)
+}
+
+#[tauri::command]
+pub fn import_script_file(path: String) -> Result<ScriptItem, String> {
+    ScriptManager::import_from_file(&path)
+}
+
+#[tauri::command]
+pub fn export_script_file(id: String, path: String) -> Result<(), String> {
+    ScriptManager::export_to_file(&id, &path)
+}
+
+#[tauri::command]
+pub fn attach_script_recording(id: String, recorded_path: String) -> Result<ScriptItem, String> {
+    ScriptManager::attach_recording(&id, &recorded_path)
+}
+
+// ─────────────────────────────────────────────────────────────
+// Typecast TTS 브라우저
+// ─────────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub fn open_typecast_browser(app: AppHandle, url: Option<String>) -> Result<(), String> {
+    TypecastController::open(&app, url)
+}
+
+#[tauri::command]
+pub fn close_typecast_browser(app: AppHandle) -> Result<(), String> {
+    TypecastController::close(&app)
+}
+
+#[tauri::command]
+pub fn focus_typecast_browser(app: AppHandle) -> Result<(), String> {
+    TypecastController::focus(&app)
+}
+
+#[tauri::command]
+pub fn navigate_typecast_browser(app: AppHandle, url: String) -> Result<(), String> {
+    TypecastController::navigate(&app, url)
+}
+
+#[tauri::command]
+pub fn typecast_go_back(app: AppHandle) -> Result<(), String> {
+    TypecastController::go_back(&app)
+}
+
+#[tauri::command]
+pub fn typecast_reload(app: AppHandle) -> Result<(), String> {
+    TypecastController::reload(&app)
+}
+
+#[tauri::command]
+pub fn clear_typecast_session(app: AppHandle) -> Result<(), String> {
+    TypecastController::clear_session(&app)
+}
+
+#[tauri::command]
+pub fn get_typecast_browser_state(app: AppHandle) -> TypecastBrowserState {
+    TypecastController::state(&app)
+}
+
+/// 로그인 완료를 기록한다. 비밀번호는 저장하지 않고,
+/// 세션 자체는 브라우저 창의 영구 쿠키 저장소가 유지한다.
+#[tauri::command]
+pub fn mark_typecast_login(email: Option<String>) -> Result<Settings, String> {
+    let mut settings = SettingsManager::load();
+    settings.typecast_session_saved = true;
+    settings.typecast_last_login_at =
+        Some(chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
+    settings.typecast_account_email = email
+        .map(|e| e.trim().to_string())
+        .filter(|e| !e.is_empty())
+        .or(settings.typecast_account_email.clone());
+    SettingsManager::save(&settings)?;
+    Ok(settings)
+}
+
+#[tauri::command]
+pub fn copy_text_to_clipboard(text: String) -> Result<(), String> {
+    crate::clipboard::copy_text(&text)
+}
+
+/// Typecast 페이지 위에 안내 배너를 띄운다(카운트다운 / 녹음 시작 알림).
+#[tauri::command]
+pub fn notify_typecast(app: AppHandle, message: String, tone: Option<String>) -> Result<(), String> {
+    TypecastController::notify(&app, message, tone)
+}
+
+// ── Typecast 페이지 자동화 ──────────────────────────────────
+
+/// 대본을 편집기에 주입한다. 결과는 `typecast_step` 이벤트로 보고된다.
+#[tauri::command]
+pub fn typecast_prepare_script(app: AppHandle, text: String) -> Result<(), String> {
+    TypecastController::prepare_script(&app, text)
+}
+
+#[tauri::command]
+pub fn typecast_play(app: AppHandle) -> Result<(), String> {
+    TypecastController::play(&app)
+}
+
+#[tauri::command]
+pub fn typecast_stop_playback(app: AppHandle) -> Result<(), String> {
+    TypecastController::stop_playback(&app)
+}
+
+/// 편집기 / 재생 버튼을 어떻게 찾았는지 진단 보고를 요청한다.
+#[tauri::command]
+pub fn typecast_probe(app: AppHandle) -> Result<(), String> {
+    TypecastController::probe(&app)
+}
