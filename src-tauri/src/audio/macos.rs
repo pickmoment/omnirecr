@@ -23,7 +23,12 @@ pub struct MacSystemAudioCapture {
 }
 
 impl MacSystemAudioCapture {
-    pub fn start(sender: Sender<Vec<f32>>) -> Result<Self, String> {
+    /// `include_own_app_audio` 가 true 면 OmniRec 자신이 내는 소리도 캡처한다.
+    ///
+    /// 기본값(false)은 화면 녹화 중 앱 자체 소리가 되먹임되는 것을 막기 위한 것이지만,
+    /// 앱 안의 웹뷰(Typecast 창)가 내는 TTS 낭독을 녹음하려면 반드시 포함시켜야 한다.
+    /// 이 값이 false 인 채로 녹음하면 스피커로는 소리가 나는데 파일은 무음이 된다.
+    pub fn start(sender: Sender<Vec<f32>>, include_own_app_audio: bool) -> Result<Self, String> {
         ensure_screen_capture_permission()?;
         let content = SCShareableContent::get().map_err(|error| {
             format!("Unable to access macOS screen and system audio content: {error}")
@@ -44,7 +49,7 @@ impl MacSystemAudioCapture {
             .with_captures_audio(true)
             .with_sample_rate(SYSTEM_AUDIO_SAMPLE_RATE_HZ as i32)
             .with_channel_count(2)
-            .with_excludes_current_process_audio(true);
+            .with_excludes_current_process_audio(!include_own_app_audio);
 
         let mut stream = SCStream::new(&filter, &configuration);
         let handler_id = stream.add_output_handler(

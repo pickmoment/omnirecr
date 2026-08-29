@@ -21,6 +21,11 @@ export interface Settings {
   video_fps: number; // 30, 60
   system_audio_enabled: boolean;
   system_audio_volume: number; // 0.0 to 2.0
+  /**
+   * OmniRec 자신이 내는 소리(앱 내 Typecast 웹뷰의 TTS 재생 등)를 시스템 오디오에 포함할지.
+   * macOS 전용. 꺼두면 스피커로는 들리는데 녹음 파일은 무음이 된다.
+   */
+  system_audio_include_own_app: boolean;
   mic_audio_enabled: boolean;
   mic_audio_volume: number; // 0.0 to 2.0
   noise_gate_enabled: boolean;
@@ -47,9 +52,40 @@ export interface Settings {
   subtitle_auto_scroll: boolean;
   subtitle_ripple_edit: boolean;
   subtitle_split_on_comma: boolean;
+  typecast_editor_url: string;
+  typecast_signin_url: string;
+  /** 표시용 계정 이메일. 비밀번호는 저장하지 않으며 세션은 브라우저 쿠키로 유지된다. */
+  typecast_account_email?: string | null;
+  typecast_session_saved: boolean;
+  typecast_last_login_at?: string | null;
+  /** 자동화용 사용자 지정 CSS 선택자 (비우면 내장 휴리스틱) */
+  typecast_editor_selector: string;
+  typecast_play_selector: string;
+  tts_countdown_secs: number;
+  tts_mic_enabled: boolean;
+  /** 낭독이 끝났다고 판정할 무음 길이(초). 자동 · 수동 TTS 녹음이 함께 쓴다. */
+  tts_auto_stop_seconds: number;
+  /** 낭독 소리로 판정할 시스템 오디오 레벨(dB) */
+  tts_speech_threshold_db: number;
+  /** 재생 시작(소리 감지) 최대 대기 시간(초) */
+  tts_start_timeout_secs: number;
+  /** 일괄 처리에서 대본 사이 간격(초) */
+  tts_gap_secs: number;
+  /** 실패한 대본이 있어도 계속 진행할지 */
+  tts_batch_continue_on_error: boolean;
 }
 
-export type TabType = 'screen' | 'audio' | 'subtitle' | 'converter' | 'history' | 'merger' | 'settings';
+/**
+ * 상단 탭. 위젯 단위가 아니라 작업 흐름 단위로 묶는다.
+ * - record : 오디오 녹음 · 화면 녹화
+ * - script : 대본 관리 → TTS 자동/수동 녹음
+ * - subtitle : 자막 편집기 · 대본 일괄 생성
+ * - files  : 히스토리 · 병합 · 변환
+ */
+export type TabType = 'record' | 'script' | 'subtitle' | 'files' | 'settings';
+
+export type RecordView = 'audio' | 'screen';
+export type FilesView = 'history' | 'merger' | 'converter';
 
 export interface RecordingStatus {
   status: 'idle' | 'recording' | 'paused' | 'stopping';
@@ -175,3 +211,84 @@ export interface SubtitleGenerateResult {
   script_lines_count: number;
 }
 
+
+// ─────────────────────────────────────────────────────────────
+// 대본 관리 & Typecast TTS
+// ─────────────────────────────────────────────────────────────
+
+export interface ScriptItem {
+  id: string;
+  title: string;
+  content: string;
+  tags: string[];
+  memo: string;
+  created_at: string;
+  updated_at: string;
+  char_count: number;
+  line_count: number;
+  /** 한국어 낭독 평균 속도 기준 예상 낭독 시간(초) */
+  estimated_secs: number;
+  last_recorded_path?: string | null;
+  last_recorded_at?: string | null;
+  record_count: number;
+}
+
+export interface ScriptDraft {
+  id?: string | null;
+  title: string;
+  content: string;
+  tags: string[];
+  memo: string;
+}
+
+export interface TypecastBrowserState {
+  is_open: boolean;
+  current_url?: string | null;
+  looks_signed_in: boolean;
+  account_email?: string | null;
+  last_login_at?: string | null;
+}
+
+export interface TypecastNavigationPayload {
+  url: string;
+  looks_signed_in: boolean;
+}
+
+export interface TypecastPopupPayload {
+  url: string;
+}
+
+/** 페이지 자동화 단계 보고 */
+export interface TypecastStepPayload {
+  name: string;
+  detail: string;
+}
+
+/** Typecast 창 연동 진단 로그 */
+export interface TypecastDebugPayload {
+  kind: string;
+  detail: string;
+  at: string;
+}
+
+
+export type BatchItemStatus =
+  | 'pending'
+  | 'preparing'
+  | 'recording'
+  | 'speaking'
+  | 'saving'
+  | 'done'
+  | 'failed'
+  | 'skipped';
+
+export interface BatchItemState {
+  scriptId: string;
+  title: string;
+  status: BatchItemStatus;
+  message?: string;
+  outputPath?: string | null;
+  durationSecs?: number;
+}
+
+export type ScriptStudioView = 'library' | 'batch' | 'manual';

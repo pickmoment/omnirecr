@@ -1,24 +1,23 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
 
 import type {
   TabType,
+  FilesView,
   Settings,
   RecordingStatus,
   HistoryItem,
   RectRegion,
   AudioVUMeterPayload,
 } from './types';
+import type { StartTtsRecordOptions } from './components/TtsRecorder';
 import { Navbar } from './components/Navbar';
-import { ScreenRecorder } from './components/ScreenRecorder';
-import { AudioRecorder } from './components/AudioRecorder';
-import { HistoryList } from './components/HistoryList';
-import { MediaJoiner } from './components/MediaJoiner';
-import { AudioConverter } from './components/AudioConverter';
-import { SubtitleGenerator } from './components/SubtitleGenerator';
-import { SettingsModal } from './components/SettingsModal';
+import { RecordStudio } from './components/RecordStudio';
+import { FileStudio } from './components/FileStudio';
+import { SubtitleStudio } from './components/SubtitleStudio';
+import { ScriptStudio } from './components/ScriptStudio';
 import { SettingsView } from './components/SettingsView';
 import { SelectionOverlay } from './components/SelectionOverlay';
 import { MiniController } from './components/MiniController';
@@ -31,6 +30,7 @@ const defaultSettings: Settings = {
   video_fps: 60,
   system_audio_enabled: true,
   system_audio_volume: 1.0,
+  system_audio_include_own_app: false,
   mic_audio_enabled: true,
   mic_audio_volume: 1.0,
   noise_gate_enabled: true,
@@ -57,6 +57,20 @@ const defaultSettings: Settings = {
   subtitle_auto_scroll: true,
   subtitle_ripple_edit: false,
   subtitle_split_on_comma: false,
+  typecast_editor_url: 'https://studio.typecast.ai/text-to-speech',
+  typecast_signin_url: 'https://studio.typecast.ai/sign-in',
+  typecast_account_email: null,
+  typecast_session_saved: false,
+  typecast_last_login_at: null,
+  typecast_editor_selector: '',
+  typecast_play_selector: '',
+  tts_countdown_secs: 3,
+  tts_mic_enabled: false,
+  tts_auto_stop_seconds: 4.0,
+  tts_speech_threshold_db: -45.0,
+  tts_start_timeout_secs: 25,
+  tts_gap_secs: 2,
+  tts_batch_continue_on_error: true,
 };
 
 const initialRecordingStatus: RecordingStatus = {
@@ -79,7 +93,12 @@ export const App: React.FC = () => {
     }
   });
 
-  const [currentTab, setCurrentTab] = useState<TabType>('screen');
+  const [currentTab, setCurrentTab] = useState<TabType>('record');
+  // 이벤트 리스너 콜백이 최신 탭을 볼 수 있도록 ref 로도 보관한다.
+  const currentTabRef = useRef<TabType>('record');
+  useEffect(() => {
+    currentTabRef.current = currentTab;
+  }, [currentTab]);
   const [settings, setSettings] = useState<Settings>(defaultSettings);
   const [recordingStatus, setRecordingStatus] = useState<RecordingStatus>(initialRecordingStatus);
   const [selectedRegion, setSelectedRegion] = useState<RectRegion | null>(null);
@@ -89,8 +108,10 @@ export const App: React.FC = () => {
 
   const [joinerInitialFiles, setJoinerInitialFiles] = useState<string[]>([]);
   const [converterInitialFiles, setConverterInitialFiles] = useState<string[]>([]);
+  // 히스토리에서 병합 · 변환으로 보낼 때 파일 탭의 서브 화면을 지정한다.
+  const [filesView, setFilesView] = useState<FilesView | null>(null);
   const [subtitleInitialAudio, setSubtitleInitialAudio] = useState<string | null>(null);
-  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [subtitleInitialScript, setSubtitleInitialScript] = useState<string | null>(null);
   const [ffmpegDetected, setFfmpegDetected] = useState(false);
 
   // Initialize app if in main window
@@ -135,10 +156,13 @@ export const App: React.FC = () => {
       setSelectedRegion(event.payload);
     });
 
-    const unlistenAutoStop = listen('auto_stop_triggered', () => {
+    const unlistenAutoStop = listen<string | null>('auto_stop_triggered', () => {
       setRecordingStatus(initialRecordingStatus);
       refreshHistory();
-      setCurrentTab('history');
+      // 대본 스튜디오에서 TTS 낭독을 녹음하는 중이라면 화면을 그대로 유지한다.
+      if (currentTabRef.current !== 'script') {
+        setCurrentTab('files');
+      }
     });
 
     return () => {
@@ -193,10 +217,15 @@ export const App: React.FC = () => {
     }
   };
 
-  const handleStartAudioRecord = async () => {
+  /** 녹음을 시작하고 저장될 파일 경로를 반환한다. 실패 시 null. */
+  const handleStartAudioRecord = async (
+    options?: StartTtsRecordOptions,
+  ): Promise<string | null> => {
     try {
-      await invoke('start_audio_record', {
-        settings,
+      const outputPath = await invoke<string>('start_audio_record', {
+        settings: { ...settings, ...(options?.settingsOverride ?? {}) },
+        fileNamePrefix: options?.fileNamePrefix ?? null,
+        showMiniController: options?.showMiniController ?? false,
       });
       setRecordingStatus((prev) => ({
         ...prev,
@@ -204,8 +233,10 @@ export const App: React.FC = () => {
         mode: 'audio',
         duration_secs: 0,
       }));
+      return outputPath || null;
     } catch (err) {
       alert(`오디오 녹음 시작 실패: ${err}`);
+      return null;
     }
   };
 
@@ -227,20 +258,27 @@ export const App: React.FC = () => {
     }
   };
 
+  // TTS 낭독 녹음 중에는 결과 연결 UI를 계속 보여줘야 하므로 탭을 바꾸지 않는다.
+  const navigateToHistoryUnlessScriptStudio = () => {
+    if (currentTabRef.current !== 'script') {
+      setCurrentTab('files');
+    }
+  };
+
   const handleStopRecord = async () => {
     try {
       setRecordingStatus((prev) => ({ ...prev, status: 'stopping' }));
       await invoke<string>('stop_record');
       setRecordingStatus(initialRecordingStatus);
       refreshHistory();
-      setCurrentTab('history');
+      navigateToHistoryUnlessScriptStudio();
     } catch (err) {
       setRecordingStatus(initialRecordingStatus);
       const errMsg = String(err);
       if (errMsg.includes('No active recording')) {
         // Already stopped successfully, safe to ignore
         refreshHistory();
-        setCurrentTab('history');
+        navigateToHistoryUnlessScriptStudio();
       } else {
         alert(`녹화 저장 실패: ${err}`);
       }
@@ -274,16 +312,19 @@ export const App: React.FC = () => {
 
   const handleSendToMerger = (selectedPaths: string[]) => {
     setJoinerInitialFiles(selectedPaths);
-    setCurrentTab('merger');
+    setFilesView('merger');
+    setCurrentTab('files');
   };
 
   const handleSendToConverter = (selectedPaths: string[]) => {
     setConverterInitialFiles(selectedPaths);
-    setCurrentTab('converter');
+    setFilesView('converter');
+    setCurrentTab('files');
   };
 
-  const handleSendToSubtitle = (audioPath: string) => {
+  const handleSendToSubtitle = (audioPath: string, scriptText?: string) => {
     setSubtitleInitialAudio(audioPath);
+    setSubtitleInitialScript(scriptText ?? null);
     setCurrentTab('subtitle');
   };
 
@@ -311,7 +352,7 @@ export const App: React.FC = () => {
         currentTab={currentTab}
         onSelectTab={(tab) => {
           setCurrentTab(tab);
-          if (tab === 'history') {
+          if (tab === 'files') {
             refreshHistory();
           }
         }}
@@ -321,76 +362,67 @@ export const App: React.FC = () => {
 
       {/* Main Tab Content */}
       <main className="flex-1 min-h-0 overflow-y-auto relative">
-        {currentTab === 'screen' && (
-          <ScreenRecorder
+        {currentTab === 'record' && (
+          <RecordStudio
             settings={settings}
             recordingStatus={recordingStatus}
             selectedRegion={selectedRegion}
             onClearRegion={() => setSelectedRegion(null)}
             onOpenSelectionOverlay={handleOpenSelectionOverlay}
             onOpenSettings={() => setCurrentTab('settings')}
-            onStartRecord={handleStartScreenRecord}
+            onStartScreenRecord={handleStartScreenRecord}
+            onStartAudioRecord={async () => {
+              await handleStartAudioRecord();
+            }}
             onPauseRecord={handlePauseRecord}
             onResumeRecord={handleResumeRecord}
             onStopRecord={handleStopRecord}
           />
         )}
 
-        {currentTab === 'audio' && (
-          <AudioRecorder
+        {currentTab === 'files' && (
+          <FileStudio
             settings={settings}
-            recordingStatus={recordingStatus}
-            onOpenSettings={() => setCurrentTab('settings')}
-            onStartRecord={handleStartAudioRecord}
-            onPauseRecord={handlePauseRecord}
-            onResumeRecord={handleResumeRecord}
-            onStopRecord={handleStopRecord}
-          />
-        )}
-
-        {currentTab === 'history' && (
-          <HistoryList
-            items={historyItems}
-            isLoading={isHistoryLoading}
-            onRefresh={refreshHistory}
+            historyItems={historyItems}
+            isHistoryLoading={isHistoryLoading}
+            joinerInitialFiles={joinerInitialFiles}
+            converterInitialFiles={converterInitialFiles}
+            onRefreshHistory={refreshHistory}
             onDeleteFile={handleDeleteHistoryFile}
             onOpenExplorer={handleOpenExplorer}
             onOpenDefaultPlayer={handleOpenDefaultPlayer}
             onSendToMerger={handleSendToMerger}
             onSendToConverter={handleSendToConverter}
             onSendToSubtitle={handleSendToSubtitle}
+            requestedView={filesView}
+            onViewHandled={() => setFilesView(null)}
           />
         )}
 
-        {currentTab === 'merger' && (
-          <MediaJoiner
+        {currentTab === 'script' && (
+          <ScriptStudio
             settings={settings}
-            initialFiles={joinerInitialFiles}
-            onOpenExplorer={handleOpenExplorer}
-            onOpenDefaultPlayer={handleOpenDefaultPlayer}
-          />
-        )}
-
-        {currentTab === 'converter' && (
-          <AudioConverter
-            settings={settings}
-            initialFiles={converterInitialFiles}
-            onOpenExplorer={handleOpenExplorer}
-            onOpenDefaultPlayer={handleOpenDefaultPlayer}
-            onNavigateToHistory={() => {
-              refreshHistory();
-              setCurrentTab('history');
-            }}
+            recordingStatus={recordingStatus}
+            onUpdateSettings={handleUpdateSettings}
+            onStartRecord={handleStartAudioRecord}
+            onPauseRecord={handlePauseRecord}
+            onResumeRecord={handleResumeRecord}
+            onStopRecord={handleStopRecord}
             onSendToSubtitle={handleSendToSubtitle}
+            onOpenExplorer={handleOpenExplorer}
+            onOpenDefaultPlayer={handleOpenDefaultPlayer}
+            onOpenSettings={() => setCurrentTab('settings')}
           />
         )}
 
         {currentTab === 'subtitle' && (
-          <SubtitleGenerator
+          <SubtitleStudio
             settings={settings}
             initialAudioPath={subtitleInitialAudio}
+            initialScriptText={subtitleInitialScript}
             onOpenExplorer={handleOpenExplorer}
             onSettingsChange={handleUpdateSettings}
+            onOpenSettings={() => setCurrentTab('settings')}
           />
         )}
 
@@ -404,18 +436,6 @@ export const App: React.FC = () => {
         )}
       </main>
 
-      {/* Settings Modal (Optional Quick Modal fallback) */}
-      <SettingsModal
-        isOpen={isSettingsOpen}
-        onClose={() => setIsSettingsOpen(false)}
-        settings={settings}
-        onSave={async (saved) => {
-          setSettings(saved);
-          await invoke('save_settings', { settings: saved });
-          checkFfmpeg(saved.custom_ffmpeg_path);
-          refreshHistory();
-        }}
-      />
     </div>
   );
 };

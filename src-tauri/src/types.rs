@@ -25,6 +25,10 @@ pub struct Settings {
     pub video_fps: u32,       // 30, 60
     pub system_audio_enabled: bool,
     pub system_audio_volume: f32, // 0.0 to 2.0 (0% to 200%)
+    /// OmniRec 자신이 내는 소리(앱 내 웹뷰의 TTS 재생 등)도 시스템 오디오에 포함할지.
+    /// macOS ScreenCaptureKit 전용. TTS 낭독 녹음에서는 반드시 true 여야 한다.
+    #[serde(default)]
+    pub system_audio_include_own_app: bool,
     pub mic_audio_enabled: bool,
     pub mic_audio_volume: f32,    // 0.0 to 2.0 (0% to 200%)
     pub noise_gate_enabled: bool,
@@ -66,6 +70,42 @@ pub struct Settings {
     pub subtitle_ripple_edit: bool,
     #[serde(default)]
     pub subtitle_split_on_comma: bool,
+    #[serde(default = "default_typecast_editor_url")]
+    pub typecast_editor_url: String,
+    #[serde(default = "default_typecast_signin_url")]
+    pub typecast_signin_url: String,
+    /// Typecast 계정 이메일(표시/식별 용도). 비밀번호는 절대 저장하지 않으며,
+    /// 실제 인증은 브라우저 창의 영구 쿠키 세션으로 유지된다.
+    #[serde(default)]
+    pub typecast_account_email: Option<String>,
+    #[serde(default)]
+    pub typecast_session_saved: bool,
+    #[serde(default)]
+    pub typecast_last_login_at: Option<String>,
+    /// 자동화용 사용자 지정 CSS 선택자. 비우면 내장 휴리스틱을 쓴다.
+    #[serde(default)]
+    pub typecast_editor_selector: String,
+    #[serde(default)]
+    pub typecast_play_selector: String,
+    #[serde(default = "default_tts_countdown_secs")]
+    pub tts_countdown_secs: u32,
+    #[serde(default)]
+    pub tts_mic_enabled: bool,
+    /// 낭독이 끝났다고 판정할 무음 길이(초). 자동 · 수동 TTS 녹음이 함께 쓴다.
+    #[serde(default = "default_tts_auto_stop_seconds")]
+    pub tts_auto_stop_seconds: f32,
+    /// 낭독 소리로 판정할 시스템 오디오 레벨(dB)
+    #[serde(default = "default_tts_speech_threshold_db")]
+    pub tts_speech_threshold_db: f32,
+    /// 재생 시작(소리 감지) 최대 대기 시간(초)
+    #[serde(default = "default_tts_start_timeout_secs")]
+    pub tts_start_timeout_secs: u32,
+    /// 일괄 처리에서 대본 사이에 두는 간격(초)
+    #[serde(default = "default_tts_gap_secs")]
+    pub tts_gap_secs: u32,
+    /// 일괄 처리 중 실패한 대본이 있어도 계속 진행할지 여부
+    #[serde(default = "default_tts_batch_continue_on_error")]
+    pub tts_batch_continue_on_error: bool,
 }
 
 fn default_macos_shortcut_start() -> String {
@@ -120,6 +160,38 @@ fn default_subtitle_auto_scroll() -> bool {
     true
 }
 
+fn default_typecast_editor_url() -> String {
+    "https://studio.typecast.ai/text-to-speech".to_string()
+}
+
+fn default_typecast_signin_url() -> String {
+    "https://studio.typecast.ai/sign-in".to_string()
+}
+
+fn default_tts_countdown_secs() -> u32 {
+    3
+}
+
+fn default_tts_auto_stop_seconds() -> f32 {
+    4.0
+}
+
+fn default_tts_speech_threshold_db() -> f32 {
+    -45.0
+}
+
+fn default_tts_start_timeout_secs() -> u32 {
+    25
+}
+
+fn default_tts_gap_secs() -> u32 {
+    2
+}
+
+fn default_tts_batch_continue_on_error() -> bool {
+    true
+}
+
 impl Default for Settings {
     fn default() -> Self {
         let default_output = dirs::video_dir()
@@ -136,6 +208,7 @@ impl Default for Settings {
             video_fps: 60,
             system_audio_enabled: true,
             system_audio_volume: 1.0,
+            system_audio_include_own_app: false,
             mic_audio_enabled: true,
             mic_audio_volume: 1.0,
             noise_gate_enabled: true,
@@ -162,6 +235,20 @@ impl Default for Settings {
             subtitle_auto_scroll: default_subtitle_auto_scroll(),
             subtitle_ripple_edit: false,
             subtitle_split_on_comma: false,
+            typecast_editor_url: default_typecast_editor_url(),
+            typecast_signin_url: default_typecast_signin_url(),
+            typecast_account_email: None,
+            typecast_session_saved: false,
+            typecast_last_login_at: None,
+            typecast_editor_selector: String::new(),
+            typecast_play_selector: String::new(),
+            tts_countdown_secs: default_tts_countdown_secs(),
+            tts_mic_enabled: false,
+            tts_auto_stop_seconds: default_tts_auto_stop_seconds(),
+            tts_speech_threshold_db: default_tts_speech_threshold_db(),
+            tts_start_timeout_secs: default_tts_start_timeout_secs(),
+            tts_gap_secs: default_tts_gap_secs(),
+            tts_batch_continue_on_error: default_tts_batch_continue_on_error(),
         }
     }
 }
@@ -317,3 +404,88 @@ pub struct SubtitleGenerateResult {
 }
 
 
+
+// ─────────────────────────────────────────────────────────────
+// 대본 관리 (Script Library)
+// ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScriptItem {
+    pub id: String,
+    pub title: String,
+    pub content: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub memo: String,
+    pub created_at: String,
+    pub updated_at: String,
+    #[serde(default)]
+    pub char_count: usize,
+    #[serde(default)]
+    pub line_count: usize,
+    /// 한국어 낭독 평균 속도(5.5자/초) 기준 예상 낭독 시간
+    #[serde(default)]
+    pub estimated_secs: f64,
+    /// 이 대본으로 마지막에 녹음한 결과 파일 경로
+    #[serde(default)]
+    pub last_recorded_path: Option<String>,
+    #[serde(default)]
+    pub last_recorded_at: Option<String>,
+    #[serde(default)]
+    pub record_count: u32,
+}
+
+/// 프론트엔드에서 넘어오는 저장 요청. `id`가 없으면 신규 생성.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScriptDraft {
+    #[serde(default)]
+    pub id: Option<String>,
+    pub title: String,
+    pub content: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub memo: String,
+}
+
+// ─────────────────────────────────────────────────────────────
+// Typecast TTS 브라우저 세션
+// ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TypecastBrowserState {
+    pub is_open: bool,
+    pub current_url: Option<String>,
+    /// URL 경로 기반 추정(로그인 페이지에 머물러 있지 않으면 로그인된 것으로 간주)
+    pub looks_signed_in: bool,
+    pub account_email: Option<String>,
+    pub last_login_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TypecastNavigationPayload {
+    pub url: String,
+    pub looks_signed_in: bool,
+}
+
+/// 차단된 팝업을 앱이 대신 열었을 때 프론트엔드로 알리는 payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TypecastPopupPayload {
+    pub url: String,
+}
+
+/// 페이지 자동화 단계 보고(대본 주입 · 재생 · 미디어 이벤트).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TypecastStepPayload {
+    pub name: String,
+    pub detail: String,
+}
+
+/// Typecast 창 연동 진단 로그(어떤 경로가 실제로 동작하는지 추적용).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TypecastDebugPayload {
+    pub kind: String,
+    pub detail: String,
+    pub at: String,
+}

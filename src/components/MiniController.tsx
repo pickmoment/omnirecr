@@ -3,6 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { Square, Pause, Play, GripVertical, HardDrive } from 'lucide-react';
 import type { RecordingStatus, AudioVUMeterPayload } from '../types';
+import { formatFileSize, formatTimer } from '../utils/format';
 
 export const MiniController: React.FC = () => {
   const [status, setStatus] = useState<RecordingStatus>({
@@ -42,30 +43,11 @@ export const MiniController: React.FC = () => {
     };
   }, []);
 
-  const formatFileSize = (bytes: number) => {
-    if (bytes <= 0) return '0 B';
-    const k = 1024;
-    const sizes = ['B', 'KB', 'MB', 'GB'];
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
-    return `${(bytes / Math.pow(k, i)).toFixed(i > 1 ? 1 : 0)} ${sizes[i]}`;
-  };
-
   const getLiveSize = () => {
     if (status.status !== 'recording' && status.status !== 'paused') return 0;
     const estimatedBitrateBps = 3500000 / 8;
     const estimatedBytes = Math.floor(estimatedBitrateBps * status.duration_secs);
     return Math.max(status.size_bytes, estimatedBytes);
-  };
-
-  const formatTimer = (seconds: number) => {
-    const s = Math.floor(seconds);
-    const hrs = Math.floor(s / 3600);
-    const mins = Math.floor((s % 3600) / 60);
-    const secs = s % 60;
-    if (hrs > 0) {
-      return `${String(hrs).padStart(2, '0')}:${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
-    }
-    return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
   };
 
   const isPaused = status.status === 'paused';

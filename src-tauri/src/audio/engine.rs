@@ -86,6 +86,7 @@ impl AudioCaptureEngine {
         let mac_system_capture = if system_enabled {
             Some(crate::audio::macos::MacSystemAudioCapture::start(
                 sys_tx.clone(),
+                settings.system_audio_include_own_app,
             )?)
         } else {
             None
