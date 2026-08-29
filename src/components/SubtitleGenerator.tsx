@@ -45,6 +45,7 @@ interface SubtitleGeneratorProps {
   settings: Settings;
   initialAudioPath?: string | null;
   onOpenExplorer: (path: string) => Promise<void>;
+  onSettingsChange: (partial: Partial<Settings>) => void;
 }
 
 const SAMPLE_SCRIPT = `안녕하세요! OmniRec 스튜디오에 오신 것을 환영합니다.
@@ -57,20 +58,22 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
   settings,
   initialAudioPath,
   onOpenExplorer,
+  onSettingsChange,
 }) => {
-  // Input State
-  const [generationWorkflow, setGenerationWorkflow] = useState<'with-script' | 'ai-only'>('with-script');
+  // Input State (initialized from persisted settings so choices survive tab switches / app restarts)
+  const [generationWorkflow, setGenerationWorkflow] = useState<'with-script' | 'ai-only'>(settings.subtitle_generation_workflow);
   const [scriptText, setScriptText] = useState<string>('');
   const [audioPath, setAudioPath] = useState<string>(initialAudioPath || '');
-  const [syncEngine, setSyncEngine] = useState<'ai-whisper' | 'vad'>('ai-whisper');
-  const [whisperModel, setWhisperModel] = useState<'Xenova/whisper-tiny' | 'Xenova/whisper-base' | 'Xenova/whisper-small'>('Xenova/whisper-base');
-  const [whisperLanguage, setWhisperLanguage] = useState<string>('korean');
-  const [splitMode, setSplitMode] = useState<SubtitleSplitMode>('auto');
-  const [maxChars, setMaxChars] = useState<number>(28);
-  const [silenceThresholdDb, setSilenceThresholdDb] = useState<number>(-35.0);
-  const [minSilenceDuration, setMinSilenceDuration] = useState<number>(0.25);
-  const [startOffsetSecs, setStartOffsetSecs] = useState<number>(0.1);
-  const [autoSave, setAutoSave] = useState<boolean>(true);
+  const [syncEngine, setSyncEngine] = useState<'ai-whisper' | 'vad'>(settings.subtitle_sync_engine);
+  const [whisperModel, setWhisperModel] = useState<'Xenova/whisper-tiny' | 'Xenova/whisper-base' | 'Xenova/whisper-small'>(settings.subtitle_whisper_model);
+  const [whisperLanguage, setWhisperLanguage] = useState<string>(settings.subtitle_whisper_language);
+  const [splitMode, setSplitMode] = useState<SubtitleSplitMode>(settings.subtitle_split_mode);
+  const [splitOnComma, setSplitOnComma] = useState<boolean>(settings.subtitle_split_on_comma);
+  const [maxChars, setMaxChars] = useState<number>(settings.subtitle_max_chars);
+  const [silenceThresholdDb, setSilenceThresholdDb] = useState<number>(settings.subtitle_silence_threshold_db);
+  const [minSilenceDuration, setMinSilenceDuration] = useState<number>(settings.subtitle_min_silence_duration);
+  const [startOffsetSecs, setStartOffsetSecs] = useState<number>(settings.subtitle_start_offset_secs);
+  const [autoSave, setAutoSave] = useState<boolean>(settings.subtitle_auto_save);
 
   // AI Progress State
   const [aiStatusMsg, setAiStatusMsg] = useState<string | null>(null);
@@ -92,13 +95,54 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
   const [duration, setDuration] = useState<number>(0);
   const [isMuted, setIsMuted] = useState<boolean>(false);
   const [highlightedIndex, setHighlightedIndex] = useState<number | null>(null);
-  const [autoScroll, setAutoScroll] = useState<boolean>(true);
-  const [rippleEdit, setRippleEdit] = useState<boolean>(false);
+  const [autoScroll, setAutoScroll] = useState<boolean>(settings.subtitle_auto_scroll);
+  const [rippleEdit, setRippleEdit] = useState<boolean>(settings.subtitle_ripple_edit);
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const subtitleListRef = useRef<HTMLDivElement | null>(null);
   const activeItemRef = useRef<HTMLDivElement | null>(null);
   const segmentTimerRef = useRef<number | null>(null);
+  const isFirstSettingsSyncRef = useRef(true);
+
+  // Persist subtitle generator option choices back into settings.json (debounced to avoid spamming disk writes on slider drag)
+  useEffect(() => {
+    if (isFirstSettingsSyncRef.current) {
+      isFirstSettingsSyncRef.current = false;
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      onSettingsChange({
+        subtitle_generation_workflow: generationWorkflow,
+        subtitle_sync_engine: syncEngine,
+        subtitle_whisper_model: whisperModel,
+        subtitle_whisper_language: whisperLanguage,
+        subtitle_split_mode: splitMode,
+        subtitle_split_on_comma: splitOnComma,
+        subtitle_max_chars: maxChars,
+        subtitle_silence_threshold_db: silenceThresholdDb,
+        subtitle_min_silence_duration: minSilenceDuration,
+        subtitle_start_offset_secs: startOffsetSecs,
+        subtitle_auto_save: autoSave,
+        subtitle_auto_scroll: autoScroll,
+        subtitle_ripple_edit: rippleEdit,
+      });
+    }, 500);
+    return () => window.clearTimeout(timer);
+  }, [
+    generationWorkflow,
+    syncEngine,
+    whisperModel,
+    whisperLanguage,
+    splitMode,
+    splitOnComma,
+    maxChars,
+    silenceThresholdDb,
+    minSilenceDuration,
+    startOffsetSecs,
+    autoSave,
+    autoScroll,
+    rippleEdit,
+  ]);
 
   // Global Spacebar shortcut for Play / Pause
   useEffect(() => {
@@ -267,7 +311,7 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
           }
         } else {
           // --- SCRIPT + AI FORCED ALIGNMENT ---
-          const lines = splitScriptIntoLines(scriptText, splitMode, maxChars);
+          const lines = splitScriptIntoLines(scriptText, splitMode, maxChars, splitOnComma);
           if (lines.length === 0) {
             throw new Error('대본에서 유효한 텍스트 문장을 찾을 수 없습니다.');
           }
@@ -316,6 +360,7 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
           audio_path: audioPath,
           script_text: scriptText,
           split_mode: splitMode,
+          split_on_comma: splitOnComma,
           max_chars: maxChars,
           min_silence_duration_secs: minSilenceDuration,
           silence_threshold_db: silenceThresholdDb,
@@ -1221,6 +1266,17 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
                     </button>
                   ))}
                 </div>
+                {splitMode === 'sentence' && (
+                  <label className="flex items-center justify-between gap-2 pt-0.5 cursor-pointer">
+                    <span className="text-[11px] text-slate-300">쉼표(,)에서도 분리</span>
+                    <input
+                      type="checkbox"
+                      checked={splitOnComma}
+                      onChange={(e) => setSplitOnComma(e.target.checked)}
+                      className="w-4 h-4 rounded bg-slate-900 border-slate-700 text-orange-500 focus:ring-0 cursor-pointer"
+                    />
+                  </label>
+                )}
               </div>
 
               {/* Max Chars Slider */}

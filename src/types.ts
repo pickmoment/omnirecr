@@ -34,6 +34,19 @@ export interface Settings {
   auto_stop_enabled: boolean;
   auto_stop_seconds: number;
   custom_ffmpeg_path?: string | null;
+  subtitle_generation_workflow: 'with-script' | 'ai-only';
+  subtitle_sync_engine: 'ai-whisper' | 'vad';
+  subtitle_whisper_model: 'Xenova/whisper-tiny' | 'Xenova/whisper-base' | 'Xenova/whisper-small';
+  subtitle_whisper_language: string;
+  subtitle_split_mode: SubtitleSplitMode;
+  subtitle_max_chars: number;
+  subtitle_silence_threshold_db: number;
+  subtitle_min_silence_duration: number;
+  subtitle_start_offset_secs: number;
+  subtitle_auto_save: boolean;
+  subtitle_auto_scroll: boolean;
+  subtitle_ripple_edit: boolean;
+  subtitle_split_on_comma: boolean;
 }
 
 export type TabType = 'screen' | 'audio' | 'subtitle' | 'converter' | 'history' | 'merger' | 'settings';
@@ -142,6 +155,7 @@ export interface SubtitleGenerateTask {
   script_text: string;
   split_mode: SubtitleSplitMode;
   max_chars: number;
+  split_on_comma?: boolean;
   min_silence_duration_secs?: number;
   silence_threshold_db?: number;
   start_offset_secs?: number;

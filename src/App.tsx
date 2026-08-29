@@ -44,6 +44,19 @@ const defaultSettings: Settings = {
   auto_stop_enabled: false,
   auto_stop_seconds: 5.0,
   custom_ffmpeg_path: null,
+  subtitle_generation_workflow: 'with-script',
+  subtitle_sync_engine: 'ai-whisper',
+  subtitle_whisper_model: 'Xenova/whisper-base',
+  subtitle_whisper_language: 'korean',
+  subtitle_split_mode: 'auto',
+  subtitle_max_chars: 28,
+  subtitle_silence_threshold_db: -35.0,
+  subtitle_min_silence_duration: 0.25,
+  subtitle_start_offset_secs: 0.1,
+  subtitle_auto_save: true,
+  subtitle_auto_scroll: true,
+  subtitle_ripple_edit: false,
+  subtitle_split_on_comma: false,
 };
 
 const initialRecordingStatus: RecordingStatus = {
@@ -377,6 +390,7 @@ export const App: React.FC = () => {
             settings={settings}
             initialAudioPath={subtitleInitialAudio}
             onOpenExplorer={handleOpenExplorer}
+            onSettingsChange={handleUpdateSettings}
           />
         )}
 

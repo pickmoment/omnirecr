@@ -149,7 +149,8 @@ export async function runLocalWhisperTranscribe(
 export function splitScriptIntoLines(
   rawText: string,
   mode: SubtitleSplitMode = 'sentence',
-  maxChars: number = 28
+  maxChars: number = 28,
+  splitOnComma: boolean = false
 ): string[] {
   // 1. Remove timestamps like [00:01.00] or SRT format headers
   const lrcRegex = /\[\d{1,2}:\d{2}(?:\.\d+)?\]/g;
@@ -180,10 +181,12 @@ export function splitScriptIntoLines(
       const ch = line[i];
       cur += ch;
 
-      const isEndingPunct = ch === '.' || ch === '?' || ch === '!' || ch === '…' || ch === '。' || ch === '~';
+      const isComma = ch === ',' || ch === '、' || ch === '，';
+      const isEndingPunct = ch === '.' || ch === '?' || ch === '!' || ch === '…' || ch === '。' || ch === '~'
+        || (splitOnComma && mode === 'sentence' && isComma);
       if (isEndingPunct) {
-        // Check if next char is decimal digit (e.g., 3.14)
-        const isDecimal = ch === '.' && i > 0 && /\d/.test(line[i - 1]) && i + 1 < line.length && /\d/.test(line[i + 1]);
+        // Check if next char is a digit, i.e. a decimal point (3.14) or thousands separator (1,000)
+        const isDecimal = (ch === '.' || isComma) && i > 0 && /\d/.test(line[i - 1]) && i + 1 < line.length && /\d/.test(line[i + 1]);
         if (!isDecimal) {
           // Check if followed by closing quote or parenthesis
           let nextIdx = i + 1;

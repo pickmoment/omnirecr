@@ -70,6 +70,7 @@ impl SubtitleController {
             &task.script_text,
             &task.split_mode,
             task.max_chars.max(5),
+            task.split_on_comma,
         );
 
         if parsed_lines.is_empty() {
@@ -150,7 +151,7 @@ impl SubtitleController {
     }
 
     /// Split raw script into chunks according to splitting mode and max character limit
-    fn split_and_clean_script(raw: &str, mode: &str, max_chars: usize) -> Vec<ParsedLine> {
+    fn split_and_clean_script(raw: &str, mode: &str, max_chars: usize, split_on_comma: bool) -> Vec<ParsedLine> {
         let lrc_regex = Regex::new(r"\[(\d{1,2}):(\d{2})(?:\.(\d+))?\]").unwrap();
         let srt_time_regex = Regex::new(r"(\d{2}:\d{2}:\d{2}[,\.]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[,\.]\d{3})").unwrap();
 
@@ -218,7 +219,7 @@ impl SubtitleController {
                     });
                 }
                 "sentence" => {
-                    let sentences = Self::split_into_sentences(line);
+                    let sentences = Self::split_into_sentences(line, split_on_comma);
                     for s in sentences {
                         if !s.is_empty() {
                             parsed_results.push(ParsedLine {
@@ -242,8 +243,8 @@ impl SubtitleController {
                     }
                 }
                 _ => {
-                    // "auto": split sentences first, then length
-                    let sentences = Self::split_into_sentences(line);
+                    // "auto": split sentences first, then length (comma-splitting is a "sentence" mode-only option)
+                    let sentences = Self::split_into_sentences(line, false);
                     for s in sentences {
                         if s.chars().count() > max_chars {
                             let chunks = Self::split_by_char_length(&s, max_chars);
@@ -273,8 +274,8 @@ impl SubtitleController {
         parsed_results
     }
 
-    /// Split string into sentences by punctuation (. ? ! … 。 ~)
-    fn split_into_sentences(text: &str) -> Vec<String> {
+    /// Split string into sentences by punctuation (. ? ! … 。 ~), optionally also on commas (, 、 ，)
+    fn split_into_sentences(text: &str, split_on_comma: bool) -> Vec<String> {
         let mut result = Vec::new();
         let mut current = String::new();
         let chars: Vec<char> = text.chars().collect();
@@ -285,10 +286,12 @@ impl SubtitleController {
             let ch = chars[i];
             current.push(ch);
 
-            let is_punct = ch == '.' || ch == '?' || ch == '!' || ch == '…' || ch == '。' || ch == '~';
+            let is_comma = ch == ',' || ch == '、' || ch == '，';
+            let is_punct = ch == '.' || ch == '?' || ch == '!' || ch == '…' || ch == '。' || ch == '~'
+                || (split_on_comma && is_comma);
             if is_punct {
-                // Check if decimal number like 3.14
-                let is_decimal = ch == '.' && i > 0 && chars[i - 1].is_ascii_digit() && i + 1 < len && chars[i + 1].is_ascii_digit();
+                // Check if decimal number like 3.14, or thousands separator like 1,000
+                let is_decimal = (ch == '.' || is_comma) && i > 0 && chars[i - 1].is_ascii_digit() && i + 1 < len && chars[i + 1].is_ascii_digit();
                 if !is_decimal {
                     // Include any trailing quotes or brackets
                     let mut next_idx = i + 1;
@@ -921,7 +924,7 @@ mod tests {
     #[test]
     fn test_split_and_clean_script() {
         let script = "안녕하세요! 반갑습니다.\nOmniRec 자막 생성기입니다.";
-        let lines = SubtitleController::split_and_clean_script(script, "sentence", 30);
+        let lines = SubtitleController::split_and_clean_script(script, "sentence", 30, false);
         assert_eq!(lines.len(), 3);
         assert_eq!(lines[0].text, "안녕하세요!");
         assert_eq!(lines[1].text, "반갑습니다.");

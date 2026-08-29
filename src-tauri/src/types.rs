@@ -40,6 +40,32 @@ pub struct Settings {
     pub auto_stop_enabled: bool,
     pub auto_stop_seconds: f32,       // default 5.0s
     pub custom_ffmpeg_path: Option<String>,
+    #[serde(default = "default_subtitle_generation_workflow")]
+    pub subtitle_generation_workflow: String, // "with-script" | "ai-only"
+    #[serde(default = "default_subtitle_sync_engine")]
+    pub subtitle_sync_engine: String, // "ai-whisper" | "vad"
+    #[serde(default = "default_subtitle_whisper_model")]
+    pub subtitle_whisper_model: String,
+    #[serde(default = "default_subtitle_whisper_language")]
+    pub subtitle_whisper_language: String,
+    #[serde(default = "default_subtitle_split_mode")]
+    pub subtitle_split_mode: String, // "auto" | "sentence" | "line" | "length"
+    #[serde(default = "default_subtitle_max_chars")]
+    pub subtitle_max_chars: u32,
+    #[serde(default = "default_subtitle_silence_threshold_db")]
+    pub subtitle_silence_threshold_db: f32,
+    #[serde(default = "default_subtitle_min_silence_duration")]
+    pub subtitle_min_silence_duration: f32,
+    #[serde(default = "default_subtitle_start_offset_secs")]
+    pub subtitle_start_offset_secs: f32,
+    #[serde(default = "default_subtitle_auto_save")]
+    pub subtitle_auto_save: bool,
+    #[serde(default = "default_subtitle_auto_scroll")]
+    pub subtitle_auto_scroll: bool,
+    #[serde(default)]
+    pub subtitle_ripple_edit: bool,
+    #[serde(default)]
+    pub subtitle_split_on_comma: bool,
 }
 
 fn default_macos_shortcut_start() -> String {
@@ -48,6 +74,50 @@ fn default_macos_shortcut_start() -> String {
 
 fn default_macos_shortcut_stop() -> String {
     "OmniRec 녹화 종료".to_string()
+}
+
+fn default_subtitle_generation_workflow() -> String {
+    "with-script".to_string()
+}
+
+fn default_subtitle_sync_engine() -> String {
+    "ai-whisper".to_string()
+}
+
+fn default_subtitle_whisper_model() -> String {
+    "Xenova/whisper-base".to_string()
+}
+
+fn default_subtitle_whisper_language() -> String {
+    "korean".to_string()
+}
+
+fn default_subtitle_split_mode() -> String {
+    "auto".to_string()
+}
+
+fn default_subtitle_max_chars() -> u32 {
+    28
+}
+
+fn default_subtitle_silence_threshold_db() -> f32 {
+    -35.0
+}
+
+fn default_subtitle_min_silence_duration() -> f32 {
+    0.25
+}
+
+fn default_subtitle_start_offset_secs() -> f32 {
+    0.1
+}
+
+fn default_subtitle_auto_save() -> bool {
+    true
+}
+
+fn default_subtitle_auto_scroll() -> bool {
+    true
 }
 
 impl Default for Settings {
@@ -79,6 +149,19 @@ impl Default for Settings {
             auto_stop_enabled: false,
             auto_stop_seconds: 5.0,
             custom_ffmpeg_path: None,
+            subtitle_generation_workflow: default_subtitle_generation_workflow(),
+            subtitle_sync_engine: default_subtitle_sync_engine(),
+            subtitle_whisper_model: default_subtitle_whisper_model(),
+            subtitle_whisper_language: default_subtitle_whisper_language(),
+            subtitle_split_mode: default_subtitle_split_mode(),
+            subtitle_max_chars: default_subtitle_max_chars(),
+            subtitle_silence_threshold_db: default_subtitle_silence_threshold_db(),
+            subtitle_min_silence_duration: default_subtitle_min_silence_duration(),
+            subtitle_start_offset_secs: default_subtitle_start_offset_secs(),
+            subtitle_auto_save: default_subtitle_auto_save(),
+            subtitle_auto_scroll: default_subtitle_auto_scroll(),
+            subtitle_ripple_edit: false,
+            subtitle_split_on_comma: false,
         }
     }
 }
@@ -211,6 +294,8 @@ pub struct SubtitleGenerateTask {
     pub script_text: String,
     pub split_mode: String, // "auto" | "line" | "sentence" | "length"
     pub max_chars: usize,
+    #[serde(default)]
+    pub split_on_comma: bool,
     pub min_silence_duration_secs: Option<f64>,
     pub silence_threshold_db: Option<f64>,
     pub start_offset_secs: Option<f64>,
