@@ -32,7 +32,7 @@ use chromiumoxide::cdp::browser_protocol::page::EventFrameNavigated;
 use chromiumoxide::cdp::browser_protocol::storage::ClearDataForOriginParams;
 use chromiumoxide::cdp::browser_protocol::target::EventTargetCreated;
 use chromiumoxide::cdp::js_protocol::runtime::{AddBindingParams, EventBindingCalled};
-use chromiumoxide::Page;
+use chromiumoxide::{Handler, Page};
 
 use crate::settings::SettingsManager;
 use crate::types::{
@@ -221,6 +221,54 @@ impl TypecastController {
         }
     }
 
+    /// Chrome 프로필 디렉터리는 한 번에 하나의 Chrome 프로세스만 열 수 있다 —
+    /// 두 번째로 열려는 순간 `SingletonLock` 충돌로 `Browser::launch` 가 실패한다.
+    /// 이 상황이 그냥 에러로 끝나면 사용자는 "Failed to create .../SingletonLock:
+    /// File exists" 같은 원시 Chrome 에러를 그대로 보게 된다(실측 확인). 원인은 둘 중 하나다:
+    ///
+    /// 1. 이전에 뜬 Chrome 이 앱이 재시작/충돌하는 사이에도 **여전히 살아있다** — 이 경우
+    ///    새로 띄우는 대신 그 Chrome 의 DevTools 엔드포인트(`DevToolsActivePort` 파일)에
+    ///    접속해 그대로 이어 쓴다.
+    /// 2. Chrome 이 비정상 종료(강제 종료 등)해 락 파일만 남았다 — 이 경우 락 파일을
+    ///    지우고 한 번 더 실행을 시도한다.
+    async fn launch_with_recovery(
+        config: BrowserConfig,
+        profile_dir: &std::path::Path,
+    ) -> Result<(Browser, Handler), String> {
+        match Browser::launch(config.clone()).await {
+            Ok(pair) => return Ok(pair),
+            Err(launch_err) => {
+                let message = launch_err.to_string();
+                if !message.contains("SingletonLock") {
+                    return Err(message);
+                }
+
+                // (1) 이미 떠 있는 Chrome 에 접속을 시도한다.
+                if let Some(port) = Self::read_devtools_port(profile_dir) {
+                    if let Ok(pair) = Browser::connect(format!("http://127.0.0.1:{}", port)).await
+                    {
+                        return Ok(pair);
+                    }
+                }
+
+                // (2) 접속도 안 되면 죽은 프로세스가 남긴 락으로 보고 정리한 뒤 재시도한다.
+                Self::clear_singleton_lock_files(profile_dir);
+                Browser::launch(config).await.map_err(|e| e.to_string())
+            }
+        }
+    }
+
+    fn read_devtools_port(profile_dir: &std::path::Path) -> Option<u16> {
+        let content = std::fs::read_to_string(profile_dir.join("DevToolsActivePort")).ok()?;
+        content.lines().next()?.trim().parse::<u16>().ok()
+    }
+
+    fn clear_singleton_lock_files(profile_dir: &std::path::Path) {
+        for name in ["SingletonLock", "SingletonCookie", "SingletonSocket"] {
+            let _ = std::fs::remove_file(profile_dir.join(name));
+        }
+    }
+
     /// Typecast 를 연다. 이미 열려 있으면 탭 활성화 + 앱 활성화만 한다.
     ///
     /// 창은 앱 전용 Chrome 프로필(`SettingsManager::typecast_chrome_profile_dir`)로
@@ -246,7 +294,7 @@ impl TypecastController {
 
         let config = BrowserConfig::builder()
             .chrome_executable(chrome_path)
-            .user_data_dir(profile_dir)
+            .user_data_dir(profile_dir.clone())
             .with_head()
             .window_size(1180, 840)
             // 합성 클릭으로도 재생되도록 자동재생 사용자 제스처 요구를 끈다.
@@ -255,7 +303,7 @@ impl TypecastController {
             .build()
             .map_err(|e| format!("Chrome 실행 설정을 만들 수 없습니다: {}", e))?;
 
-        let (mut browser, mut handler) = Browser::launch(config)
+        let (mut browser, mut handler) = Self::launch_with_recovery(config, &profile_dir)
             .await
             .map_err(|e| format!("Chrome 을 실행할 수 없습니다: {}", e))?;
 
@@ -1696,5 +1744,88 @@ mod tests {
         let _ = browser.close().await;
         let _ = browser.wait().await;
         handler_task.abort();
+    }
+
+    /// `Browser::launch` 를 같은 프로필로 두 번 하면 실측대로 `SingletonLock` 충돌이
+    /// 난다. `launch_with_recovery` 가 이미 떠 있는 그 Chrome 에 재접속해 복구하는지
+    /// 확인한다(사용자가 실제로 겪은 "Failed to create .../SingletonLock: File exists"
+    /// 에러 재현 + 복구).
+    #[tokio::test]
+    #[ignore]
+    async fn recovers_from_live_singleton_lock() {
+        use crate::settings::SettingsManager;
+        use chromiumoxide::browser::{Browser, BrowserConfig};
+        use futures::StreamExt;
+
+        let chrome_path =
+            SettingsManager::find_chrome(None).expect("Chrome executable should be discoverable");
+        let profile_dir = std::env::temp_dir().join(format!(
+            "omnirec-lock-recovery-test-{}",
+            std::process::id()
+        ));
+
+        let build_config = || {
+            BrowserConfig::builder()
+                .chrome_executable(&chrome_path)
+                .user_data_dir(&profile_dir)
+                .with_head()
+                .window_size(800, 600)
+                .build()
+                .expect("browser config should build")
+        };
+
+        // 1. "이미 떠 있는" Chrome 을 흉내 낸다 — 그냥 직접 띄우고 닫지 않는다.
+        let (first_browser, mut first_handler) = Browser::launch(build_config())
+            .await
+            .expect("first Chrome should launch");
+        let first_handler_task = tokio::spawn(async move {
+            while let Some(event) = first_handler.next().await {
+                if event.is_err() {
+                    break;
+                }
+            }
+        });
+
+        // 2. 같은 프로필로 다시 열려고 하면 SingletonLock 충돌이 난다 — 복구 로직이
+        //    새로 띄우는 대신 위 인스턴스에 재접속해야 한다.
+        let (mut second_browser, mut second_handler) =
+            TypecastController::launch_with_recovery(build_config(), &profile_dir)
+                .await
+                .expect("launch_with_recovery should recover by reconnecting");
+
+        let second_handler_task = tokio::spawn(async move {
+            while let Some(event) = second_handler.next().await {
+                if event.is_err() {
+                    break;
+                }
+            }
+        });
+
+        // 재접속이 실제로 됐는지 새 페이지를 만들어 확인한다.
+        let page = second_browser
+            .new_page("about:blank")
+            .await
+            .expect("reconnected browser should be usable");
+        let value: i32 = page
+            .evaluate("1 + 1")
+            .await
+            .expect("evaluate should succeed")
+            .into_value()
+            .expect("should be a number");
+        assert_eq!(value, 2);
+        println!("재접속 후 evaluate 결과: {}", value);
+
+        // second_browser (재접속) 를 통해 닫으면 실제 Chrome 프로세스 자체가 종료된다.
+        // handler_task 는 close() 가 CDP 응답을 받아야 하므로 반드시 close()/wait() 다음에 abort 한다.
+        let _ = second_browser.close().await;
+        let _ = second_browser.wait().await;
+        second_handler_task.abort();
+
+        // first_browser 가 실제로 띄웠던 프로세스는 위에서 이미 종료됐다. 여기서 또
+        // close()/wait() 를 부르면 이미 죽은 프로세스의 응답을 영원히 기다리게 된다 —
+        // drop 만으로 충분하다(Browser::drop 이 이미 종료됐음을 감지해 조용히 넘어간다).
+        first_handler_task.abort();
+        drop(first_browser);
+        let _ = std::fs::remove_dir_all(&profile_dir);
     }
 }

@@ -237,6 +237,23 @@ chromiumoxide 0.9.1 은 `Page.navigate` 요청에 `FrameNavigationRequest::new()
 `close_typecast_browser` 커맨드가 멈춘다 — 실제로 스모크 테스트에서 이 순서로 짰다가
 재현했다. 항상 `close()` → `wait()` → (그 다음에) 태스크 정리 순서를 지킬 것.
 
+**같은 프로필로 두 번 실행하면 `SingletonLock` 충돌이 난다.** Chrome 프로필 디렉터리는
+한 번에 프로세스 하나만 열 수 있다. 앱이 재시작/충돌하는 사이에도 이전 Chrome 이 살아있거나,
+비정상 종료로 락 파일만 남으면 `Browser::launch` 가 `Failed to create .../SingletonLock:
+File exists` 로 실패한다(실측 확인 — 사용자가 그대로 겪음). `TypecastController::launch_with_recovery()`
+가 이 경우를 처리한다: (1) `DevToolsActivePort` 파일에서 포트를 읽어 이미 떠 있는 Chrome 에
+먼저 재접속을 시도하고, (2) 그것도 안 되면 죽은 프로세스가 남긴 락으로 보고
+`SingletonLock`/`SingletonCookie`/`SingletonSocket` 을 지운 뒤 한 번 더 실행한다. `open()` 에서
+`Browser::launch` 를 직접 부르지 말고 반드시 이 헬퍼를 거칠 것. 스모크 테스트:
+`tts::tests::recovers_from_live_singleton_lock`(`#[ignore]`).
+
+**`commands.rs` 의 모든 `typecast_*` 커맨드는 `with_typecast_timeout()` 으로 감싸져 있다.**
+chromiumoxide 의 CDP 요청/응답이 (드물지만) 영원히 안 돌아오는 경우가 있다 — 이러면 그
+커맨드를 부른 `await` 가 무한정 멈추고, `TtsBatchRunner` 의 for-loop 전체가 그 자리에서
+멈춰 그 대본의 `onStopRecord()` 조차 실행되지 못한다(실제 증상: 대본 3개 중 마지막에서
+멈추고 녹음 종료 처리도 안 됨). 새 `typecast_*` 커맨드를 추가할 때도 반드시 이 타임아웃으로
+감쌀 것 — 프론트엔드의 기존 실패 처리(건너뛰기/중단 선택)가 그 위에서 동작한다.
+
 **실제 Chrome + CDP 스모크 테스트**: `tts::tests::real_chrome_cdp_round_trip` (`#[ignore]`, 일반
 `cargo test` 에는 안 돎). 이 머신에 설치된 실제 Chrome 을 띄우고, 프로덕션과 똑같은 순서로
 바인딩·초기화 스크립트를 등록한 뒤 `studio.typecast.ai/sign-in` 으로 이동해 실제
