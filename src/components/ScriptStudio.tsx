@@ -97,7 +97,7 @@ export const ScriptStudio: React.FC<ScriptStudioProps> = ({
       <TabBar items={tabs} current={view} onSelect={setView} className="self-start mb-4 shrink-0" />
 
       <div className="flex-1 min-h-0 overflow-y-auto">
-        {view === 'batch' && (
+        <div className={view === 'batch' ? '' : 'hidden'}>
           <TtsBatchRunner
             settings={settings}
             scripts={scripts}
@@ -113,9 +113,9 @@ export const ScriptStudio: React.FC<ScriptStudioProps> = ({
             onGoToLibrary={() => setView('library')}
             onOpenSettings={onOpenSettings}
           />
-        )}
+        </div>
 
-        {view === 'library' && (
+        <div className={view === 'library' ? '' : 'hidden'}>
           <ScriptLibrary
             scripts={scripts}
             isLoading={isLoading}
@@ -130,9 +130,9 @@ export const ScriptStudio: React.FC<ScriptStudioProps> = ({
             }}
             onOpenExplorer={onOpenExplorer}
           />
-        )}
+        </div>
 
-        {view === 'manual' && (
+        <div className={view === 'manual' ? '' : 'hidden'}>
           <TtsRecorder
             settings={settings}
             scripts={scripts}
@@ -150,7 +150,7 @@ export const ScriptStudio: React.FC<ScriptStudioProps> = ({
             onOpenDefaultPlayer={onOpenDefaultPlayer}
             onGoToLibrary={() => setView('library')}
           />
-        )}
+        </div>
       </div>
     </div>
   );

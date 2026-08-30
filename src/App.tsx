@@ -399,7 +399,7 @@ export const App: React.FC = () => {
           />
         )}
 
-        {currentTab === 'script' && (
+        <div className={currentTab === 'script' ? 'h-full' : 'hidden'}>
           <ScriptStudio
             settings={settings}
             recordingStatus={recordingStatus}
@@ -413,7 +413,7 @@ export const App: React.FC = () => {
             onOpenDefaultPlayer={handleOpenDefaultPlayer}
             onOpenSettings={() => setCurrentTab('settings')}
           />
-        )}
+        </div>
 
         {currentTab === 'subtitle' && (
           <SubtitleStudio
