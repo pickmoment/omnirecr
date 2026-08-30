@@ -166,7 +166,7 @@
 - `main`: Primary application window.
 - `selection-overlay`: Transparent, fullscreen, frameless window for drag-to-crop region selection.
 - `mini-controller`: Compact, frameless, always-on-top floating toolbar displayed during active screen recordings, and during TTS 낭독 녹음 (`start_audio_record` 의 `show_mini_controller` 옵션).
-- `typecast-browser`: 런타임에 `WebviewWindowBuilder` 로 생성되는 외부 URL(Typecast) 전용 창. `incognito(false)` 로 열려 로그인 쿠키가 앱 데이터에 영구 저장되고, 다음 실행에서 같은 세션으로 재접속된다. 초기화 스크립트로 `window.open` 오버라이드와 `__omnirecFillScript` / `__omnirecToast` 헬퍼를 주입한다.
+- `typecast-browser`: 런타임에 `WebviewWindowBuilder` 로 생성되는 외부 URL(Typecast) 전용 창. `incognito(false)` 로 열려 로그인 쿠키가 앱 데이터에 영구 저장되고, 다음 실행에서 같은 세션으로 재접속된다. 초기화 스크립트로 `window.open` 오버라이드와 `__omnirecFillScript` / `__omnirecToast` 헬퍼를 주입한다. `.background_throttling(BackgroundThrottlingPolicy::Disabled)` 로 macOS 의 WKWebView 백그라운드 스로틀링을 꺼둔다 — 창이 가려지거나 최소화되면 WebKit 이 전력 절약을 위해 그 창의 프로세스를 스로틀링/서스펜드해 재생 중인 오디오까지 멈추는데, 자동 배치 녹음 중에는 이 창이 계속 최전면에 있지 않을 수 있어 꼭 필요하다(tauri 2.3.0+, macOS 14+ 에서만 적용).
 - `typecast-popup`: `typecast_popup_mode == "new-window"` 일 때만 생성되는 소셜 로그인 전용 창. Typecast 도메인으로 되돌아오면 자동으로 닫히고 본 창을 새로고침한다.
 
 #### 소셜 로그인(팝업) 처리 흐름
@@ -210,10 +210,28 @@ prepare  typecast_prepare_script  → step:prepared / step:prepare-failed (10s �
 record   start_audio_record       → 저장 경로 확보 (auto_stop 은 끄고 직접 판정)
 play     focus_typecast_browser → typecast_play → step:playing / step:play-failed (12s)
 speak    audio_vu_meter 구독      → sys_level > 임계값이면 시작, 무음 N초 지속되면 종료
+         (단락/화자 전환으로 오디오가 재생성되는 동안의 무음은 `media-ended` 신호로,
+          Typecast 사이트가 스스로 재생을 멈추는 오동작은 `media-pause` 신호로 들어온다.
+          둘 다 재생 버튼을 다시 누르는 등 추가 개입 없이 `segmentGapMs`(무음 판정의
+          2배, 최소 8초) 만큼 종료 판정만 미룬다 — TtsBatchRunner.tsx)
 save     stop_record → attach_script_recording → 다음 대본 (gap 초 대기)
 ```
 
 Typecast 의 3,000자 제한은 **문단(줄) 하나의 최대 길이**이지 한 번에 넣을 수 있는 전체 길이가 아니다. 대본은 통째로 넣는다. 분할 로직을 다시 넣지 말 것.
+
+**단락 전환 · 사이트 오동작으로 인한 무음을 낭독 종료로 오판하지 않도록 할 것. 동시에 Typecast
+사이트 동작에 대한 개입은 최소로 유지할 것.** 무음 원인은 두 가지다.
+(1) Typecast 는 화자/단락이 바뀔 때 다음 오디오를 새로 생성하느라 잠깐 재생이 끊긴다 — 정상 동작.
+(2) Typecast 사이트가 낭독 도중 재생을 스스로 멈추는 오동작이 있다 — `ended` 없이 `pause` 만 온다.
+둘 다 이 무음이 `tts_auto_stop_seconds` 를 넘기면 `waitForSpeechCycle` 이 낭독이 끝난 것으로 오판해
+대본 중간에서 녹음을 끝내고 다음 대본으로 넘어간다. `hookMedia` 가 `play`/`ended`/`pause` 를 구분해
+보고하고(`step:media-play` / `step:media-ended` / `step:media-pause`), 배치 러너는 둘 다 재생 버튼을
+다시 누르는 등의 추가 조작 없이 `segmentGapMs` 만큼 종료 판정만 미루고 재생이 스스로 돌아오길
+기다린다. **재생 버튼을 자동으로 재클릭해 "이어가기"를 시도하는 방식은 쓰지 않는다** — 이미 재생
+중인데 또 클릭하면 토글 버튼이 꺼져버려 오히려 우리가 재생을 멈추는 원인이 될 수 있다(정지 버튼을
+누르지 않았는데 소리가 멈추는 증상의 실제 원인이었다). 우리가 `doStop` 으로 직접 멈춘 pause 는
+`intentionalStop` 플래그로 걸러 오동작으로 보고하지 않는다. 이 유예 없이 `silenceMs` 자체를 늘리는
+식으로 고치면 진짜 낭독 종료 판정도 그만큼 느려지므로 반드시 구분해서 다룰 것.
 
 **입력 직후 캐럿을 반드시 맨 앞으로 되돌릴 것.** `execCommand('insertText')` 는 캐럿을 본문 끝에 남기는데, Typecast 는 커서 위치부터 낭독하므로 그대로 재생하면 아무 소리도 나지 않거나 마지막 부분만 읽는다. `collapseCaretToStart()` 를 입력 직후와 재생 직전 두 번 호출한다.
 

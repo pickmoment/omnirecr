@@ -51,6 +51,8 @@ export const MiniController: React.FC = () => {
   };
 
   const isPaused = status.status === 'paused';
+  const isAudio = status.mode === 'audio';
+  const actionNoun = isAudio ? '녹음' : '녹화';
 
   const handleTogglePause = async () => {
     try {
@@ -109,7 +111,7 @@ export const MiniController: React.FC = () => {
         {/* Pause / Resume Button */}
         <button
           onClick={handleTogglePause}
-          title={isPaused ? '녹화 재개 (F10)' : '일시정지 (F10)'}
+          title={isPaused ? `${actionNoun} 재개 (F10)` : '일시정지 (F10)'}
           className={`p-2 rounded-xl border text-xs font-bold transition ${
             isPaused
               ? 'bg-emerald-600 border-emerald-500 text-white shadow-md'
@@ -122,11 +124,11 @@ export const MiniController: React.FC = () => {
         {/* Big Stop Button */}
         <button
           onClick={handleStop}
-          title="녹화 종료 및 저장 (F9)"
+          title={`${actionNoun} 종료 및 저장 (F9)`}
           className="flex items-center gap-1.5 px-3 py-2 bg-red-600 hover:bg-red-500 text-white text-xs font-bold rounded-xl shadow-lg shadow-red-600/40 active:scale-95 transition"
         >
           <Square className="w-3.5 h-3.5 fill-current" />
-          <span>녹화 종료</span>
+          <span>{actionNoun} 종료</span>
         </button>
       </div>
     </div>

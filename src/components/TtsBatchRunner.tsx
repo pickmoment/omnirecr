@@ -149,25 +149,38 @@ export const TtsBatchRunner: React.FC<TtsBatchRunnerProps> = ({
   /**
    * 시스템 오디오 레벨을 보고 낭독 시작 / 종료를 판정한다.
    * Typecast 가 어떤 방식으로 재생하든(미디어 엘리먼트 · Web Audio) 동작한다.
+   *
+   * Typecast 사이트를 최대한 건드리지 않는다. 단락(화자) 전환으로 다음 오디오를 새로
+   * 생성하는 동안의 정상적인 무음(`step:media-ended`)과, 사이트가 낭독 도중 스스로
+   * 재생을 멈추는 오동작(`ended` 없는 `step:media-pause`) 둘 다 재생 버튼을 다시 누르는
+   * 등 추가로 개입하지 않고 `segmentGapMs` 만큼 무음 판정만 미뤄 다음 재생을 기다린다.
+   * (재생 버튼을 다시 누르는 방식은 이미 재생 중인데 또 클릭해 토글을 꺼버리는 등
+   * 오히려 사이트 동작을 방해할 수 있어 쓰지 않는다.) 그 유예 안에 재생이 돌아오지
+   * 않으면 낭독이 실제로 끝난 것으로 보고 정상 종료 처리한다.
    */
   const waitForSpeechCycle = (
     thresholdDb: number,
     startTimeoutMs: number,
     silenceMs: number,
     hardCapMs: number,
+    segmentGapMs: number,
   ): Promise<{ ok: boolean; detail: string }> =>
     new Promise((resolve) => {
       let settled = false;
-      let unlisten: UnlistenFn | null = null;
+      let unlistenVu: UnlistenFn | null = null;
+      let unlistenStep: UnlistenFn | null = null;
       let started = false;
       let lastLoudAt = Date.now();
+      // media-ended / media-pause 이후 재생이 이어지길 기다리는 유예 시작 시각. null 이면 유예 없음.
+      let segmentEndedAt: number | null = null;
       const beganAt = Date.now();
 
       const finish = (result: { ok: boolean; detail: string }) => {
         if (settled) return;
         settled = true;
         window.clearInterval(ticker);
-        if (unlisten) unlisten();
+        if (unlistenVu) unlistenVu();
+        if (unlistenStep) unlistenStep();
         resolve(result);
       };
 
@@ -186,10 +199,16 @@ export const TtsBatchRunner: React.FC<TtsBatchRunnerProps> = ({
           }
           return;
         }
+        if (now - beganAt > hardCapMs) {
+          finish({ ok: true, detail: '최대 녹음 시간 도달' });
+          return;
+        }
+        // 단락 전환 · 재생 오동작 회복 유예 기간 중에는 무음이어도 재생이 이어지길 기다린다.
+        if (segmentEndedAt !== null && now - segmentEndedAt < segmentGapMs) {
+          return;
+        }
         if (now - lastLoudAt > silenceMs) {
           finish({ ok: true, detail: `${Math.round((now - beganAt) / 1000)}초 녹음` });
-        } else if (now - beganAt > hardCapMs) {
-          finish({ ok: true, detail: '최대 녹음 시간 도달' });
         }
       }, 200);
 
@@ -200,9 +219,21 @@ export const TtsBatchRunner: React.FC<TtsBatchRunnerProps> = ({
             setPhaseMessage('낭독 녹음 중...');
           }
           lastLoudAt = Date.now();
+          segmentEndedAt = null;
         }
       }).then((fn) => {
-        unlisten = fn;
+        unlistenVu = fn;
+        if (settled) fn();
+      });
+
+      listen<TypecastStepPayload>('typecast_step', (event) => {
+        if (event.payload.name === 'media-ended' || event.payload.name === 'media-pause') {
+          segmentEndedAt = Date.now();
+        } else if (event.payload.name === 'media-play') {
+          segmentEndedAt = null;
+        }
+      }).then((fn) => {
+        unlistenStep = fn;
         if (settled) fn();
       });
     });
@@ -244,6 +275,8 @@ export const TtsBatchRunner: React.FC<TtsBatchRunnerProps> = ({
     const thresholdDb = settings.tts_speech_threshold_db;
     const startTimeoutMs = settings.tts_start_timeout_secs * 1000;
     const silenceMs = Math.max(1, settings.tts_auto_stop_seconds) * 1000;
+    // 단락(화자) 전환 시 다음 오디오 생성을 기다리는 유예. 일반 무음 판정보다 넉넉하게 둔다.
+    const segmentGapMs = Math.max(silenceMs * 2, 8000);
     const gapMs = settings.tts_gap_secs * 1000;
 
     // 재생 버튼을 누른다. 버튼이 비활성일 수 있어 페이지 쪽에서 활성화를 기다리므로
@@ -322,7 +355,7 @@ export const TtsBatchRunner: React.FC<TtsBatchRunnerProps> = ({
       if (played.ok) {
         setItem(script.id, { status: 'speaking', message: '낭독 녹음 중' });
         const hardCapMs = Math.max(60000, script.estimated_secs * 3000 + 60000);
-        result = await waitForSpeechCycle(thresholdDb, startTimeoutMs, silenceMs, hardCapMs);
+        result = await waitForSpeechCycle(thresholdDb, startTimeoutMs, silenceMs, hardCapMs, segmentGapMs);
       }
 
       // 5. 저장 & 대본에 연결

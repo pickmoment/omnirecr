@@ -1,4 +1,5 @@
 use tauri::webview::{NewWindowResponse, WebviewWindowBuilder};
+use tauri::utils::config::BackgroundThrottlingPolicy;
 use tauri::{AppHandle, Emitter, Manager, Url, WebviewUrl, WindowEvent};
 
 use crate::settings::SettingsManager;
@@ -87,6 +88,10 @@ impl TypecastController {
         .resizable(true)
         .center()
         .focused(true)
+        // macOS 는 창이 가려지거나 최소화되면 WKWebView 를 전력 절약 모드로 스로틀링해
+        // 재생 중인 오디오까지 멈출 수 있다(정지 버튼과 무관한 멈춤의 실제 원인 중 하나).
+        // 배치 자동화 중에는 창이 계속 최전면에 있지 않을 수 있으므로 꺼둔다.
+        .background_throttling(BackgroundThrottlingPolicy::Disabled)
         // incognito(false): 쿠키/로컬스토리지를 영구 보관해 로그인 상태를 유지한다.
         .incognito(false)
         // 편집기가 iframe 안에 있을 수 있으므로 모든 프레임에 주입한다.
@@ -818,6 +823,9 @@ const MAIN_INIT_SCRIPT: &str = concat!(
   // 마지막으로 어떤 경로로 재생 버튼을 찾았는지(진단 로그용)
   var playSource = '';
 
+  // 정지 요청(doStop)으로 인한 pause 는 오동작 신호로 취급하지 않는다.
+  var intentionalStop = false;
+
   function buttonLabel(el) {
     var cls = el.className;
     if (cls && cls.baseVal !== undefined) cls = cls.baseVal;
@@ -1197,6 +1205,7 @@ const MAIN_INIT_SCRIPT: &str = concat!(
   }
 
   function doPlay() {
+    intentionalStop = false;
     var button = findPlayButton();
     if (!button) return false;
     var source = playSource;
@@ -1243,6 +1252,7 @@ const MAIN_INIT_SCRIPT: &str = concat!(
   }
 
   function doStop() {
+    intentionalStop = true;
     var button = findButton(STOP_HINTS, null);
     if (button) clickLikeUser(button);
     deepQueryAll('audio, video').forEach(function (el) {
@@ -1371,6 +1381,12 @@ const MAIN_INIT_SCRIPT: &str = concat!(
     el.__omnirecHooked = true;
     el.addEventListener('play', function () { report('step:media-play:'); });
     el.addEventListener('ended', function () { report('step:media-ended:'); });
+    // ended 없이 pause 만 오는 경우: 페이지 쪽 오동작으로 재생이 중간에 멈춘 것.
+    // 우리가 doStop 으로 직접 멈춘 경우(intentionalStop)는 제외한다.
+    el.addEventListener('pause', function () {
+      if (intentionalStop || el.ended) return;
+      report('step:media-pause:' + describe(el));
+    });
   }
   setInterval(function () {
     deepQueryAll('audio, video').forEach(hookMedia);
