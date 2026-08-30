@@ -66,12 +66,15 @@ struct CdpSession {
 
 impl CdpSession {
     async fn shutdown(mut self) {
+        // browser.close() 는 CDP 요청/응답 왕복이라 handler_task(연결을 실제로 읽는 루프)가
+        // 계속 돌고 있어야 응답을 받는다. handler_task 를 먼저 abort 하면 close() 가
+        // 영원히 응답을 못 받아 멈춘다 — 반드시 close() → wait() 다음에 태스크들을 정리한다.
+        let _ = self.browser.close().await;
+        let _ = self.browser.wait().await;
         self.handler_task.abort();
         self.binding_task.abort();
         self.navigation_task.abort();
         self.target_task.abort();
-        let _ = self.browser.close().await;
-        let _ = self.browser.wait().await;
     }
 }
 
@@ -179,6 +182,45 @@ impl TypecastController {
             .ok_or_else(|| "Typecast 브라우저가 열려 있지 않습니다.".to_string())
     }
 
+    /// `page.goto()`(CDP `Page.navigate`)는 chromiumoxide 0.9.1 내부에 **하드코딩된 30초**
+    /// 프레임 라이프사이클 타임아웃이 있다(`BrowserConfig::request_timeout` 과 무관하게
+    /// `FrameNavigationRequest::new` 가 항상 `REQUEST_TIMEOUT` 상수를 그대로 씀 — 빌더로
+    /// 늘릴 수 없다). Typecast 같은 무거운 SPA 는 분석 스크립트 등 3rd-party 리소스가 느리면
+    /// `load` 이벤트가 30초를 넘겨 실측으로 타임아웃이 났다(예: `studio.typecast.ai`).
+    ///
+    /// `Page.navigate` CDP 커맨드 자체를 보내지 않고 `location.replace()` JS 로 이동시킨
+    /// 뒤 `document.readyState` 를 우리가 직접 폴링해, 타임아웃 값도 우리가 정한다.
+    /// 네비게이션이 시작되며 실행 컨텍스트가 파괴돼 `evaluate` 호출 자체가 에러를 낼 수
+    /// 있는데, 정상적인 현상이라 결과는 무시한다.
+    async fn navigate_and_wait(
+        page: &Page,
+        url: &str,
+        timeout: std::time::Duration,
+    ) -> Result<(), String> {
+        let script = format!(
+            "location.replace({});",
+            serde_json::to_string(url).map_err(|e| e.to_string())?
+        );
+        let _ = page.evaluate(script).await;
+
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let ready = page
+                .evaluate("document.readyState !== 'loading'")
+                .await
+                .ok()
+                .and_then(|r| r.into_value::<bool>().ok())
+                .unwrap_or(false);
+            if ready {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err("페이지 로딩이 너무 오래 걸립니다(시간 초과)".to_string());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    }
+
     /// Typecast 를 연다. 이미 열려 있으면 탭 활성화 + 앱 활성화만 한다.
     ///
     /// 창은 앱 전용 Chrome 프로필(`SettingsManager::typecast_chrome_profile_dir`)로
@@ -263,7 +305,7 @@ impl TypecastController {
                 .await
                 .map_err(|e| format!("팝업 감지 구독 실패: {}", e))?;
 
-            page.goto(target.as_str())
+            Self::navigate_and_wait(&page, &target, std::time::Duration::from_secs(45))
                 .await
                 .map_err(|e| format!("Typecast 페이지로 이동할 수 없습니다: {}", e))?;
 
@@ -318,8 +360,8 @@ impl TypecastController {
         let (page, binding_task, navigation_task, target_task) = match setup {
             Ok(parts) => parts,
             Err(error) => {
-                handler_task.abort();
                 let _ = browser.close().await;
+                handler_task.abort();
                 return Err(error);
             }
         };
@@ -368,11 +410,11 @@ impl TypecastController {
             guard.as_ref().map(|session| session.main_page.clone())
         };
         match existing {
-            Some(page) => page
-                .goto(target.as_str())
-                .await
-                .map(|_| ())
-                .map_err(|e| format!("페이지 이동 실패: {}", e)),
+            Some(page) => {
+                Self::navigate_and_wait(&page, &target, std::time::Duration::from_secs(45))
+                    .await
+                    .map_err(|e| format!("페이지 이동 실패: {}", e))
+            }
             None => Self::open(app, Some(url)).await,
         }
     }
@@ -420,7 +462,12 @@ impl TypecastController {
                         .await;
                 }
                 if let Ok(signin) = Self::parse_url(&settings.typecast_signin_url) {
-                    let _ = session.main_page.goto(signin.as_str()).await;
+                    let _ = Self::navigate_and_wait(
+                        &session.main_page,
+                        &signin,
+                        std::time::Duration::from_secs(45),
+                    )
+                    .await;
                 }
                 true
             } else {
@@ -1274,7 +1321,7 @@ const MAIN_INIT_SCRIPT: &str = r#"
 
 #[cfg(test)]
 mod tests {
-    use super::TypecastController;
+    use super::{TypecastController, BRIDGE_BINDING_NAME, MAIN_INIT_SCRIPT};
 
     #[test]
     fn sign_in_pages_are_not_treated_as_signed_in() {
@@ -1298,5 +1345,103 @@ mod tests {
         ] {
             assert!(TypecastController::looks_signed_in(url), "{url}");
         }
+    }
+
+    /// 실제 Chrome + CDP 왕복이 이 머신에서 동작하는지 확인하는 수동 스모크 테스트.
+    /// 일반 `cargo test` 에는 포함하지 않는다(실제 Chrome 프로세스를 띄우고 로그인 없이도
+    /// 접근 가능한 studio.typecast.ai 초기 페이지로 이동한다 — CI/헤드리스 환경에서 불안정할
+    /// 수 있다). 수동으로 확인하려면: `cargo test --lib tts::tests::real_chrome_cdp_round_trip -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn real_chrome_cdp_round_trip() {
+        use crate::settings::SettingsManager;
+        use chromiumoxide::browser::{Browser, BrowserConfig};
+        use chromiumoxide::cdp::js_protocol::runtime::{AddBindingParams, EventBindingCalled};
+        use futures::StreamExt;
+
+        let chrome_path =
+            SettingsManager::find_chrome(None).expect("Chrome executable should be discoverable");
+        println!("using chrome executable: {}", chrome_path.display());
+
+        let profile_dir = std::env::temp_dir().join(format!(
+            "omnirec-cdp-smoke-test-{}",
+            std::process::id()
+        ));
+
+        let config = BrowserConfig::builder()
+            .chrome_executable(&chrome_path)
+            .user_data_dir(&profile_dir)
+            .with_head()
+            .window_size(1024, 768)
+            .build()
+            .expect("browser config should build");
+
+        let (mut browser, mut handler) =
+            Browser::launch(config).await.expect("Chrome should launch");
+
+        let handler_task = tokio::spawn(async move {
+            while let Some(event) = handler.next().await {
+                if event.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let page = browser
+            .new_page("about:blank")
+            .await
+            .expect("should create a page");
+
+        // 실제 프로덕션 코드(open())와 똑같은 순서: 바인딩 등록 → 초기화 스크립트 등록 →
+        // 그 다음에야 실제 URL로 이동한다.
+        page.execute(AddBindingParams::new(BRIDGE_BINDING_NAME))
+            .await
+            .expect("binding should register");
+        page.evaluate_on_new_document(MAIN_INIT_SCRIPT)
+            .await
+            .expect("init script should register");
+
+        let mut binding_events = page
+            .event_listener::<EventBindingCalled>()
+            .await
+            .expect("should subscribe to binding events");
+
+        TypecastController::navigate_and_wait(
+            &page,
+            "https://studio.typecast.ai/sign-in",
+            std::time::Duration::from_secs(45),
+        )
+        .await
+        .expect("navigation should complete");
+
+        let url = page.url().await.ok().flatten();
+        println!("landed on: {:?}", url);
+        assert!(url.is_some(), "page should report a URL after navigation");
+
+        // 실제 자동화 진입점(__omnirecProbe)을 호출해 MAIN_INIT_SCRIPT 가 실제로 이 페이지에
+        // 주입·실행됐는지, 그리고 report() → __omnirecBridge 브리지가 실제로 동작하는지 확인한다.
+        page.evaluate("window.__omnirecProbe && window.__omnirecProbe();")
+            .await
+            .expect("evaluate should succeed");
+
+        let received = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            binding_events.next(),
+        )
+        .await
+        .expect("should receive a probe step within 5s")
+        .expect("binding stream should not end");
+        assert_eq!(received.name, BRIDGE_BINDING_NAME);
+        assert!(
+            received.payload.starts_with("step:probe:"),
+            "expected a step:probe: message, got: {}",
+            received.payload
+        );
+        println!("real automation probe payload: {}", received.payload);
+
+        let _ = browser.close().await;
+        let _ = browser.wait().await;
+        handler_task.abort();
+        let _ = std::fs::remove_dir_all(&profile_dir);
     }
 }

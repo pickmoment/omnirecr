@@ -219,6 +219,32 @@ Google Chrome 프로세스**를 Chrome DevTools Protocol(CDP, `chromiumoxide` �
 **자동재생 정책**은 Chrome 실행 인자 `--autoplay-policy=no-user-gesture-required` 로 끈다
 (WKWebView 시절 `mediaTypesRequiringUserActionForPlayback = None` 과 같은 목적).
 
+**`page.goto()`(`Page.navigate`)를 쓰지 말 것 — 하드코딩된 30초 타임아웃이 있다.**
+chromiumoxide 0.9.1 은 `Page.navigate` 요청에 `FrameNavigationRequest::new()` 가 항상
+`REQUEST_TIMEOUT`(30초) 상수를 그대로 박아 쓴다 — `BrowserConfig::request_timeout()` 빌더로
+늘릴 수 없다(그 설정은 다른 일반 커맨드 왕복에만 적용됨). Typecast 처럼 분석 스크립트 등
+3rd-party 리소스가 낀 무거운 SPA 는 `load` 이벤트가 30초를 넘기기 쉬워, 실제로 스모크
+테스트(`tts::tests::real_chrome_cdp_round_trip`, 아래)에서 `studio.typecast.ai/sign-in` 이동이
+매번 정확히 30초에 `CdpError::Timeout` 으로 실패하는 것을 확인했다. `TypecastController::navigate_and_wait()`
+가 우회로다 — `Page.navigate` CDP 커맨드 자체를 보내지 않고 `location.replace()` JS 로 이동시킨
+뒤 `document.readyState` 를 우리가 직접 폴링해 타임아웃도 우리가 정한다(45초). `open()` /
+`navigate()` / `clear_session()` 모두 이 헬퍼를 쓴다 — 새 네비게이션 경로를 추가할 때
+`page.goto()` 를 다시 쓰지 말 것.
+
+**`CdpSession::shutdown()` 의 순서를 바꾸지 말 것.** `browser.close()` 는 CDP 요청/응답
+왕복이라 `handler_task`(연결을 실제로 읽는 폴링 루프)가 계속 돌고 있어야 응답을 받는다.
+`handler_task.abort()` 를 `close()`/`wait()` **보다 먼저** 부르면 응답을 영원히 못 받아
+`close_typecast_browser` 커맨드가 멈춘다 — 실제로 스모크 테스트에서 이 순서로 짰다가
+재현했다. 항상 `close()` → `wait()` → (그 다음에) 태스크 정리 순서를 지킬 것.
+
+**실제 Chrome + CDP 스모크 테스트**: `tts::tests::real_chrome_cdp_round_trip` (`#[ignore]`, 일반
+`cargo test` 에는 안 돎). 이 머신에 설치된 실제 Chrome 을 띄우고, 프로덕션과 똑같은 순서로
+바인딩·초기화 스크립트를 등록한 뒤 `studio.typecast.ai/sign-in` 으로 이동해 실제
+`MAIN_INIT_SCRIPT` 가 주입됐는지, `__omnirecProbe()` → `step:probe:` 브리지 왕복이 되는지
+확인한다. 로그인이 필요한 그 다음 단계(대본 입력·재생)까지는 검증하지 않는다(계정 필요).
+`cargo test --manifest-path src-tauri/Cargo.toml --lib tts::tests::real_chrome_cdp_round_trip -- --ignored --nocapture`
+로 수동 실행. Chrome 자동화 관련 코드를 고칠 때마다 이 테스트로 먼저 확인할 것.
+
 #### 자동 일괄 녹음 파이프라인 (`TtsBatchRunner`)
 
 대본마다 아래 상태 기계를 순서대로 돌린다. 오케스트레이션은 프론트엔드가 맡고, Rust 는 페이지 조작과 녹음만 담당한다.
