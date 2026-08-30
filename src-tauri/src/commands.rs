@@ -440,43 +440,43 @@ pub fn attach_script_recording(id: String, recorded_path: String) -> Result<Scri
 // ─────────────────────────────────────────────────────────────
 
 #[tauri::command]
-pub fn open_typecast_browser(app: AppHandle, url: Option<String>) -> Result<(), String> {
-    TypecastController::open(&app, url)
+pub async fn open_typecast_browser(app: AppHandle, url: Option<String>) -> Result<(), String> {
+    TypecastController::open(&app, url).await
 }
 
 #[tauri::command]
-pub fn close_typecast_browser(app: AppHandle) -> Result<(), String> {
-    TypecastController::close(&app)
+pub async fn close_typecast_browser(app: AppHandle) -> Result<(), String> {
+    TypecastController::close(&app).await
 }
 
 #[tauri::command]
-pub fn focus_typecast_browser(app: AppHandle) -> Result<(), String> {
-    TypecastController::focus(&app)
+pub async fn focus_typecast_browser(app: AppHandle) -> Result<(), String> {
+    TypecastController::focus(&app).await
 }
 
 #[tauri::command]
-pub fn navigate_typecast_browser(app: AppHandle, url: String) -> Result<(), String> {
-    TypecastController::navigate(&app, url)
+pub async fn navigate_typecast_browser(app: AppHandle, url: String) -> Result<(), String> {
+    TypecastController::navigate(&app, url).await
 }
 
 #[tauri::command]
-pub fn typecast_go_back(app: AppHandle) -> Result<(), String> {
-    TypecastController::go_back(&app)
+pub async fn typecast_go_back(app: AppHandle) -> Result<(), String> {
+    TypecastController::go_back(&app).await
 }
 
 #[tauri::command]
-pub fn typecast_reload(app: AppHandle) -> Result<(), String> {
-    TypecastController::reload(&app)
+pub async fn typecast_reload(app: AppHandle) -> Result<(), String> {
+    TypecastController::reload(&app).await
 }
 
 #[tauri::command]
-pub fn clear_typecast_session(app: AppHandle) -> Result<(), String> {
-    TypecastController::clear_session(&app)
+pub async fn clear_typecast_session(app: AppHandle) -> Result<(), String> {
+    TypecastController::clear_session(&app).await
 }
 
 #[tauri::command]
-pub fn get_typecast_browser_state(app: AppHandle) -> TypecastBrowserState {
-    TypecastController::state(&app)
+pub async fn get_typecast_browser_state(app: AppHandle) -> TypecastBrowserState {
+    TypecastController::state(&app).await
 }
 
 /// 로그인 완료를 기록한다. 비밀번호는 저장하지 않고,
@@ -502,30 +502,37 @@ pub fn copy_text_to_clipboard(text: String) -> Result<(), String> {
 
 /// Typecast 페이지 위에 안내 배너를 띄운다(카운트다운 / 녹음 시작 알림).
 #[tauri::command]
-pub fn notify_typecast(app: AppHandle, message: String, tone: Option<String>) -> Result<(), String> {
-    TypecastController::notify(&app, message, tone)
+pub async fn notify_typecast(app: AppHandle, message: String, tone: Option<String>) -> Result<(), String> {
+    TypecastController::notify(&app, message, tone).await
 }
 
 // ── Typecast 페이지 자동화 ──────────────────────────────────
 
 /// 대본을 편집기에 주입한다. 결과는 `typecast_step` 이벤트로 보고된다.
 #[tauri::command]
-pub fn typecast_prepare_script(app: AppHandle, text: String) -> Result<(), String> {
-    TypecastController::prepare_script(&app, text)
+pub async fn typecast_prepare_script(app: AppHandle, text: String) -> Result<(), String> {
+    TypecastController::prepare_script(&app, text).await
 }
 
 #[tauri::command]
-pub fn typecast_play(app: AppHandle) -> Result<(), String> {
-    TypecastController::play(&app)
+pub async fn typecast_play(app: AppHandle) -> Result<(), String> {
+    TypecastController::play(&app).await
 }
 
 #[tauri::command]
-pub fn typecast_stop_playback(app: AppHandle) -> Result<(), String> {
-    TypecastController::stop_playback(&app)
+pub async fn typecast_stop_playback(app: AppHandle) -> Result<(), String> {
+    TypecastController::stop_playback(&app).await
 }
 
 /// 편집기 / 재생 버튼을 어떻게 찾았는지 진단 보고를 요청한다.
 #[tauri::command]
-pub fn typecast_probe(app: AppHandle) -> Result<(), String> {
-    TypecastController::probe(&app)
+pub async fn typecast_probe(app: AppHandle) -> Result<(), String> {
+    TypecastController::probe(&app).await
+}
+
+/// Chrome 실행 파일을 찾을 수 있는지 확인한다(설정 화면 "테스트" 버튼용).
+#[tauri::command]
+pub fn check_chrome_status(custom_chrome_path: Option<String>) -> Result<String, String> {
+    let path = SettingsManager::find_chrome(custom_chrome_path.as_deref())?;
+    Ok(path.to_string_lossy().to_string())
 }

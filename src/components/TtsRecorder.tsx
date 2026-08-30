@@ -207,8 +207,6 @@ export const TtsRecorder: React.FC<TtsRecorderProps> = ({
         exactFileName: true,
         settingsOverride: {
           system_audio_enabled: true,
-          // Typecast 창은 앱 내부 웹뷰이므로 자기 앱 소리를 포함해야 녹음된다.
-          system_audio_include_own_app: true,
           mic_audio_enabled: settings.tts_mic_enabled,
           // 무음 자동 일시정지 · DSP 필터는 환경 설정 값을 그대로 따른다.
           // 낭독이 끝나면 자동 저장되도록 무음 자동 종료를 켠다.

@@ -131,8 +131,8 @@
 | `auto_stop_triggered` | `Option<String>` | Emitted when silence duration exceeds threshold and recorder auto-stops. Payload is the saved output file path. |
 | `typecast_navigation` | `TypecastNavigationPayload` | Typecast 브라우저 창의 URL 이 바뀔 때마다 발행(로그인 여부 추정 포함). |
 | `typecast_browser_closed` | `None` | Typecast 브라우저 창이 닫혔을 때 발행. |
-| `typecast_popup_intercepted` | `TypecastPopupPayload` | 웹뷰에서 차단된 `window.open` 을 앱이 대신 열었을 때 발행. |
-| `typecast_step` | `TypecastStepPayload` | 페이지 자동화 단계 보고(`prepared`, `prepare-failed`, `playing`, `play-failed`, `stopped`, `probe`, `media-play`, `media-ended`). |
+| `typecast_popup_intercepted` | `TypecastPopupPayload` | 새 팝업/탭이 열렸을 때 발행(진단용 — 팝업 자체는 건드리지 않는다, 실제 브라우저의 네이티브 로그인 팝업). |
+| `typecast_step` | `TypecastStepPayload` | 페이지 자동화 단계 보고(`prepared`, `prepare-failed`, `playing`, `play-failed`, `stopped`, `probe`, `media-play`, `media-ended`, `media-pause`). |
 | `typecast_debug` | `TypecastDebugPayload` | 연동 진단 로그(네비게이션 · 네이티브 팝업 · 브리지 메시지). |
 
 ---
@@ -167,38 +167,57 @@
 - `main`: Primary application window.
 - `selection-overlay`: Transparent, fullscreen, frameless window for drag-to-crop region selection.
 - `mini-controller`: Compact, frameless, always-on-top floating toolbar displayed during active screen recordings, and during TTS 낭독 녹음 (`start_audio_record` 의 `show_mini_controller` 옵션).
-- `typecast-browser`: 런타임에 `WebviewWindowBuilder` 로 생성되는 외부 URL(Typecast) 전용 창. `incognito(false)` 로 열려 로그인 쿠키가 앱 데이터에 영구 저장되고, 다음 실행에서 같은 세션으로 재접속된다. 초기화 스크립트로 `window.open` 오버라이드와 `__omnirecFillScript` / `__omnirecToast` 헬퍼를 주입한다. `.background_throttling(BackgroundThrottlingPolicy::Disabled)` 로 macOS 의 WKWebView 백그라운드 스로틀링을 꺼둔다 — 창이 가려지거나 최소화되면 WebKit 이 전력 절약을 위해 그 창의 프로세스를 스로틀링/서스펜드해 재생 중인 오디오까지 멈추는데, 자동 배치 녹음 중에는 이 창이 계속 최전면에 있지 않을 수 있어 꼭 필요하다(tauri 2.3.0+, macOS 14+ 에서만 적용).
-- `typecast-popup`: `typecast_popup_mode == "new-window"` 일 때만 생성되는 소셜 로그인 전용 창. Typecast 도메인으로 되돌아오면 자동으로 닫히고 본 창을 새로고침한다.
 
-#### 소셜 로그인(팝업) 처리 흐름
+Typecast 는 Tauri 창이 아니다 — `typecast-browser`/`typecast-popup` 이라는 이름의 앱 창은 없다.
 
-Typecast 의 구글 · 애플 · 네이버 · 카카오 로그인은 **팝업 + `window.opener.postMessage` 프로토콜**이다.
+### Typecast 자동화 — 실제 Chrome + CDP (`src-tauri/src/tts/mod.rs`)
 
-```
-메인창(studio.typecast.ai)                     팝업(accounts.typecast.ai)
-  window.open("", "authPopup")   ──▶  (빈 창 생성)
-  popup.location.replace(authUrl) ──▶  provider 인증 → /callback/login/<provider>
-                                        window.opener.postMessage(
-                                          {type:"AUTH_TYPE", idToken, state}, "*")
-  window 'message' 리스너  ◀────────────┘
-    origin === "https://accounts.typecast.ai" 검증
-    localStorage 의 AUTH_STATE_* 와 state 대조 → 로그인 완료
-    popup.close()
-```
+Typecast(`studio.typecast.ai`)는 앱 내장 웹뷰가 아니라 **사용자가 실제로 보는 별도의
+Google Chrome 프로세스**를 Chrome DevTools Protocol(CDP, `chromiumoxide` 크레이트)로 띄우고
+제어한다. WKWebView 로 임베드하던 이전 구현에서 이쪽으로 바꾼 이유:
 
-리디렉션으로 대체할 수 없다. 메인 창이 살아 있어야 `localStorage` 의 state 검증과 Promise 해소가 가능하기 때문이다. 그래서 다음 두 단계로 처리한다.
+1. WKWebView 는 창이 가려지거나 최소화되면 배터리 절약을 위해 그 프로세스를 스로틀링/서스펜드해,
+   재생 중인 오디오가 정지 버튼을 누르지 않았는데도 멈추는 사고가 있었다.
+2. WKWebView 는 사용자 제스처와 분리된 `window.open` 을 차단해, Typecast 의 소셜 로그인
+   (팝업 + `window.opener.postMessage`)을 흉내 내려면 프록시 window 객체 + opener 스텁으로
+   된 400줄 넘는 우회 코드가 필요했다.
+3. 실제 Chrome 은 이 둘 다 겪지 않는다. **팝업 로그인은 아무 코드 없이 그대로 동작한다** —
+   진짜 `window.opener` 관계가 유지되므로 Typecast 자신의 `postMessage`/`popup.close()` 코드가
+   손대지 않아도 정상 동작한다.
 
-1. **네이티브 팝업 살리기 (우선)**: WKWebView 는 사용자 제스처와 분리된 `window.open` 을 막는다. 창 생성 직후 `enable_automatic_popups()` 로 `WKPreferences.javaScriptCanOpenWindowsAutomatically = true` 를 설정해 이를 푼다. 이 경로가 동작하면 WebKit 이 만든 진짜 팝업이라 `window.opener` 관계가 그대로 살아 별도 처리가 필요 없다.
-2. **opener 브리지 (예비)**: 그래도 막히면 주입 스크립트가 프록시 window 객체를 돌려준다. Typecast 는 `window.open("", ...)` 처럼 **빈 URL 로 먼저 열고** 나중에 `popup.location.replace(url)` 을 부르므로, 프록시의 `location` 은 반드시 `replace`/`assign`/`href` 를 모두 가로채야 한다. 이후 흐름:
-   - 프록시 → `open:<url>` → 앱이 `typecast-popup` 창을 연다
-   - 팝업 창에는 `window.opener` 스텁을 주입 → 콜백의 `postMessage` 를 `msg:<json>` 으로 가로챈다
-   - 앱이 메인 창에 `__omnirecDeliverMessage` 를 eval → 합성 `MessageEvent` 를 dispatch (origin 보존)
-   - 메인 페이지가 `popup.close()` → `close` → 앱이 팝업 창을 닫음
-   - 팝업 창이 파괴되면 `__omnirecPopupClosed()` 로 알려 `popup.closed` 폴링을 끝낸다
+**세션·프로필**: `SettingsManager::typecast_chrome_profile_dir()` (`~/.omnirec/typecast-chrome-profile`)
+가 로그인 쿠키를 영구 보관하는 앱 전용 Chrome 프로필이다. 사용자의 평소 개인 Chrome 프로필과는
+**절대 공유하지 않는다** — Chrome 136+ 는 기본 프로필에 대한 원격 디버깅 자체를 거부하기도 하고,
+자동화가 사용자의 실제 로그인 세션에 손대는 것도 피해야 한다. Chrome 실행 파일은
+`SettingsManager::find_chrome()` 이 OS별 기본 설치 위치를 자동 탐색하며, 안 잡히면
+설정의 `custom_chrome_path` 로 직접 지정할 수 있다(TtsBatchRunner 고급 설정 패널).
 
-**페이지 → 앱 브리지 채널**: 원격 오리진은 Tauri IPC 가 막혀 있어 두 경로를 함께 쓴다.
-- 주 경로: `document.title = "__omnirec__<kind>:<payload>"` → `on_document_title_changed`
-- 예비 경로: 숨은 iframe 의 `omnirec-popup:<encoded>` 네비게이션 → `on_navigation` 에서 가로채 `false` 반환
+**세션 상태(`TypecastCdpState`)**: `AsyncMutex<Option<CdpSession>>` 하나로 앱 전체에 세션을
+최대 하나만 유지한다(단일 Typecast 탭 모델). `CdpSession` 은 `Browser`, `main_page: Page`,
+그리고 백그라운드로 계속 폴링해야 하는 태스크 3~4개(핸들러 루프 · 브리지 바인딩 이벤트 ·
+네비게이션 이벤트 · 팝업 감지)를 들고 있다. `Page` 는 `Clone`(내부 `Arc`)이라 명령마다
+짧게 락을 잡고 클론해서 쓰고 바로 락을 놓는다 — `Browser` 는 `Clone` 이 아니라서 `close()`/`wait()`
+처럼 소유권이 필요한 조작만 세션을 통째로 `take()` 한 뒤에 한다.
+
+**페이지 → 앱 브리지**: CDP `Runtime.addBinding("__omnirecBridge")` 하나로 단순화됐다. 원격
+오리진이라 Tauri IPC 가 막혀 있던 WKWebView 시절에는 `document.title` 변경 + 커스텀 스킴
+네비게이션이라는 이중 채널과 일련번호 중복 제거가 필요했지만, CDP 바인딩은 페이지 JS 가 직접
+호출하는 진짜 함수라 그런 우회가 필요 없다. 바인딩은 최상위 실행 컨텍스트에서만 보장되므로,
+주입 스크립트의 `report()` 는 최상위 프레임에서만 `window.__omnirecBridge` 를 직접 부르고
+서브프레임은 여전히 `postMessage` 로 top 에 중계한다(이 부분은 그대로 유지했다).
+
+**팝업 감지는 진단용일 뿐, 팝업 자체를 조작하지 않는다.** `Browser::event_listener::<EventTargetCreated>()`
+로 새 탭/창이 뜨는 것만 관찰해 `typecast_debug`/`typecast_popup_intercepted` 를 보고한다.
+`window.open` 오버라이드, opener 스텁, `popup.close()` 가로채기 같은 코드를 다시 넣지 말 것 —
+진짜 브라우저에서는 전부 불필요하고, 오히려 사이트 동작을 방해할 위험만 늘린다.
+
+**포커스는 두 단계다.** `Page::bring_to_front()` 는 Chrome **탭**만 활성화할 뿐, 다른 앱 뒤에
+있는 Chrome **창**을 OS 레벨로 끌어올리지는 못한다. 그래서 `activate_chrome_app()` 이
+`open -a "Google Chrome"` 을 셸아웃해 앱 자체를 최전면으로 올린 뒤 `bring_to_front()` 로 탭을
+맞춘다(macOS 전용, 다른 OS 는 no-op).
+
+**자동재생 정책**은 Chrome 실행 인자 `--autoplay-policy=no-user-gesture-required` 로 끈다
+(WKWebView 시절 `mediaTypesRequiringUserActionForPlayback = None` 과 같은 목적).
 
 #### 자동 일괄 녹음 파이프라인 (`TtsBatchRunner`)
 
@@ -269,25 +288,31 @@ DOM 구조가 평범한 `contenteditable` 이 아니라 아래처럼 생겼다. 
 #### 합성 클릭의 두 가지 함정
 
 1. **click 이벤트를 두 번 보내지 말 것.** 마우스 시퀀스를 dispatch 한 뒤 `el.click()` 까지 부르면 클릭이 두 번 나가 재생 → 정지로 토글된다. `clickLikeUser()` 는 `pointerover … mouseup` 뒤에 `click` 을 **정확히 한 번만** 발생시킨다.
-2. **합성 클릭은 사용자 제스처로 인정되지 않는다.** WebKit 의 자동재생 정책에 걸려 `audio.play()` 가 거부될 수 있으므로, 창을 만들 때 `automation_webview_configuration()` 으로 `mediaTypesRequiringUserActionForPlayback = None` 을 설정한다(설정 객체는 생성 시점에만 반영되므로 `with_webview_configuration` 으로 넘겨야 한다).
+2. **합성 클릭은 사용자 제스처로 인정되지 않는다.** 브라우저의 자동재생 정책에 걸려 `audio.play()`
+   가 거부될 수 있으므로, Chrome 실행 인자 `--autoplay-policy=no-user-gesture-required` 로 이
+   제한을 끈다(`BrowserConfig::builder().arg(...)`, `TypecastController::open`).
 
 붙여넣기 직후에는 재생 버튼이 잠시 비활성일 수 있어 `doPlay()` 가 최대 5초간 활성화를 기다린다. 클릭이 버튼까지 전달됐는지는 임시 capture 리스너로 확인해 `step:playing` 에 `클릭전달`/`클릭미전달` 로 남기므로, 실패 시 "버튼을 못 찾음 / 클릭이 안 닿음 / 닿았는데 반응 없음"을 구분할 수 있다.
 
 **재생 버튼은 아이콘만 있어 라벨 휴리스틱으로 잡히지 않는다.** 하단 플레이어 바의 구조 선택자를 `DEFAULT_PLAY_SELECTORS` 에 정확한 것부터 느슨한 것 순으로 내장해 두고, 그 다음에 라벨 탐색을 시도한다. 어떤 경로로 찾았는지(`playSource`)를 `step:playing` / `step:probe` 에 함께 실어 보내므로, 사이트가 개편되면 진단 로그의 `play=` 항목을 보고 목록 앞쪽에 새 선택자를 추가하면 된다. 사용자 지정 선택자(`typecast_play_selector`)가 있으면 항상 먼저 시도한다.
 
-#### 앱 자신의 소리를 캡처해야 한다 (macOS)
+#### 시스템 오디오만으로 낭독을 캡처한다
 
-`MacSystemAudioCapture` 는 기본적으로 `excludesCurrentProcessAudio = true` 로 동작한다. 화면 녹화 중 앱 자체 소리가 되먹임되는 것을 막기 위한 설정이다. 그런데 **Typecast 창은 OmniRec 안의 웹뷰**라, 이 설정이 켜져 있으면 스피커로는 낭독이 들리는데 녹음 파일은 무음이 된다.
+Typecast 는 이제 별도의 실제 Chrome 프로세스라 `MacSystemAudioCapture` 의
+`excludesCurrentProcessAudio`(자기 앱 소리 제외) 설정과 무관하다 — Chrome 은 OmniRec 과
+다른 프로세스이므로 시스템 오디오 루프백에 항상 포함된다. **TTS 녹음의 `settingsOverride`
+에 `system_audio_include_own_app` 를 넣지 말 것** — WKWebView 시절 자기 앱 소리를 캡처에
+포함시키려고 켰던 값인데, 지금은 아무 효과가 없고 오히려 "왜 이 플래그가 필요한가"라는
+혼란만 남긴다.
 
 TTS 녹음의 `settingsOverride` 는 **꼭 필요한 것만** 덮어쓴다. 무음 자동 일시정지 · 노이즈 게이트 · 80Hz Low-cut 은 환경 설정 값을 그대로 따라야 한다(사용자가 설정한 무음 처리가 결과 파일에 반영되어야 하므로). 예외는 `auto_stop_enabled: false` 하나뿐인데, 녹음을 언제 끝낼지는 일괄 러너가 직접 판정해 다음 대본으로 넘어가는 시점을 관리해야 하기 때문이다. 오디오 엔진은 일시정지 중에도 VU 레벨을 계속 갱신하므로 auto-pause 가 켜져 있어도 소리 기반 종료 판정은 정상 동작한다.
-
-그래서 TTS 녹음 경로는 `settingsOverride` 로 `system_audio_include_own_app: true` 를 넘긴다(`MacSystemAudioCapture::start` 의 두 번째 인자). 이 값은 오버라이드로만 켜지고 `settings.json` 에 저장되지 않으므로 일반 화면 녹화의 동작은 그대로다. 자동 녹음이 무음으로 나오면 이 플래그부터 확인할 것.
 
 일괄 처리 화면의 진행 표시줄에 시스템 오디오 레벨(dB)을 실시간으로 띄워, 소리가 실제로 캡처되고 있는지 바로 보이게 해 두었다.
 
 **낭독 시작/종료 판정을 DOM 이 아니라 시스템 오디오 레벨로 하는 것이 핵심이다.** Typecast 가 미디어 엘리먼트로 재생하든 Web Audio 로 재생하든 동작하고, 사이트 개편에도 영향을 받지 않는다. DOM 에 의존하는 부분은 **편집기 입력**과 **재생 버튼 클릭** 둘뿐이며, 각각 휴리스틱 + 사용자 지정 CSS 선택자(`typecast_editor_selector` / `typecast_play_selector`)로 대응한다. 자동화 코드를 고칠 때 이 경계를 유지할 것.
 
-모든 경로는 `typecast_debug` 이벤트로 기록되어 TTS 탭의 **연동 진단 로그**에 표시된다. 이 흐름을 수정할 때는 **네비게이션/제목 델리게이트 안에서 창을 직접 조작하지 말고** 반드시 `run_on_main_thread` 로 미룰 것.
+모든 경로는 `typecast_debug` 이벤트로 기록되어 TTS 탭의 **연동 진단 로그**에 표시된다.
+
 ---
 
 ## 🧪 Development & Testing Workflow

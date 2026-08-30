@@ -91,6 +91,7 @@ export const TtsBatchRunner: React.FC<TtsBatchRunnerProps> = ({
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
+  const [chromeTestMsg, setChromeTestMsg] = useState<string | null>(null);
 
   const abortRef = useRef(false);
   // 진행 중 정리해야 할 이벤트 구독들
@@ -238,6 +239,18 @@ export const TtsBatchRunner: React.FC<TtsBatchRunnerProps> = ({
       });
     });
 
+  const handleTestChrome = async () => {
+    setChromeTestMsg(null);
+    try {
+      const path = await invoke<string>('check_chrome_status', {
+        customChromePath: settings.custom_chrome_path || null,
+      });
+      setChromeTestMsg(`✅ 감지 성공: ${path}`);
+    } catch (err) {
+      setChromeTestMsg(`❌ 감지 실패: ${err}`);
+    }
+  };
+
   const ensureBrowserReady = async (): Promise<boolean> => {
     try {
       const state = await invoke<{ is_open: boolean }>('get_typecast_browser_state');
@@ -331,9 +344,6 @@ export const TtsBatchRunner: React.FC<TtsBatchRunnerProps> = ({
         exactFileName: true,
         settingsOverride: {
           system_audio_enabled: true,
-          // Typecast 창은 OmniRec 안의 웹뷰라, 이 값을 켜지 않으면
-          // 스피커로는 들려도 녹음 파일에는 아무것도 담기지 않는다.
-          system_audio_include_own_app: true,
           mic_audio_enabled: settings.tts_mic_enabled,
           // 무음 자동 일시정지 · 노이즈 게이트 · 80Hz Low-cut 은 환경 설정 값을 그대로 쓴다.
           // 무음 자동 종료만 끈다. 녹음을 언제 끝낼지는 이 화면이 직접 판정해
@@ -777,6 +787,36 @@ export const TtsBatchRunner: React.FC<TtsBatchRunnerProps> = ({
                 />
                 <span className="text-[11px] font-semibold text-slate-300">마이크도 함께 녹음</span>
               </label>
+            </div>
+            <div>
+              <label className="text-[11px] font-semibold text-slate-400 mb-1 block">
+                사용자 지정 Chrome 경로 (선택)
+              </label>
+              <div className="flex items-center gap-2">
+                <input
+                  value={settings.custom_chrome_path || ''}
+                  onChange={(e) =>
+                    onUpdateSettings({ custom_chrome_path: e.target.value.trim() || null })
+                  }
+                  placeholder="자동 감지 사용 (비워두면 OS별 기본 설치 위치 자동 탐색)"
+                  className="flex-1 px-3 py-2 rounded-xl bg-slate-950 border border-slate-800 text-xs text-slate-200 font-mono placeholder:text-slate-600 focus:outline-none focus:border-indigo-600"
+                />
+                <button
+                  type="button"
+                  onClick={handleTestChrome}
+                  className="px-3 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-bold rounded-xl transition"
+                >
+                  테스트
+                </button>
+              </div>
+              {chromeTestMsg && (
+                <p className="text-[11px] font-mono text-slate-400 mt-1">{chromeTestMsg}</p>
+              )}
+              <p className="text-[10px] text-slate-500 mt-1">
+                Typecast 는 앱 내장 화면이 아니라 실제 Google Chrome 을 별도로 실행해 자동화합니다.
+                로그인 세션은 이 앱 전용 Chrome 프로필에만 저장되며 평소 쓰는 Chrome 프로필과는
+                공유되지 않습니다.
+              </p>
             </div>
 
             <div className="grid grid-cols-1 md:grid-cols-2 gap-3 pt-1">

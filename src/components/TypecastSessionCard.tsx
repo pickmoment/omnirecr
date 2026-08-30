@@ -77,7 +77,7 @@ export const TypecastSessionCard: React.FC<TypecastSessionCardProps> = ({
     });
 
     const unlistenPopup = listen<TypecastPopupPayload>('typecast_popup_intercepted', () => {
-      onNotice?.('차단된 소셜 로그인 팝업을 OmniRec 로그인 창으로 대신 열었습니다.');
+      onNotice?.('소셜 로그인 팝업이 열렸습니다. 팝업 창에서 로그인을 완료하세요.');
     });
 
     return () => {

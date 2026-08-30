@@ -74,6 +74,10 @@ pub struct Settings {
     pub typecast_editor_url: String,
     #[serde(default = "default_typecast_signin_url")]
     pub typecast_signin_url: String,
+    /// Typecast 는 앱 내장 웹뷰가 아니라 실제 Chrome 을 별도 실행해 자동화한다.
+    /// 비우면 OS별 기본 설치 위치를 자동 탐색한다.
+    #[serde(default)]
+    pub custom_chrome_path: Option<String>,
     /// Typecast 계정 이메일(표시/식별 용도). 비밀번호는 절대 저장하지 않으며,
     /// 실제 인증은 브라우저 창의 영구 쿠키 세션으로 유지된다.
     #[serde(default)]
@@ -237,6 +241,7 @@ impl Default for Settings {
             subtitle_split_on_comma: false,
             typecast_editor_url: default_typecast_editor_url(),
             typecast_signin_url: default_typecast_signin_url(),
+            custom_chrome_path: None,
             typecast_account_email: None,
             typecast_session_saved: false,
             typecast_last_login_at: None,

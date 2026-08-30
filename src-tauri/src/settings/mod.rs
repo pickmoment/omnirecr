@@ -150,4 +150,92 @@ impl SettingsManager {
 
         Err("FFprobe executable not found.".to_string())
     }
+
+    /// Typecast 자동화용 Chrome 실행 파일을 찾는다.
+    /// 사용자 지정 경로가 있으면 우선하고, 없으면 OS별 기본 설치 위치를 순서대로 확인한다.
+    /// 시스템 PATH 는 뒤진다 — 사용자의 기본(개인 로그인 세션이 든) Chrome 프로필과
+    /// 혼동되지 않도록 실행 파일 자체를 특정하는 쪽을 우선한다.
+    pub fn find_chrome(custom_path: Option<&str>) -> Result<PathBuf, String> {
+        if let Some(path_str) = custom_path {
+            let trimmed = path_str.trim();
+            if !trimmed.is_empty() {
+                let path = PathBuf::from(trimmed);
+                if path.is_file() {
+                    return Ok(path);
+                }
+                return Err(format!(
+                    "지정한 Chrome 경로를 찾을 수 없습니다: {}",
+                    trimmed
+                ));
+            }
+        }
+
+        #[cfg(target_os = "macos")]
+        let candidates: Vec<PathBuf> = {
+            let mut list = vec![PathBuf::from(
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            )];
+            if let Some(home) = dirs::home_dir() {
+                list.push(
+                    home.join("Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+                );
+            }
+            list
+        };
+
+        #[cfg(target_os = "windows")]
+        let candidates: Vec<PathBuf> = {
+            let mut list = vec![];
+            for env_var in ["ProgramFiles", "ProgramFiles(x86)", "LocalAppData"] {
+                if let Ok(base) = std::env::var(env_var) {
+                    list.push(
+                        PathBuf::from(base)
+                            .join("Google")
+                            .join("Chrome")
+                            .join("Application")
+                            .join("chrome.exe"),
+                    );
+                }
+            }
+            list
+        };
+
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let candidates: Vec<PathBuf> = vec![
+            PathBuf::from("/usr/bin/google-chrome-stable"),
+            PathBuf::from("/usr/bin/google-chrome"),
+            PathBuf::from("/usr/bin/chromium-browser"),
+            PathBuf::from("/usr/bin/chromium"),
+            PathBuf::from("/snap/bin/chromium"),
+        ];
+
+        for candidate in &candidates {
+            if candidate.is_file() {
+                return Ok(candidate.clone());
+            }
+        }
+
+        // 시스템 PATH 에 등록된 실행 파일 이름들을 마지막으로 시도한다.
+        for name in ["google-chrome-stable", "google-chrome", "chromium-browser", "chromium"] {
+            if let Ok(output) = Command::new(name).arg("--version").output() {
+                if output.status.success() {
+                    return Ok(PathBuf::from(name));
+                }
+            }
+        }
+
+        Err(
+            "Google Chrome 을 찾을 수 없습니다. Chrome 을 설치하거나 설정에서 실행 파일 경로를 지정하세요."
+                .to_string(),
+        )
+    }
+
+    /// Typecast 자동화 전용 Chrome 프로필 디렉터리.
+    /// 사용자의 개인 Chrome 프로필과 절대 공유하지 않는다 — 로그인 세션이 이 안에서만 유지된다.
+    pub fn typecast_chrome_profile_dir() -> PathBuf {
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let dir = home.join(".omnirec").join("typecast-chrome-profile");
+        let _ = fs::create_dir_all(&dir);
+        dir
+    }
 }

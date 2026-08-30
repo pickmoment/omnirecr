@@ -59,6 +59,7 @@ const defaultSettings: Settings = {
   subtitle_split_on_comma: false,
   typecast_editor_url: 'https://studio.typecast.ai/text-to-speech',
   typecast_signin_url: 'https://studio.typecast.ai/sign-in',
+  custom_chrome_path: null,
   typecast_account_email: null,
   typecast_session_saved: false,
   typecast_last_login_at: null,

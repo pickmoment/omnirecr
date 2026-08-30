@@ -17,6 +17,7 @@ use converter::AudioConverterController;
 use merger::MergerController;
 use recorder::RecorderController;
 use tauri::Manager;
+use tts::TypecastCdpState;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -39,6 +40,7 @@ pub fn run() {
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_shell::init())
         .manage(app_state)
+        .manage(TypecastCdpState::new())
         .setup(move |app| {
             recorder.set_app_handle(app.handle().clone());
             if let Some(window) = app.get_webview_window("selection-overlay") {
@@ -59,6 +61,7 @@ pub fn run() {
             commands::get_settings,
             commands::save_settings,
             commands::check_ffmpeg_status,
+            commands::check_chrome_status,
             commands::run_macos_shortcut,
             commands::start_screen_record,
             commands::start_audio_record,

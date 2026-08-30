@@ -52,10 +52,10 @@
   - `.txt` / `.md` / `.srt` 파일 가져오기 및 텍스트 파일로 내보내기
   - 글자 수 · 줄 수 · **한국어 낭독 속도 기반 예상 낭독 시간** 자동 계산
   - 대본별 최근 녹음 결과 파일 연결 및 녹음 횟수 기록
-- **Typecast 전용 브라우저 창 (Persistent Login Session)**:
-  - 앱 안에서 [typecast.ai](https://typecast.ai) 스튜디오를 여는 전용 웹뷰 창 제공
-  - **한 번만 로그인하면 쿠키 세션이 앱에 영구 저장**되어 다음 실행부터 같은 계정으로 자동 접속
-  - **소셜 로그인 팝업 지원**: 앱 내 웹뷰가 막는 `window.open` 을 해제해 구글 · 애플 · 네이버 · 카카오 로그인 팝업이 정상 동작합니다. 그래도 차단되면 OmniRec이 전용 로그인 창을 열고 인증 결과(`opener.postMessage`)를 원래 창으로 중계합니다
+- **Typecast 전용 Chrome 세션 (Persistent Login Session)**:
+  - 앱 내장 웹뷰가 아니라 **실제 Google Chrome**을 별도 프로세스로 띄워 [typecast.ai](https://typecast.ai) 스튜디오를 자동화(Chrome DevTools Protocol)
+  - 앱 전용 Chrome 프로필에 로그인 쿠키가 영구 저장되어 다음 실행부터 같은 계정으로 자동 접속(평소 쓰는 개인 Chrome 프로필과는 공유하지 않음)
+  - **소셜 로그인 팝업 지원**: 실제 브라우저라 구글 · 애플 · 네이버 · 카카오 로그인 팝업이 별도 조작 없이 그대로 동작합니다
   - **연동 진단 로그**: 로그인이 진행되지 않을 때 어느 단계까지 동작했는지 확인하고 복사할 수 있습니다
   - 창 `뒤로` · `새로고침` 버튼과 `세션 초기화` 버튼으로 언제든 되돌리거나 로그아웃
   - **비밀번호는 저장하지 않습니다.** 계정 이메일은 어떤 계정인지 구분하기 위한 표시용 메모로만 사용
@@ -72,7 +72,7 @@
   - 준비 카운트다운(0/3/5/10초)을 Typecast 화면 위 배너로 안내한 뒤 녹음 시작
   - 시스템 사운드 전용 녹음(마이크 기본 OFF, 필요 시 함께 녹음 가능)
   - **무음 자동 종료**로 낭독이 끝나면 자동으로 저장, 항상 위에 뜨는 미니 컨트롤러로 수동 종료도 가능
-  - 저장 파일 이름은 대본 제목으로 생성 (`대본제목_20260829_143000.m4a`)
+  - 저장 파일 이름은 대본 제목 그대로 사용(타임스탬프 없음). 같은 이름의 파일이 있으면 시작 전에 덮어쓸지 확인
 - **📄 자막 일괄 생성 (Batch Subtitle)**:
   - 대본에 연결된 녹음 파일을 골라 체크하면 **대본과 음성을 정렬해 `.srt` · `.vtt`를 한 번에 생성**
   - 원본 대본 글자 그대로 자막이 만들어지므로 오타 없는 결과
@@ -118,6 +118,7 @@
 | **Audio Capture & DSP** | [cpal](https://github.com/RustAudio/cpal), Custom IIR Biquad Filter, Noise Gate, Stereo Linear Resampler |
 | **Media Processing** | FFmpeg, FFprobe (Process Pipe Streaming, silencedetect) |
 | **Cross-Platform Bridge** | `tauri-plugin-dialog`, `tauri-plugin-fs`, `tauri-plugin-opener`, `tauri-plugin-shell` |
+| **Typecast 자동화** | [chromiumoxide](https://github.com/mattsse/chromiumoxide) (Chrome DevTools Protocol, 실제 Google Chrome 별도 실행) |
 
 ---
 
@@ -125,10 +126,11 @@
 
 ### 1. 필수 의존성
 - **Node.js**: `v18.0.0` 이상
-- **Rust**: `1.77.2` 이상 ([rustup 설치](https://rustup.rs/))
+- **Rust**: `1.85.0` 이상 ([rustup 설치](https://rustup.rs/))
 - **FFmpeg**: 시스템 PATH에 등록되어 있거나 애플리케이션 '환경 설정'에서 경로 지정
   - **macOS (Homebrew)**: `brew install ffmpeg`
   - **Windows (Chocolatey/Scoop/Winget)**: `winget install Gyan.FFmpeg` 또는 `choco install ffmpeg`
+- **Google Chrome**: 대본 & TTS 자동화(Typecast)를 쓰려면 필요. OS별 기본 설치 위치를 자동 탐색하며, 다른 경로에 설치했다면 앱 설정에서 실행 파일 경로를 직접 지정 가능
 
 ---
 

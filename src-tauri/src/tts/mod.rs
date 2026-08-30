@@ -1,6 +1,38 @@
-use tauri::webview::{NewWindowResponse, WebviewWindowBuilder};
-use tauri::utils::config::BackgroundThrottlingPolicy;
-use tauri::{AppHandle, Emitter, Manager, Url, WebviewUrl, WindowEvent};
+//! Typecast 자동화.
+//!
+//! 앱 내장 웹뷰(WKWebView)가 아니라, 사용자가 실제로 보는 별도의 Google Chrome 프로세스를
+//! Chrome DevTools Protocol(CDP, `chromiumoxide` 크레이트)로 제어한다. 이유:
+//!
+//! 1. WKWebView 는 창이 가려지거나 최소화되면 배터리 절약을 위해 그 프로세스를
+//!    스로틀링/서스펜드한다. 재생 중인 오디오가 정지 버튼을 누르지 않았는데도
+//!    멈추는 사고의 실제 원인 중 하나였다.
+//! 2. WKWebView 는 사용자 제스처와 분리된 `window.open` 을 차단한다. Typecast 의 소셜
+//!    로그인(팝업 + `window.opener.postMessage`)은 비동기 흐름에서 팝업을 열기 때문에,
+//!    프록시 window 객체 + opener 스텁으로 팝업을 흉내 내는 코드가 400줄 넘게 필요했다.
+//! 3. 실제 Chrome 은 이 둘 다 겪지 않는다. 팝업은 진짜 `window.opener` 관계를 유지해
+//!    Typecast 자신의 `postMessage` 코드가 그대로 동작하고, `popup.close()` 도 실제
+//!    창을 닫는다. (2)의 코드 전체가 필요 없어졌다.
+//!
+//! 로그인 세션은 앱 전용 Chrome 프로필 디렉터리(`~/.omnirec/typecast-chrome-profile`)에
+//! 영구 저장된다. 사용자의 평소 개인 Chrome 프로필과는 절대 공유하지 않는다 — Chrome
+//! 136+ 는 기본 프로필에 대한 원격 디버깅 자체를 거부하기도 하고, 자동화가 사용자의
+//! 실제 브라우징 세션(로그인된 다른 사이트들)에 손대는 것도 피해야 한다.
+//!
+//! 페이지 → 앱 브리지는 CDP `Runtime.addBinding` 하나로 단순화됐다. 원격 오리진이라
+//! Tauri IPC 가 막혀 있던 WKWebView 시절에는 `document.title` 변경 + 커스텀 스킴
+//! 네비게이션이라는 이중 채널과 일련번호 중복 제거가 필요했지만, CDP 바인딩은 페이지
+//! JS 가 직접 호출하는 진짜 함수라 그런 우회가 필요 없다.
+
+use futures::StreamExt;
+use tauri::{AppHandle, Emitter, Manager};
+use tokio::sync::Mutex as AsyncMutex;
+
+use chromiumoxide::browser::{Browser, BrowserConfig};
+use chromiumoxide::cdp::browser_protocol::page::EventFrameNavigated;
+use chromiumoxide::cdp::browser_protocol::storage::ClearDataForOriginParams;
+use chromiumoxide::cdp::browser_protocol::target::EventTargetCreated;
+use chromiumoxide::cdp::js_protocol::runtime::{AddBindingParams, EventBindingCalled};
+use chromiumoxide::Page;
 
 use crate::settings::SettingsManager;
 use crate::types::{
@@ -8,16 +40,8 @@ use crate::types::{
     TypecastStepPayload,
 };
 
-pub const TYPECAST_WINDOW_LABEL: &str = "typecast-browser";
-pub const TYPECAST_POPUP_LABEL: &str = "typecast-popup";
-
-/// 페이지에서 차단된 `window.open` 을 앱으로 넘길 때 쓰는 내부 전용 스킴.
-/// 실제로 이동하지는 않고 네비게이션 핸들러가 가로채 취소한다.
-const POPUP_SCHEME: &str = "omnirec-popup";
-
-/// 페이지 → 앱 브리지 메시지의 문서 제목 접두사.
-/// 원격 오리진에서는 Tauri IPC 가 막혀 있어, 제목 변경 이벤트를 단방향 채널로 쓴다.
-const BRIDGE_TITLE_PREFIX: &str = "__omnirec__";
+/// 페이지 → 앱 브리지에 쓰는 CDP 바인딩 이름. 최상위 프레임에서만 호출된다.
+const BRIDGE_BINDING_NAME: &str = "__omnirecBridge";
 
 /// 로그인 화면으로 판단할 URL 경로 조각.
 const SIGN_IN_PATH_HINTS: [&str; 6] = [
@@ -28,6 +52,43 @@ const SIGN_IN_PATH_HINTS: [&str; 6] = [
     "/signup",
     "/auth",
 ];
+
+/// 실행 중인 Chrome 세션 하나. 앱 전체에 Typecast 창은 하나만 존재하는 모델이라
+/// 세션도 하나만 유지한다.
+struct CdpSession {
+    browser: Browser,
+    main_page: Page,
+    handler_task: tokio::task::JoinHandle<()>,
+    binding_task: tokio::task::JoinHandle<()>,
+    navigation_task: tokio::task::JoinHandle<()>,
+    target_task: tokio::task::JoinHandle<()>,
+}
+
+impl CdpSession {
+    async fn shutdown(mut self) {
+        self.handler_task.abort();
+        self.binding_task.abort();
+        self.navigation_task.abort();
+        self.target_task.abort();
+        let _ = self.browser.close().await;
+        let _ = self.browser.wait().await;
+    }
+}
+
+/// Tauri 관리 상태. 세션이 없으면 `None`.
+pub struct TypecastCdpState(AsyncMutex<Option<CdpSession>>);
+
+impl TypecastCdpState {
+    pub fn new() -> Self {
+        Self(AsyncMutex::new(None))
+    }
+}
+
+impl Default for TypecastCdpState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 pub struct TypecastController;
 
@@ -47,7 +108,7 @@ impl TypecastController {
             .any(|hint| path_and_query.starts_with(hint) || path_and_query.contains(hint))
     }
 
-    fn parse_url(url: &str) -> Result<Url, String> {
+    fn parse_url(url: &str) -> Result<String, String> {
         let trimmed = url.trim();
         if trimmed.is_empty() {
             return Err("접속할 주소가 비어 있습니다.".to_string());
@@ -55,102 +116,7 @@ impl TypecastController {
         if !(trimmed.starts_with("https://") || trimmed.starts_with("http://")) {
             return Err(format!("http/https 주소만 열 수 있습니다: {}", trimmed));
         }
-        Url::parse(trimmed).map_err(|e| format!("주소를 해석할 수 없습니다({}): {}", trimmed, e))
-    }
-
-    /// Typecast 창을 연다. 이미 열려 있으면 포커스만 준다.
-    /// 창은 incognito 를 끈 상태(기본값)로 만들어져 로그인 쿠키가 앱 데이터에 영구 저장되고,
-    /// 다음 실행에서도 같은 세션으로 자동 접속된다.
-    pub fn open(app: &AppHandle, url: Option<String>) -> Result<(), String> {
-        let settings = SettingsManager::load();
-        let target = url.unwrap_or_else(|| settings.typecast_editor_url.clone());
-        let parsed = Self::parse_url(&target)?;
-
-        if let Some(existing) = app.get_webview_window(TYPECAST_WINDOW_LABEL) {
-            let _ = existing.show();
-            let _ = existing.unminimize();
-            let _ = existing.set_focus();
-            return Ok(());
-        }
-
-        let nav_handle = app.clone();
-        let title_handle = app.clone();
-        let new_window_handle = app.clone();
-
-        let builder = WebviewWindowBuilder::new(
-            app,
-            TYPECAST_WINDOW_LABEL,
-            WebviewUrl::External(parsed),
-        )
-        .title("Typecast TTS — OmniRec 대본 낭독")
-        .inner_size(1180.0, 840.0)
-        .min_inner_size(900.0, 600.0)
-        .resizable(true)
-        .center()
-        .focused(true)
-        // macOS 는 창이 가려지거나 최소화되면 WKWebView 를 전력 절약 모드로 스로틀링해
-        // 재생 중인 오디오까지 멈출 수 있다(정지 버튼과 무관한 멈춤의 실제 원인 중 하나).
-        // 배치 자동화 중에는 창이 계속 최전면에 있지 않을 수 있으므로 꺼둔다.
-        .background_throttling(BackgroundThrottlingPolicy::Disabled)
-        // incognito(false): 쿠키/로컬스토리지를 영구 보관해 로그인 상태를 유지한다.
-        .incognito(false)
-        // 편집기가 iframe 안에 있을 수 있으므로 모든 프레임에 주입한다.
-        .initialization_script_for_all_frames(MAIN_INIT_SCRIPT)
-        .on_navigation(move |url| {
-            // 커스텀 스킴 채널(제목 채널이 동작하지 않는 환경용 예비 경로)
-            if url.scheme() == POPUP_SCHEME {
-                let message = percent_decode(url.path());
-                Self::handle_bridge_message(&nav_handle, &message);
-                return false;
-            }
-
-            let url_string = url.to_string();
-            Self::debug(&nav_handle, "navigate", &url_string);
-            let _ = nav_handle.emit(
-                "typecast_navigation",
-                TypecastNavigationPayload {
-                    looks_signed_in: Self::looks_signed_in(&url_string),
-                    url: url_string,
-                },
-            );
-            true
-        })
-        // 페이지 → 앱 단방향 브리지(문서 제목 채널)
-        .on_document_title_changed(move |_window, title| {
-            if let Some(message) = title.strip_prefix(BRIDGE_TITLE_PREFIX) {
-                Self::handle_bridge_message(&title_handle, message);
-            }
-        })
-        // 네이티브 팝업이 허용되는 환경에서는 WebKit 이 만든 진짜 팝업을 그대로 쓴다.
-        // 이 경로가 살아 있으면 window.opener 관계가 유지돼 소셜 로그인이 그대로 동작한다.
-        .on_new_window(move |url, _features| {
-            Self::debug(&new_window_handle, "native-popup", url.as_str());
-            NewWindowResponse::Allow
-        });
-
-        // 합성 클릭으로도 오디오가 재생되도록 자동재생 제한을 푼 설정을 쓴다.
-        #[cfg(target_os = "macos")]
-        let builder = match automation_webview_configuration() {
-            Some(configuration) => builder.with_webview_configuration(configuration),
-            None => builder,
-        };
-
-        let window = builder
-            .build()
-            .map_err(|e| format!("Typecast 창을 열 수 없습니다: {}", e))?;
-
-        // WKWebView 는 사용자 제스처와 분리된 window.open 을 막는다.
-        // 소셜 로그인은 비동기 흐름에서 팝업을 열기 때문에 이 설정이 없으면 차단된다.
-        enable_automatic_popups(&window);
-
-        let close_handle = app.clone();
-        window.on_window_event(move |event| {
-            if matches!(event, WindowEvent::Destroyed) {
-                let _ = close_handle.emit("typecast_browser_closed", ());
-            }
-        });
-
-        Ok(())
+        Ok(trimmed.to_string())
     }
 
     /// 진단 로그를 프론트엔드로 흘려보낸다. 어떤 경로가 실제로 동작하는지 추적하기 위한 것.
@@ -166,25 +132,11 @@ impl TypecastController {
         );
     }
 
-    /// 페이지가 보낸 브리지 메시지를 처리한다. 형식은 `<kind>:<payload>`.
-    ///
-    /// - `open:<url>`   차단된 팝업 대신 앱이 로그인 창을 열어 준다
-    /// - `close`        메인 페이지가 팝업을 닫으라고 요청
-    /// - `msg:<json>`   팝업이 opener 로 보내려던 postMessage 를 메인 창으로 중계
-    /// - `log:<text>`   진단용 로그
+    /// 페이지가 CDP 바인딩으로 보낸 메시지를 처리한다. 형식은 `<kind>:<payload>`.
+    /// 지금은 `step:<name>:<detail>` (자동화 단계 보고) 하나만 의미 있게 처리한다.
+    /// `open`/`close`/`msg` 같은 팝업 브리지 케이스는 실제 브라우저에서는 필요 없다 —
+    /// 진짜 팝업의 `window.opener.postMessage` / `popup.close()` 가 그대로 동작한다.
     fn handle_bridge_message(app: &AppHandle, message: &str) {
-        // 제목 채널과 커스텀 스킴 채널이 같은 메시지를 각각 보내므로
-        // 앞에 붙은 일련번호로 중복을 걸러낸다.
-        let message = match message.split_once('|') {
-            Some((seq, rest)) => {
-                if !seen_bridge_message(seq) {
-                    return;
-                }
-                rest
-            }
-            None => message,
-        };
-
         let (kind, payload) = match message.split_once(':') {
             Some((k, p)) => (k, p),
             None => (message, ""),
@@ -192,198 +144,292 @@ impl TypecastController {
 
         Self::debug(app, &format!("bridge:{kind}"), payload);
 
-        match kind {
-            "open" => {
-                let target = payload.to_string();
-                if Self::parse_url(&target).is_err() {
-                    return;
-                }
-                let _ = app.emit(
-                    "typecast_popup_intercepted",
-                    TypecastPopupPayload { url: target.clone() },
-                );
-                let handle = app.clone();
-                // 델리게이트 콜백 안에서 창을 직접 만들지 않도록 이벤트 루프로 넘긴다.
-                let _ = app.run_on_main_thread(move || {
-                    let _ = Self::open_popup_window(&handle, &target);
-                });
-            }
-            "close" => {
-                let handle = app.clone();
-                let _ = app.run_on_main_thread(move || {
-                    if let Some(popup) = handle.get_webview_window(TYPECAST_POPUP_LABEL) {
-                        let _ = popup.close();
-                    }
-                });
-            }
-            // 페이지 자동화 단계 보고 (`step:<name>:<detail>`)
-            "step" => {
-                let (name, detail) = match payload.split_once(':') {
-                    Some((n, d)) => (n.to_string(), d.to_string()),
-                    None => (payload.to_string(), String::new()),
-                };
-                let _ = app.emit("typecast_step", TypecastStepPayload { name, detail });
-            }
-            "msg" => {
-                let payload = payload.to_string();
-                let handle = app.clone();
-                let _ = app.run_on_main_thread(move || {
-                    Self::deliver_message_to_main(&handle, &payload);
-                });
-            }
-            _ => {}
+        if kind == "step" {
+            let (name, detail) = match payload.split_once(':') {
+                Some((n, d)) => (n.to_string(), d.to_string()),
+                None => (payload.to_string(), String::new()),
+            };
+            let _ = app.emit("typecast_step", TypecastStepPayload { name, detail });
         }
     }
 
-    /// 팝업이 `window.opener.postMessage(...)` 로 보내려던 값을 메인 창에 합성 이벤트로 전달한다.
-    fn deliver_message_to_main(app: &AppHandle, payload_json: &str) {
-        let Some(window) = app.get_webview_window(TYPECAST_WINDOW_LABEL) else {
-            return;
-        };
-        // payload_json 은 { "data": ..., "origin": "..." } 형태의 JSON 문자열.
-        let literal = match serde_json::to_string(payload_json) {
-            Ok(v) => v,
-            Err(_) => return,
-        };
-        let _ = window.eval(format!(
-            "window.__omnirecDeliverMessage && window.__omnirecDeliverMessage({});",
-            literal
-        ));
-        let _ = window.set_focus();
+    /// macOS 에서 Chrome 앱 자체를 최전면으로 올린다. `Page.bringToFront` 는 탭만
+    /// 활성화할 뿐 OS 레벨에서 다른 앱 뒤에 있는 Chrome 창을 끌어올리지는 못한다.
+    #[cfg(target_os = "macos")]
+    fn activate_chrome_app() {
+        let _ = std::process::Command::new("open")
+            .arg("-a")
+            .arg("Google Chrome")
+            .spawn();
     }
 
-    /// 네이티브 팝업이 막혔을 때 대신 여는 로그인 창.
+    #[cfg(not(target_os = "macos"))]
+    fn activate_chrome_app() {}
+
+    fn cdp_state(app: &AppHandle) -> tauri::State<'_, TypecastCdpState> {
+        app.state::<TypecastCdpState>()
+    }
+
+    async fn get_main_page(app: &AppHandle) -> Result<Page, String> {
+        let state = Self::cdp_state(app);
+        let guard = state.0.lock().await;
+        guard
+            .as_ref()
+            .map(|session| session.main_page.clone())
+            .ok_or_else(|| "Typecast 브라우저가 열려 있지 않습니다.".to_string())
+    }
+
+    /// Typecast 를 연다. 이미 열려 있으면 탭 활성화 + 앱 활성화만 한다.
     ///
-    /// 이 창에는 `window.opener` 스텁을 주입해, 콜백 페이지가 보내는
-    /// `opener.postMessage({type:"AUTH_TYPE", ...})` 를 가로채 메인 창으로 중계한다.
-    /// (별도 창이라 진짜 opener 관계가 없기 때문에 반드시 필요하다.)
-    fn open_popup_window(app: &AppHandle, target: &str) -> Result<(), String> {
-        let parsed = Self::parse_url(target)?;
+    /// 창은 앱 전용 Chrome 프로필(`SettingsManager::typecast_chrome_profile_dir`)로
+    /// 실행되어 로그인 쿠키가 영구 저장되고, 다음 실행에서도 같은 세션으로 자동 접속된다.
+    pub async fn open(app: &AppHandle, url: Option<String>) -> Result<(), String> {
+        let settings = SettingsManager::load();
+        let target = url.unwrap_or_else(|| settings.typecast_editor_url.clone());
+        let target = Self::parse_url(&target)?;
 
-        if let Some(existing) = app.get_webview_window(TYPECAST_POPUP_LABEL) {
-            existing
-                .navigate(parsed)
-                .map_err(|e| format!("로그인 창 이동 실패: {}", e))?;
-            let _ = existing.show();
-            let _ = existing.set_focus();
-            return Ok(());
+        let state = Self::cdp_state(app);
+        {
+            let guard = state.0.lock().await;
+            if let Some(session) = guard.as_ref() {
+                let _ = session.main_page.bring_to_front().await;
+                drop(guard);
+                Self::activate_chrome_app();
+                return Ok(());
+            }
         }
 
-        let title_handle = app.clone();
-        let nav_handle = app.clone();
-        let window =
-            WebviewWindowBuilder::new(app, TYPECAST_POPUP_LABEL, WebviewUrl::External(parsed))
-                .title("Typecast 로그인")
-                .inner_size(560.0, 720.0)
-                .min_inner_size(420.0, 560.0)
-                .resizable(true)
-                .center()
-                .focused(true)
-                .incognito(false)
-                .initialization_script(POPUP_INIT_SCRIPT)
-                .on_navigation(move |url| {
-                    if url.scheme() == POPUP_SCHEME {
-                        Self::handle_bridge_message(&nav_handle, &percent_decode(url.path()));
-                        return false;
-                    }
-                    Self::debug(&nav_handle, "popup-navigate", url.as_str());
-                    true
-                })
-                .on_document_title_changed(move |_w, title| {
-                    if let Some(message) = title.strip_prefix(BRIDGE_TITLE_PREFIX) {
-                        Self::handle_bridge_message(&title_handle, message);
-                    }
-                })
-                .build()
-                .map_err(|e| format!("로그인 창을 열 수 없습니다: {}", e))?;
+        let chrome_path = SettingsManager::find_chrome(settings.custom_chrome_path.as_deref())?;
+        let profile_dir = SettingsManager::typecast_chrome_profile_dir();
 
-        enable_automatic_popups(&window);
+        let config = BrowserConfig::builder()
+            .chrome_executable(chrome_path)
+            .user_data_dir(profile_dir)
+            .with_head()
+            .window_size(1180, 840)
+            // 합성 클릭으로도 재생되도록 자동재생 사용자 제스처 요구를 끈다.
+            // (WKWebView 시절 mediaTypesRequiringUserActionForPlayback = None 과 같은 목적.)
+            .arg("--autoplay-policy=no-user-gesture-required")
+            .build()
+            .map_err(|e| format!("Chrome 실행 설정을 만들 수 없습니다: {}", e))?;
 
-        // 로그인 창이 닫히면 메인 페이지의 `popup.closed` 폴링이 멈출 수 있도록 알려준다.
-        let closed_handle = app.clone();
-        window.on_window_event(move |event| {
-            if matches!(event, WindowEvent::Destroyed) {
-                if let Some(main) = closed_handle.get_webview_window(TYPECAST_WINDOW_LABEL) {
-                    let _ = main.eval("window.__omnirecPopupClosed && window.__omnirecPopupClosed();");
+        let (mut browser, mut handler) = Browser::launch(config)
+            .await
+            .map_err(|e| format!("Chrome 을 실행할 수 없습니다: {}", e))?;
+
+        let handler_app = app.clone();
+        let handler_task = tokio::spawn(async move {
+            while let Some(event) = handler.next().await {
+                if event.is_err() {
+                    break;
                 }
             }
+            // 이벤트 스트림이 끝났다는 것은 연결이 끊겼다는 뜻이다(사용자가 Chrome 을 직접 닫은 경우 포함).
+            let _ = handler_app.emit("typecast_browser_closed", ());
         });
 
+        let setup: Result<
+            (
+                Page,
+                tokio::task::JoinHandle<()>,
+                tokio::task::JoinHandle<()>,
+                tokio::task::JoinHandle<()>,
+            ),
+            String,
+        > = async {
+            // about:blank 로 먼저 만들어 실제 콘텐츠가 로드되기 전에 바인딩/초기 스크립트를 심는다.
+            let page = browser
+                .new_page("about:blank")
+                .await
+                .map_err(|e| format!("Typecast 페이지를 열 수 없습니다: {}", e))?;
+
+            page.execute(AddBindingParams::new(BRIDGE_BINDING_NAME))
+                .await
+                .map_err(|e| format!("브리지 바인딩 등록 실패: {}", e))?;
+            page.evaluate_on_new_document(MAIN_INIT_SCRIPT)
+                .await
+                .map_err(|e| format!("자동화 스크립트 등록 실패: {}", e))?;
+
+            let mut binding_events = page
+                .event_listener::<EventBindingCalled>()
+                .await
+                .map_err(|e| format!("브리지 이벤트 구독 실패: {}", e))?;
+            let mut nav_events = page
+                .event_listener::<EventFrameNavigated>()
+                .await
+                .map_err(|e| format!("네비게이션 이벤트 구독 실패: {}", e))?;
+            let mut popup_events = browser
+                .event_listener::<EventTargetCreated>()
+                .await
+                .map_err(|e| format!("팝업 감지 구독 실패: {}", e))?;
+
+            page.goto(target.as_str())
+                .await
+                .map_err(|e| format!("Typecast 페이지로 이동할 수 없습니다: {}", e))?;
+
+            let bridge_app = app.clone();
+            let binding_task = tokio::spawn(async move {
+                while let Some(event) = binding_events.next().await {
+                    if event.name == BRIDGE_BINDING_NAME {
+                        Self::handle_bridge_message(&bridge_app, &event.payload);
+                    }
+                }
+            });
+
+            let nav_app = app.clone();
+            let navigation_task = tokio::spawn(async move {
+                while let Some(event) = nav_events.next().await {
+                    // 최상위 프레임 네비게이션만 로그인 상태 판정에 쓴다.
+                    if event.frame.parent_id.is_some() {
+                        continue;
+                    }
+                    let url = event.frame.url.clone();
+                    Self::debug(&nav_app, "navigate", &url);
+                    let _ = nav_app.emit(
+                        "typecast_navigation",
+                        TypecastNavigationPayload {
+                            looks_signed_in: Self::looks_signed_in(&url),
+                            url,
+                        },
+                    );
+                }
+            });
+
+            let popup_app = app.clone();
+            let target_task = tokio::spawn(async move {
+                while let Some(event) = popup_events.next().await {
+                    if event.target_info.r#type != "page" {
+                        continue;
+                    }
+                    Self::debug(&popup_app, "popup-opened", &event.target_info.url);
+                    let _ = popup_app.emit(
+                        "typecast_popup_intercepted",
+                        TypecastPopupPayload {
+                            url: event.target_info.url.clone(),
+                        },
+                    );
+                }
+            });
+
+            Ok((page, binding_task, navigation_task, target_task))
+        }
+        .await;
+
+        let (page, binding_task, navigation_task, target_task) = match setup {
+            Ok(parts) => parts,
+            Err(error) => {
+                handler_task.abort();
+                let _ = browser.close().await;
+                return Err(error);
+            }
+        };
+
+        let mut guard = state.0.lock().await;
+        *guard = Some(CdpSession {
+            browser,
+            main_page: page,
+            handler_task,
+            binding_task,
+            navigation_task,
+            target_task,
+        });
+        drop(guard);
+
+        Self::activate_chrome_app();
         Ok(())
     }
 
-    pub fn close(app: &AppHandle) -> Result<(), String> {
-        if let Some(popup) = app.get_webview_window(TYPECAST_POPUP_LABEL) {
-            let _ = popup.close();
-        }
-        if let Some(window) = app.get_webview_window(TYPECAST_WINDOW_LABEL) {
-            window
-                .close()
-                .map_err(|e| format!("Typecast 창을 닫을 수 없습니다: {}", e))?;
+    pub async fn close(app: &AppHandle) -> Result<(), String> {
+        let state = Self::cdp_state(app);
+        let session = {
+            let mut guard = state.0.lock().await;
+            guard.take()
+        };
+        if let Some(session) = session {
+            session.shutdown().await;
         }
         Ok(())
     }
 
-    pub fn focus(app: &AppHandle) -> Result<(), String> {
-        let window = app
-            .get_webview_window(TYPECAST_WINDOW_LABEL)
-            .ok_or_else(|| "Typecast 창이 열려 있지 않습니다.".to_string())?;
-        let _ = window.show();
-        let _ = window.unminimize();
-        window
-            .set_focus()
-            .map_err(|e| format!("Typecast 창 포커스 실패: {}", e))
+    pub async fn focus(app: &AppHandle) -> Result<(), String> {
+        let page = Self::get_main_page(app).await?;
+        page.bring_to_front()
+            .await
+            .map_err(|e| format!("탭 활성화 실패: {}", e))?;
+        Self::activate_chrome_app();
+        Ok(())
     }
 
-    pub fn navigate(app: &AppHandle, url: String) -> Result<(), String> {
-        let parsed = Self::parse_url(&url)?;
-        match app.get_webview_window(TYPECAST_WINDOW_LABEL) {
-            Some(window) => window
-                .navigate(parsed)
+    pub async fn navigate(app: &AppHandle, url: String) -> Result<(), String> {
+        let target = Self::parse_url(&url)?;
+        let state = Self::cdp_state(app);
+        let existing = {
+            let guard = state.0.lock().await;
+            guard.as_ref().map(|session| session.main_page.clone())
+        };
+        match existing {
+            Some(page) => page
+                .goto(target.as_str())
+                .await
+                .map(|_| ())
                 .map_err(|e| format!("페이지 이동 실패: {}", e)),
-            None => Self::open(app, Some(url)),
+            None => Self::open(app, Some(url)).await,
         }
     }
 
-    pub fn go_back(app: &AppHandle) -> Result<(), String> {
-        let window = app
-            .get_webview_window(TYPECAST_WINDOW_LABEL)
-            .ok_or_else(|| "Typecast 창이 열려 있지 않습니다.".to_string())?;
-        window
-            .eval("history.back();")
+    pub async fn go_back(app: &AppHandle) -> Result<(), String> {
+        let page = Self::get_main_page(app).await?;
+        page.evaluate("history.back();")
+            .await
+            .map(|_| ())
             .map_err(|e| format!("뒤로 가기 실패: {}", e))
     }
 
-    pub fn reload(app: &AppHandle) -> Result<(), String> {
-        let window = app
-            .get_webview_window(TYPECAST_WINDOW_LABEL)
-            .ok_or_else(|| "Typecast 창이 열려 있지 않습니다.".to_string())?;
-        window.reload().map_err(|e| format!("새로고침 실패: {}", e))
+    pub async fn reload(app: &AppHandle) -> Result<(), String> {
+        let page = Self::get_main_page(app).await?;
+        page.reload()
+            .await
+            .map(|_| ())
+            .map_err(|e| format!("새로고침 실패: {}", e))
     }
 
     /// 저장된 로그인 세션(쿠키/스토리지)을 모두 지우고 로그인 페이지로 되돌린다.
-    pub fn clear_session(app: &AppHandle) -> Result<(), String> {
+    ///
+    /// 세션이 열려 있으면 CDP 로 쿠키/오리진 스토리지를 지운 뒤 로그인 페이지로 이동한다.
+    /// 세션이 없으면 쿠키가 디스크의 프로필 디렉터리에만 존재하므로, 그 디렉터리 자체를
+    /// 지우는 쪽이 더 확실하다(Chrome 이 실행 중이 아니므로 파일 삭제가 안전하다).
+    pub async fn clear_session(app: &AppHandle) -> Result<(), String> {
         let settings = SettingsManager::load();
+        let state = Self::cdp_state(app);
 
-        if let Some(popup) = app.get_webview_window(TYPECAST_POPUP_LABEL) {
-            let _ = popup.close();
-        }
+        let session_open = {
+            let guard = state.0.lock().await;
+            if let Some(session) = guard.as_ref() {
+                session
+                    .browser
+                    .clear_cookies()
+                    .await
+                    .map_err(|e| format!("쿠키 삭제 실패: {}", e))?;
+                if let Ok(origin_url) = tauri::Url::parse(&settings.typecast_editor_url) {
+                    let _ = session
+                        .main_page
+                        .execute(ClearDataForOriginParams::new(
+                            origin_url.origin().ascii_serialization(),
+                            "all",
+                        ))
+                        .await;
+                }
+                if let Ok(signin) = Self::parse_url(&settings.typecast_signin_url) {
+                    let _ = session.main_page.goto(signin.as_str()).await;
+                }
+                true
+            } else {
+                false
+            }
+        };
 
-        if let Some(window) = app.get_webview_window(TYPECAST_WINDOW_LABEL) {
-            window
-                .clear_all_browsing_data()
-                .map_err(|e| format!("세션 데이터 삭제 실패: {}", e))?;
-            if let Ok(parsed) = Self::parse_url(&settings.typecast_signin_url) {
-                let _ = window.navigate(parsed);
-            }
-        } else {
-            // 창이 없으면 잠깐 띄워서 데이터를 지운 뒤 로그인 페이지를 보여준다.
-            Self::open(app, Some(settings.typecast_signin_url.clone()))?;
-            if let Some(window) = app.get_webview_window(TYPECAST_WINDOW_LABEL) {
-                window
-                    .clear_all_browsing_data()
-                    .map_err(|e| format!("세션 데이터 삭제 실패: {}", e))?;
-            }
+        if !session_open {
+            let _ = std::fs::remove_dir_all(SettingsManager::typecast_chrome_profile_dir());
         }
 
         let mut updated = settings;
@@ -394,16 +440,18 @@ impl TypecastController {
         Ok(())
     }
 
-    pub fn state(app: &AppHandle) -> TypecastBrowserState {
+    pub async fn state(app: &AppHandle) -> TypecastBrowserState {
         let settings = SettingsManager::load();
-        let window = app.get_webview_window(TYPECAST_WINDOW_LABEL);
-        let current_url = window
-            .as_ref()
-            .and_then(|w| w.url().ok())
-            .map(|u| u.to_string());
+        let cdp_state = Self::cdp_state(app);
+        let guard = cdp_state.0.lock().await;
+        let (is_open, current_url) = match guard.as_ref() {
+            Some(session) => (true, session.main_page.url().await.ok().flatten()),
+            None => (false, None),
+        };
+        drop(guard);
 
         TypecastBrowserState {
-            is_open: window.is_some(),
+            is_open,
             looks_signed_in: current_url
                 .as_deref()
                 .map(Self::looks_signed_in)
@@ -414,173 +462,105 @@ impl TypecastController {
         }
     }
 
-    fn main_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String> {
-        app.get_webview_window(TYPECAST_WINDOW_LABEL)
-            .ok_or_else(|| "Typecast 창이 열려 있지 않습니다.".to_string())
-    }
-
     /// 자동화용 선택자를 페이지에 심는다. 비워두면 내장 휴리스틱을 쓴다.
-    pub fn apply_selectors(app: &AppHandle) -> Result<(), String> {
+    pub async fn apply_selectors(app: &AppHandle) -> Result<(), String> {
         let settings = SettingsManager::load();
-        let window = Self::main_window(app)?;
+        let page = Self::get_main_page(app).await?;
         let editor = serde_json::to_string(&settings.typecast_editor_selector)
             .map_err(|e| e.to_string())?;
         let play =
             serde_json::to_string(&settings.typecast_play_selector).map_err(|e| e.to_string())?;
-        window
-            .eval(format!(
-                "window.__omnirecSetSelectors && window.__omnirecSetSelectors({}, {});",
-                editor, play
-            ))
-            .map_err(|e| format!("선택자 적용 실패: {}", e))
+        page.evaluate(format!(
+            "window.__omnirecSetSelectors && window.__omnirecSetSelectors({}, {});",
+            editor, play
+        ))
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("선택자 적용 실패: {}", e))
     }
 
     /// 대본을 편집기에 채우고, 결과를 `typecast_step` 이벤트로 보고한다.
     ///
     /// 자동 입력이 실패하더라도 사용자가 직접 붙여넣을 수 있도록 클립보드에도 넣어 둔다.
     /// 수동 녹음 화면의 "대본 보내기"도 같은 경로를 쓴다.
-    pub fn prepare_script(app: &AppHandle, text: String) -> Result<(), String> {
+    pub async fn prepare_script(app: &AppHandle, text: String) -> Result<(), String> {
         let _ = crate::clipboard::copy_text(&text);
-        Self::apply_selectors(app)?;
-        let window = Self::main_window(app)?;
+        Self::apply_selectors(app).await?;
+        let page = Self::get_main_page(app).await?;
         let payload = serde_json::to_string(&text).map_err(|e| e.to_string())?;
-        window
-            .eval(format!(
-                "window.__omnirecPrepare && window.__omnirecPrepare({});",
-                payload
-            ))
-            .map_err(|e| format!("대본 주입 실패: {}", e))?;
-        let _ = window.show();
+        page.evaluate(format!(
+            "window.__omnirecPrepare && window.__omnirecPrepare({});",
+            payload
+        ))
+        .await
+        .map_err(|e| format!("대본 주입 실패: {}", e))?;
+        let _ = page.bring_to_front().await;
         Ok(())
     }
 
     /// 편집기의 재생 버튼을 누른다.
-    pub fn play(app: &AppHandle) -> Result<(), String> {
-        let window = Self::main_window(app)?;
-        window
-            .eval("window.__omnirecPlay && window.__omnirecPlay();")
+    pub async fn play(app: &AppHandle) -> Result<(), String> {
+        let page = Self::get_main_page(app).await?;
+        page.evaluate("window.__omnirecPlay && window.__omnirecPlay();")
+            .await
+            .map(|_| ())
             .map_err(|e| format!("재생 실행 실패: {}", e))
     }
 
     /// 재생을 멈춘다(정지/일시정지 버튼 탐색).
-    pub fn stop_playback(app: &AppHandle) -> Result<(), String> {
-        let window = Self::main_window(app)?;
-        window
-            .eval("window.__omnirecStopPlayback && window.__omnirecStopPlayback();")
+    pub async fn stop_playback(app: &AppHandle) -> Result<(), String> {
+        let page = Self::get_main_page(app).await?;
+        page.evaluate("window.__omnirecStopPlayback && window.__omnirecStopPlayback();")
+            .await
+            .map(|_| ())
             .map_err(|e| format!("재생 정지 실패: {}", e))
     }
 
     /// 편집기 / 재생 버튼 후보를 찾아 진단 정보를 보고한다.
-    pub fn probe(app: &AppHandle) -> Result<(), String> {
-        Self::apply_selectors(app)?;
-        let window = Self::main_window(app)?;
-        window
-            .eval("window.__omnirecProbe && window.__omnirecProbe();")
+    pub async fn probe(app: &AppHandle) -> Result<(), String> {
+        Self::apply_selectors(app).await?;
+        let page = Self::get_main_page(app).await?;
+        page.evaluate("window.__omnirecProbe && window.__omnirecProbe();")
+            .await
+            .map(|_| ())
             .map_err(|e| format!("페이지 진단 실패: {}", e))
     }
 
     /// Typecast 페이지 위에 안내 토스트를 띄운다(카운트다운 / 녹음 시작 알림 용도).
-    pub fn notify(app: &AppHandle, message: String, tone: Option<String>) -> Result<(), String> {
-        let window = app
-            .get_webview_window(TYPECAST_WINDOW_LABEL)
-            .ok_or_else(|| "Typecast 창이 열려 있지 않습니다.".to_string())?;
-
+    pub async fn notify(app: &AppHandle, message: String, tone: Option<String>) -> Result<(), String> {
+        let page = Self::get_main_page(app).await?;
         let msg = serde_json::to_string(&message).map_err(|e| e.to_string())?;
         let tone = serde_json::to_string(&tone.unwrap_or_else(|| "info".to_string()))
             .map_err(|e| e.to_string())?;
-        window
-            .eval(format!(
-                "window.__omnirecToast && window.__omnirecToast({}, {});",
-                msg, tone
-            ))
-            .map_err(|e| format!("Typecast 알림 표시 실패: {}", e))
+        page.evaluate(format!(
+            "window.__omnirecToast && window.__omnirecToast({}, {});",
+            msg, tone
+        ))
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("Typecast 알림 표시 실패: {}", e))
     }
 }
 
-/// 자동화에 맞춘 WKWebView 설정을 만든다.
+/// Typecast 페이지에 주입되는 자동화 스크립트. **모든 프레임**에서 실행된다
+/// (`Page.addScriptToEvaluateOnNewDocument` 는 새로 생성되는 모든 프레임에 적용되고,
+/// 그 프레임의 스크립트가 실행되기 전에 먼저 돈다).
 ///
-/// - `mediaTypesRequiringUserActionForPlayback = None`:
-///   JS 로 만든 합성 클릭은 사용자 제스처로 인정되지 않아 오디오 재생이 거부될 수 있다.
-///   자동 낭독 녹음을 하려면 이 제한을 풀어야 한다.
-/// - `javaScriptCanOpenWindowsAutomatically = true`: 소셜 로그인 팝업 차단 해제.
-#[cfg(target_os = "macos")]
-fn automation_webview_configuration(
-) -> Option<objc2::rc::Retained<objc2_web_kit::WKWebViewConfiguration>> {
-    use objc2::MainThreadMarker;
-    use objc2_web_kit::{WKAudiovisualMediaTypes, WKWebViewConfiguration};
+/// - 편집기 입력 · 재생 버튼 클릭 · 진단. 편집기가 iframe 이나 shadow DOM 안에 있을 수
+///   있으므로 모든 프레임에 주입하고 shadow root 까지 훑는다.
+/// - `window.open`/`postMessage` 관련 우회 코드가 전혀 없다 — 실제 Chrome 에서는
+///   Typecast 자신의 팝업 로그인 코드가 그대로 동작한다.
+const MAIN_INIT_SCRIPT: &str = r#"
+(function () {
+  if (window.__omnirecInjected) return;
+  window.__omnirecInjected = true;
 
-    let mtm = MainThreadMarker::new()?;
-    // SAFETY: 메인 스레드에서 새 설정 객체를 만들고 속성만 설정한다.
-    unsafe {
-        let configuration = WKWebViewConfiguration::new(mtm);
-        configuration.setMediaTypesRequiringUserActionForPlayback(WKAudiovisualMediaTypes::None);
-        configuration
-            .preferences()
-            .setJavaScriptCanOpenWindowsAutomatically(true);
-        Some(configuration)
-    }
-}
-
-/// WKWebView 는 사용자 제스처와 분리된 `window.open` 을 차단한다.
-/// Typecast 의 소셜 로그인은 async 흐름에서 팝업을 열기 때문에 이 설정이 필요하다.
-/// 이 값이 켜져 네이티브 팝업이 열리면 `window.opener` 관계가 그대로 유지되어
-/// 아래 브리지 없이도 로그인이 정상 동작한다.
-#[cfg(target_os = "macos")]
-fn enable_automatic_popups(window: &tauri::WebviewWindow) {
-    use objc2_web_kit::WKWebView;
-
-    let _ = window.with_webview(|platform| {
-        let ptr = platform.inner() as *mut WKWebView;
-        if ptr.is_null() {
-            return;
-        }
-        // SAFETY: Tauri 가 넘겨주는 포인터는 살아 있는 WKWebView(하위 클래스) 인스턴스이며,
-        // 이 클로저는 메인 스레드에서 실행된다.
-        unsafe {
-            let webview = &*ptr;
-            let preferences = webview.configuration().preferences();
-            preferences.setJavaScriptCanOpenWindowsAutomatically(true);
-        }
-    });
-}
-
-#[cfg(not(target_os = "macos"))]
-fn enable_automatic_popups(_window: &tauri::WebviewWindow) {}
-
-/// 페이지 → 앱 브리지 공통부. 문서 제목 채널을 주 경로로,
-/// 커스텀 스킴 네비게이션을 예비 경로로 함께 사용한다.
-/// (`concat!` 은 리터럴만 받으므로 상수가 아닌 매크로로 둔다.)
-/// 페이지 → 앱 브리지 공통부. 문서 제목 채널을 주 경로로,
-/// 커스텀 스킴 네비게이션을 예비 경로로 함께 사용한다.
-/// 두 채널이 같은 메시지를 두 번 보낼 수 있어 일련번호로 중복을 거른다.
-/// (`concat!` 은 리터럴만 받으므로 상수가 아닌 매크로로 둔다.)
-macro_rules! bridge_snippet {
-    () => {
-        r#"
   var IS_TOP = (function () { try { return window.top === window; } catch (e) { return false; } })();
-  // 페이지가 새로 로드될 때마다 번호가 1부터 다시 시작하면 이전 메시지와 충돌하므로
-  // 로드마다 임의 토큰을 붙여 고유하게 만든다.
-  var omnirecId = Math.random().toString(36).slice(2, 8);
-  var omnirecSeq = 0;
 
-  // 최상위 프레임만 앱과 직접 통신한다. 서브프레임은 top 으로 postMessage 해서 중계한다.
+  // 최상위 프레임만 앱과 직접 통신한다(CDP 바인딩은 최상위 실행 컨텍스트에서만 보장된다).
+  // 서브프레임은 top 으로 postMessage 해서 중계한다.
   function omnirecSend(message) {
-    omnirecSeq += 1;
-    var framed = omnirecId + '-' + omnirecSeq + '|' + message;
-    try {
-      var previous = document.title;
-      document.title = '__omnirec__' + framed;
-      setTimeout(function () {
-        if (document.title.indexOf('__omnirec__') === 0) document.title = previous;
-      }, 30);
-    } catch (e) {}
-    try {
-      var frame = document.createElement('iframe');
-      frame.style.display = 'none';
-      frame.src = 'omnirec-popup:' + encodeURIComponent(framed);
-      (document.body || document.documentElement).appendChild(frame);
-      setTimeout(function () { frame.remove(); }, 200);
-    } catch (e) {}
+    try { window.__omnirecBridge && window.__omnirecBridge(message); } catch (e) {}
   }
 
   // 어느 프레임에서든 쓸 수 있는 보고 함수.
@@ -593,27 +573,7 @@ macro_rules! bridge_snippet {
       window.top.postMessage({ __omnirec: 'report', message: message }, '*');
     } catch (e) {}
   }
-"#
-    };
-}
 
-/// Typecast 메인 창에 주입되는 스크립트. **모든 프레임**에서 실행된다.
-///
-/// - `window.open` 오버라이드: 네이티브 팝업이 막히면 앱이 연 로그인 창을 가리키는
-///   프록시 window 객체를 돌려줘 사이트가 "팝업 차단"으로 오판하지 않게 한다.
-///   Typecast 는 `window.open("", "authPopup", ...)` 처럼 **빈 URL** 로 먼저 열고
-///   나중에 `popup.location.replace(authUrl)` 을 부르므로 location 프록시가 반드시 필요하다.
-/// - 자동화: 편집기 입력 · 재생 버튼 클릭 · 진단. 편집기가 iframe 이나 shadow DOM 안에
-///   있을 수 있으므로 모든 프레임에 주입하고 shadow root 까지 훑는다.
-/// - `__omnirecDeliverMessage(json)`: 로그인 창이 opener 로 보내려던 postMessage 를 재현한다.
-const MAIN_INIT_SCRIPT: &str = concat!(
-    r#"
-(function () {
-  if (window.__omnirecInjected) return;
-  window.__omnirecInjected = true;
-"#,
-    bridge_snippet!(),
-    r#"
   function toast(message, tone) {
     try {
       var prev = document.getElementById('__omnirec_toast');
@@ -633,88 +593,6 @@ const MAIN_INIT_SCRIPT: &str = concat!(
     } catch (e) {}
   }
   if (IS_TOP) window.__omnirecToast = toast;
-
-  // ── 차단된 소셜 로그인 팝업 대체 ────────────────────────────
-  var proxyPopup = null;
-
-  function makePopupProxy() {
-    var closed = false;
-    var currentHref = '';
-
-    function go(url) {
-      if (!url) return;
-      currentHref = String(url);
-      report('open:' + currentHref);
-    }
-
-    var location = {
-      replace: go,
-      assign: go,
-      reload: function () {},
-      toString: function () { return currentHref; }
-    };
-    try {
-      Object.defineProperty(location, 'href', {
-        get: function () { return currentHref; },
-        set: function (value) { go(value); }
-      });
-    } catch (e) {
-      location.href = '';
-    }
-
-    var proxy = {
-      name: 'authPopup',
-      opener: window,
-      location: location,
-      close: function () { closed = true; report('close'); },
-      focus: function () {},
-      blur: function () {},
-      postMessage: function () {},
-      addEventListener: function () {},
-      removeEventListener: function () {},
-      __omnirecMarkClosed: function () { closed = true; }
-    };
-    try {
-      Object.defineProperty(proxy, 'closed', { get: function () { return closed; } });
-    } catch (e) {
-      proxy.closed = false;
-    }
-    return proxy;
-  }
-
-  window.__omnirecPopupClosed = function () {
-    if (proxyPopup && proxyPopup.__omnirecMarkClosed) proxyPopup.__omnirecMarkClosed();
-  };
-
-  window.__omnirecDeliverMessage = function (raw) {
-    try {
-      var parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
-      window.dispatchEvent(new MessageEvent('message', {
-        data: parsed.data,
-        origin: parsed.origin,
-        source: proxyPopup || window
-      }));
-    } catch (e) {
-      toast('로그인 결과를 전달하지 못했습니다: ' + e, 'warn');
-    }
-  };
-
-  var nativeOpen = typeof window.open === 'function' ? window.open.bind(window) : null;
-
-  window.open = function (url, target, features) {
-    var opened = null;
-    try {
-      if (nativeOpen) opened = nativeOpen(url, target, features);
-    } catch (e) {
-      opened = null;
-    }
-    if (opened) return opened;
-
-    proxyPopup = makePopupProxy();
-    if (url) proxyPopup.location.replace(String(url));
-    toast('팝업이 차단되어 OmniRec 로그인 창으로 대신 엽니다.', 'warn');
-    return proxyPopup;
-  };
 
   // ── 페이지 자동화 ──────────────────────────────────────────
   var selectors = { editor: '', play: '' };
@@ -1392,95 +1270,11 @@ const MAIN_INIT_SCRIPT: &str = concat!(
     deepQueryAll('audio, video').forEach(hookMedia);
   }, 1500);
 })();
-"#
-);
-
-/// 앱이 대신 연 로그인 창에 주입되는 스크립트.
-/// 별도 창이라 진짜 `window.opener` 가 없으므로 스텁을 심어,
-/// 콜백 페이지의 `opener.postMessage(...)` 를 메인 창으로 중계한다.
-const POPUP_INIT_SCRIPT: &str = concat!(
-    r#"
-(function () {
-  if (window.__omnirecPopupInjected) return;
-  window.__omnirecPopupInjected = true;
-"#,
-    bridge_snippet!(),
-    r#"
-  if (window.opener) return; // 진짜 opener 가 있으면 손대지 않는다.
-
-  var openerStub = {
-    closed: false,
-    postMessage: function (data, targetOrigin) {
-      try {
-        omnirecSend('msg:' + JSON.stringify({ data: data, origin: window.location.origin }));
-      } catch (e) {
-        omnirecSend('log:opener.postMessage 직렬화 실패 ' + e);
-      }
-    },
-    focus: function () {},
-    close: function () {},
-    location: { href: '', replace: function () {}, assign: function () {} }
-  };
-
-  try {
-    Object.defineProperty(window, 'opener', {
-      configurable: true,
-      get: function () { return openerStub; },
-      set: function () {}
-    });
-  } catch (e) {
-    try { window.opener = openerStub; } catch (e2) {}
-  }
-})();
-"#
-);
-
-/// 브리지 메시지 일련번호를 기억해 중복 전달을 한 번만 처리한다.
-/// 두 채널(문서 제목 · 커스텀 스킴)이 같은 메시지를 보내기 때문에 필요하다.
-/// 처음 보는 번호면 `true`.
-fn seen_bridge_message(seq: &str) -> bool {
-    use std::collections::VecDeque;
-    use std::sync::{Mutex, OnceLock};
-
-    static RECENT: OnceLock<Mutex<VecDeque<String>>> = OnceLock::new();
-    let recent = RECENT.get_or_init(|| Mutex::new(VecDeque::with_capacity(64)));
-    let Ok(mut guard) = recent.lock() else {
-        return true;
-    };
-    if guard.iter().any(|s| s == seq) {
-        return false;
-    }
-    if guard.len() >= 64 {
-        guard.pop_front();
-    }
-    guard.push_back(seq.to_string());
-    true
-}
-
-/// `encodeURIComponent` 로 인코딩된 문자열을 되돌린다.
-fn percent_decode(input: &str) -> String {
-    let bytes = input.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            let hi = (bytes[i + 1] as char).to_digit(16);
-            let lo = (bytes[i + 2] as char).to_digit(16);
-            if let (Some(hi), Some(lo)) = (hi, lo) {
-                out.push((hi * 16 + lo) as u8);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
+"#;
 
 #[cfg(test)]
 mod tests {
-    use super::{percent_decode, TypecastController};
+    use super::TypecastController;
 
     #[test]
     fn sign_in_pages_are_not_treated_as_signed_in() {
@@ -1504,19 +1298,5 @@ mod tests {
         ] {
             assert!(TypecastController::looks_signed_in(url), "{url}");
         }
-    }
-
-    #[test]
-    fn decodes_encode_uri_component_output() {
-        assert_eq!(
-            percent_decode(
-                "https%3A%2F%2Faccounts.google.com%2Fo%2Foauth2%2Fv2%2Fauth%3Fscope%3Demail"
-            ),
-            "https://accounts.google.com/o/oauth2/v2/auth?scope=email"
-        );
-        // 인코딩되지 않은 문자열은 그대로 통과한다.
-        assert_eq!(percent_decode("https://typecast.ai/"), "https://typecast.ai/");
-        // 잘린 이스케이프는 원문 그대로 둔다.
-        assert_eq!(percent_decode("abc%2"), "abc%2");
     }
 }

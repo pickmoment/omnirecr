@@ -54,6 +54,8 @@ export interface Settings {
   subtitle_split_on_comma: boolean;
   typecast_editor_url: string;
   typecast_signin_url: string;
+  /** 비우면 OS별 기본 설치 위치를 자동 탐색한다. Typecast 는 실제 Chrome 을 별도 실행해 쓴다. */
+  custom_chrome_path?: string | null;
   /** 표시용 계정 이메일. 비밀번호는 저장하지 않으며 세션은 브라우저 쿠키로 유지된다. */
   typecast_account_email?: string | null;
   typecast_session_saved: boolean;
