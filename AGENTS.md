@@ -241,9 +241,19 @@ chromiumoxide 0.9.1 은 `Page.navigate` 요청에 `FrameNavigationRequest::new()
 `cargo test` 에는 안 돎). 이 머신에 설치된 실제 Chrome 을 띄우고, 프로덕션과 똑같은 순서로
 바인딩·초기화 스크립트를 등록한 뒤 `studio.typecast.ai/sign-in` 으로 이동해 실제
 `MAIN_INIT_SCRIPT` 가 주입됐는지, `__omnirecProbe()` → `step:probe:` 브리지 왕복이 되는지
-확인한다. 로그인이 필요한 그 다음 단계(대본 입력·재생)까지는 검증하지 않는다(계정 필요).
+확인한다. 로그인은 필요 없다.
 `cargo test --manifest-path src-tauri/Cargo.toml --lib tts::tests::real_chrome_cdp_round_trip -- --ignored --nocapture`
-로 수동 실행. Chrome 자동화 관련 코드를 고칠 때마다 이 테스트로 먼저 확인할 것.
+로 수동 실행.
+
+**로그인 포함 종단 테스트**: `tts::tests::real_login_and_prepare_flow` (`#[ignore]`). **프로덕션과
+같은 프로필**(`typecast_chrome_profile_dir`)을 그대로 써서 실제 대본 입력(`__omnirecPrepare`)과
+재생(`__omnirecPlay`) 까지 확인한다. 처음 뜬 Chrome 창에서 사용자가 직접 로그인한 뒤 테스트가
+떠 있는 터미널에서 Enter 를 눌러야 진행된다(URL 만으로는 로그인 여부를 정확히 판단할 수 없어
+URL 휴리스틱 대신 사람 확인을 기다린다 — `hub send` 로 표준입력에 아무 텍스트나 보내면 됨).
+같은 프로필을 재사용하므로 한 번 로그인해 두면 다음 실행부터는 바로 Enter 를 보내도 된다.
+`cargo test --manifest-path src-tauri/Cargo.toml --lib tts::tests::real_login_and_prepare_flow -- --ignored --nocapture`
+로 수동 실행. Chrome 자동화 관련 코드(특히 `MAIN_INIT_SCRIPT`, `doPrepare`, `doPlay`)를 고칠 때마다
+이 테스트로 먼저 확인할 것 — 이 문서의 Slate 관련 함정들은 전부 이 테스트로 실측한 것이다.
 
 #### 자동 일괄 녹음 파이프라인 (`TtsBatchRunner`)
 
@@ -305,7 +315,17 @@ DOM 구조가 평범한 `contenteditable` 이 아니라 아래처럼 생겼다. 
 2. **캐럿을 첫 텍스트 노드에 놓으면 안 된다.** 첫 텍스트 노드는 `contenteditable="false"` 인 화자 버튼 안에 있다. `collapseCaretToStart()` 는 첫 `[data-slate-string="true"]` 노드를 찾아 그 앞에 놓고, 없으면 편집 불가 서브트리를 걸러내는 TreeWalker 로 되돌아간다.
 3. **빈 줄은 빈 단락이 된다.** 소리 없는 단락과 화자 선택 UI만 늘어나므로 `cleanScript()` 로 미리 걷어낸다(프론트엔드 `scriptChunks.ts` 에도 같은 정리 로직이 있다).
 
-4. **`execCommand('selectAll')` 은 문단 하나만 선택할 수 있다.** 그 상태로 붙여넣으면 첫 문단만 새 대본으로 바뀌고 이전 대본의 나머지 문단이 그대로 남는다. `selectAllIn()` 은 첫 `[data-slate-string]` 텍스트 노드부터 마지막 노드까지 범위를 직접 만들고, `doPrepare()` 는 붙여넣기 **전에** `clearEditor()` 로 편집기를 완전히 비운다(최대 4회 반복, `execCommand('delete')` → 실패 시 `beforeinput/deleteContentBackward`).
+4. **`execCommand('selectAll')` 은 문단 하나만 선택할 수 있다.** 그 상태로 붙여넣으면 첫 문단만 새 대본으로 바뀌고 이전 대본의 나머지 문단이 그대로 남는다. `selectAllIn()` 은 첫 `[data-slate-string]` 텍스트 노드부터 마지막 노드까지 범위를 직접 만들고, `doPrepare()` 는 붙여넣기 **전에** `clearEditor()` 로 편집기를 완전히 비운다(최대 4회 반복).
+5. **`execCommand('delete')` 로 지우지 말 것 — Slate 의 "문단 최소 1개" 불변식이 깨진다.** 실측: 전체 선택 후 `execCommand('delete')` 를 반복하면 문단이 화자 선택 버튼까지 통째로 사라져 `[data-slate-node="element"]` 가 0개가 되는 경우가 있었다. 이 상태가 되면 Slate 가 이 DOM 과 완전히 어긋나 이후 어떤 `execCommand`(`insertText` 포함)로도 복구되지 않고 — 붙여넣기가 조용히 사라진다("입력 확인 실패"). `execCommand` 는 Slate 의 `onKeyDown` 컨트롤을 거치지 않고 DOM 을 직접 바꾸기 때문이다. `clearEditor()` 는 대신 진짜 `KeyboardEvent('keydown', { key: 'Backspace', ... })` 를 보낸다 — Slate 가 이 키를 자기 핸들러에서 가로채 자신의 delete 트랜잭션으로 처리하므로 불변식이 유지된다. **`execCommand` 기반 삭제/삽입으로 되돌리지 말 것.**
+
+**Typecast 는 프로젝트 기반이다 — `typecast_editor_url` 이 에디터가 아니라 프로젝트 목록으로 갈 수 있다.**
+실측(2026-08): 기본 URL(`studio.typecast.ai/text-to-speech`)이 에디터가 아니라 "새 프로젝트 / 대본
+가져오기 / 새 폴더" 가 있는 프로젝트 목록 화면으로 감. `findEditor()`/`findPlayButton()` 이 못 찾으면
+(즉 `editor`/`button` 이 `null`) `doPrepare()`/`doPlay()` 가 `enterFirstProjectAndRetry()` 를 호출해
+목록의 **첫 번째(가장 최근) 프로젝트** 링크(`a[href*="/text-to-speech/"]`)를 클릭하고 2초 뒤 **한 번만**
+재시도한다. **새 프로젝트를 만들지 않는다** — 사용자가 이미 갖고 있는 프로젝트를 그대로 쓴다(재시도
+횟수를 `attempt < 1` 로 제한해 무한 재귀도 막는다). 이 로직을 지울 때는 목록 화면 자체가 없어졌는지
+먼저 확인할 것 — 사이트가 다시 개편되면 이 부분이 가장 먼저 깨진다.
 
 입력 검증은 "앞 40자가 들어갔는가"에 더해 **글자 수가 기대보다 20자 넘게 많으면 이전 대본이 남은 것으로 보고 실패 처리**한다. 이 잔여물 버그는 조용히 지나가면 엉뚱한 낭독이 녹음되므로 반드시 걸러야 한다.
 

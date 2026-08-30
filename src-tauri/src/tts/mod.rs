@@ -946,7 +946,15 @@ const MAIN_INIT_SCRIPT: &str = r#"
         range.setStart(start, 0);
         range.setEnd(end, end.nodeType === 3 ? end.length : end.childNodes.length);
       } else {
-        range.selectNodeContents(el);
+        // 텍스트 노드가 하나도 없는 완전히 빈 문단이면 el 전체 대신 편집 가능한
+        // <p> 안쪽만 선택한다. el 전체를 선택하면 화자 선택 버튼(contenteditable="false")
+        // 까지 선택 범위에 들어가, 그 상태로 붙여넣으면 Slate 가 문단 자체를(화자 버튼까지)
+        // 지워버려 문단이 0개가 되고 이후 붙여넣기가 들어갈 자리가 없어지는 문제가 있었다.
+        var editableParagraphs = el.querySelectorAll('p');
+        var target = editableParagraphs.length
+          ? editableParagraphs[editableParagraphs.length - 1]
+          : el;
+        range.selectNodeContents(target);
       }
       selection.removeAllRanges();
       selection.addRange(range);
@@ -963,7 +971,16 @@ const MAIN_INIT_SCRIPT: &str = r#"
     return normalize(readEditor(el)).length === 0;
   }
 
-  /** 편집기를 완전히 비운다. Slate 는 한 번의 delete 로 다 지워지지 않을 수 있어 반복한다. */
+  /**
+   * 편집기를 완전히 비운다.
+   *
+   * execCommand('delete') 는 Slate 의 컨트롤을 거치지 않고 DOM 을 직접 바꾼다. 그 결과
+   * Slate 가 항상 유지해야 할 불변식("문단이 최소 1개는 있어야 한다")이 깨져 문단이
+   * 통째로(화자 선택 버튼까지) 사라지는 경우가 실측으로 확인됐다 — 이 상태가 되면
+   * Slate 가 이 편집기 DOM 과 완전히 어긋나 이후 어떤 execCommand 로도 복구되지 않는다.
+   * 대신 진짜 Backspace keydown 이벤트를 보낸다 — Slate 는 이 키를 자기 onKeyDown 에서
+   * 가로채 자신의 delete 트랜잭션으로 처리하므로 불변식이 깨지지 않는다.
+   */
   function clearEditor(el, attempt, done) {
     attempt = attempt || 0;
     if (editorIsEmpty(el)) {
@@ -975,19 +992,35 @@ const MAIN_INIT_SCRIPT: &str = r#"
       return;
     }
     selectAllIn(el);
-    var deleted = false;
-    try { deleted = document.execCommand('delete'); } catch (e) {}
-    if (!deleted) {
-      // Slate 는 beforeinput 으로도 삭제를 처리한다.
-      try {
-        el.dispatchEvent(new InputEvent('beforeinput', {
-          inputType: 'deleteContentBackward',
-          bubbles: true,
-          cancelable: true
-        }));
-      } catch (e) {}
-    }
+    try {
+      el.dispatchEvent(new KeyboardEvent('keydown', {
+        key: 'Backspace',
+        code: 'Backspace',
+        keyCode: 8,
+        which: 8,
+        bubbles: true,
+        cancelable: true
+      }));
+    } catch (e) {}
     setTimeout(function () { clearEditor(el, attempt + 1, done); }, 150);
+  }
+
+  /**
+   * execCommand('delete') 는 Slate 의 컨트롤을 거치지 않고 DOM 을 직접 바꾼다.
+   * 그 결과 Slate 가 항상 유지해야 할 불변식("문단이 최소 1개는 있어야 한다")이
+   * 깨져 문단이 통째로(화자 선택 버튼까지) 사라지는 경우가 실측으로 확인됐다 —
+   * 이 상태에서는 붙여넣기가 들어갈 자리가 없어 입력이 조용히 사라진다.
+   * execCommand('insertText') 로 진짜 문자 입력 하나를 흘려보내면 Slate 의
+   * onChange/정규화 파이프라인이 정상적으로 돌아 문단을 스스로 복구한다.
+   */
+  function repairEmptyEditor(el, done) {
+    if (el.querySelectorAll('[data-slate-node="element"]').length > 0) {
+      done();
+      return;
+    }
+    el.focus();
+    try { document.execCommand('insertText', false, ' '); } catch (e) {}
+    setTimeout(done, 150);
   }
 
   /** 대본을 편집기에 넣고, 어떤 방식이 통했는지 돌려준다. */
@@ -1073,10 +1106,30 @@ const MAIN_INIT_SCRIPT: &str = r#"
     }
   }
 
+  // Typecast 가 프로젝트 기반으로 바뀌어, typecast_editor_url 이 이제 에디터가 아니라
+  // 프로젝트 목록 화면으로 갈 수 있다. 에디터를 못 찾았을 때 목록의 첫 번째(가장 최근)
+  // 프로젝트로 들어가 한 번만 다시 시도한다. 새 프로젝트를 만들지 않는다 — 사용자가
+  // 이미 갖고 있는 프로젝트를 그대로 쓴다.
+  function enterFirstProjectAndRetry(retry) {
+    var links = deepQueryAll('a[href*="/text-to-speech/"]');
+    if (!links.length) return false;
+    report('step:entering-project:' + (links[0].getAttribute('href') || ''));
+    clickLikeUser(links[0]);
+    setTimeout(retry, 2000);
+    return true;
+  }
+
   // 이 프레임에서 실제 작업을 수행한다. 대상이 없으면 조용히 false 를 돌려준다.
-  function doPrepare(rawText) {
+  function doPrepare(rawText, attempt) {
+    attempt = attempt || 0;
     var editor = findEditor();
-    if (!editor) return false;
+    if (!editor) {
+      if (attempt < 1 && enterFirstProjectAndRetry(function () { doPrepare(rawText, attempt + 1); })) {
+        return true;
+      }
+      return false;
+    }
+
     // 빈 줄을 걷어내 빈 단락이 생기지 않게 한다.
     var text = cleanScript(rawText);
     editor.focus();
@@ -1084,55 +1137,63 @@ const MAIN_INIT_SCRIPT: &str = r#"
     // 이전 대본을 먼저 완전히 비운다. 비우지 않고 붙여넣으면 Slate 가
     // 커서가 놓인 문단만 교체해 이전 대본의 나머지 문단이 남는다.
     clearEditor(editor, 0, function (cleared) {
-      var method;
-      try {
-        method = fillEditor(editor, text);
-      } catch (e) {
-        report('step:prepare-failed:입력 중 오류 ' + e);
-        return;
-      }
-
-      setTimeout(function () {
-        var actual = normalize(readEditor(editor));
-        var expected = normalize(text);
-        var head = expected.slice(0, 40);
-        var paragraphs = editor.querySelectorAll('[data-slate-node="element"]').length;
-        // 처음부터 낭독되도록 선택 해제 + 캐럿을 맨 앞으로 옮긴다.
-        var caret = collapseCaretToStart(editor);
-
-        var details =
-          ' · ' + describe(editor) +
-          ' · ' + method +
-          (cleared ? '' : ' · 비우기실패') +
-          (caret ? ' · 캐럿맨앞' : ' · 캐럿이동실패');
-
-        if (actual.indexOf(head) < 0) {
-          report('step:prepare-failed:입력 확인 실패' + details);
+      repairEmptyEditor(editor, function () {
+        var method;
+        try {
+          method = fillEditor(editor, text);
+        } catch (e) {
+          report('step:prepare-failed:입력 중 오류 ' + e);
           return;
         }
-        // 이전 대본이 남아 있으면 글자 수가 눈에 띄게 많아진다.
-        if (actual.length > expected.length + 20) {
+
+        setTimeout(function () {
+          var actual = normalize(readEditor(editor));
+          var expected = normalize(text);
+          var head = expected.slice(0, 40);
+          var paragraphs = editor.querySelectorAll('[data-slate-node="element"]').length;
+          // 처음부터 낭독되도록 선택 해제 + 캐럿을 맨 앞으로 옮긴다.
+          var caret = collapseCaretToStart(editor);
+
+          var details =
+            ' · ' + describe(editor) +
+            ' · ' + method +
+            (cleared ? '' : ' · 비우기실패') +
+            (caret ? ' · 캐럿맨앞' : ' · 캐럿이동실패');
+
+          if (actual.indexOf(head) < 0) {
+            report('step:prepare-failed:입력 확인 실패' + details);
+            return;
+          }
+          // 이전 대본이 남아 있으면 글자 수가 눈에 띄게 많아진다.
+          if (actual.length > expected.length + 20) {
+            report(
+              'step:prepare-failed:이전 대본이 남아 있습니다 (기대 ' + expected.length +
+              '자 / 실제 ' + actual.length + '자)' + details
+            );
+            return;
+          }
+
           report(
-            'step:prepare-failed:이전 대본이 남아 있습니다 (기대 ' + expected.length +
-            '자 / 실제 ' + actual.length + '자)' + details
+            'step:prepared:' + actual.length + '자' +
+            (paragraphs ? ' · ' + paragraphs + '단락' : '') + details
           );
-          return;
-        }
-
-        report(
-          'step:prepared:' + actual.length + '자' +
-          (paragraphs ? ' · ' + paragraphs + '단락' : '') + details
-        );
-      }, 500);
+        }, 500);
+      });
     });
 
     return true;
   }
 
-  function doPlay() {
+  function doPlay(attempt) {
+    attempt = attempt || 0;
     intentionalStop = false;
     var button = findPlayButton();
-    if (!button) return false;
+    if (!button) {
+      if (attempt < 1 && enterFirstProjectAndRetry(function () { doPlay(attempt + 1); })) {
+        return true;
+      }
+      return false;
+    }
     var source = playSource;
     // 입력 후 재생까지 사이에 커서가 움직였을 수 있으므로 직전에 다시 맨 앞으로 보낸다.
     var caret = collapseCaretToStart(findEditor());
@@ -1443,5 +1504,197 @@ mod tests {
         let _ = browser.wait().await;
         handler_task.abort();
         let _ = std::fs::remove_dir_all(&profile_dir);
+    }
+
+    /// 실제 로그인까지 포함한 수동 종단 테스트. 사용자가 뜬 Chrome 창에서 직접 로그인하는
+    /// 동안 URL을 폴링하다가, 로그인이 확인되면 실제 대본 입력 → 재생까지 실행한다.
+    ///
+    /// **실제 프로덕션 프로필**(`SettingsManager::typecast_chrome_profile_dir`)을 그대로
+    /// 쓴다 — 여기서 로그인하면 앱을 실행했을 때도 같은 세션으로 이어진다.
+    ///
+    /// 수동 실행: `cargo test --manifest-path src-tauri/Cargo.toml --lib tts::tests::real_login_and_prepare_flow -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn real_login_and_prepare_flow() {
+        use crate::settings::SettingsManager;
+        use chromiumoxide::browser::{Browser, BrowserConfig};
+        use chromiumoxide::cdp::js_protocol::runtime::{AddBindingParams, EventBindingCalled};
+        use futures::StreamExt;
+
+        let chrome_path =
+            SettingsManager::find_chrome(None).expect("Chrome executable should be discoverable");
+        let profile_dir = SettingsManager::typecast_chrome_profile_dir();
+        println!("using chrome executable: {}", chrome_path.display());
+        println!("using profile dir: {}", profile_dir.display());
+
+        let config = BrowserConfig::builder()
+            .chrome_executable(&chrome_path)
+            .user_data_dir(&profile_dir)
+            .with_head()
+            .window_size(1180, 840)
+            .arg("--autoplay-policy=no-user-gesture-required")
+            .build()
+            .expect("browser config should build");
+
+        let (mut browser, mut handler) =
+            Browser::launch(config).await.expect("Chrome should launch");
+
+        let handler_task = tokio::spawn(async move {
+            while let Some(event) = handler.next().await {
+                if event.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let page = browser
+            .new_page("about:blank")
+            .await
+            .expect("should create a page");
+
+        page.execute(AddBindingParams::new(BRIDGE_BINDING_NAME))
+            .await
+            .expect("binding should register");
+        page.evaluate_on_new_document(MAIN_INIT_SCRIPT)
+            .await
+            .expect("init script should register");
+
+        let mut binding_events = page
+            .event_listener::<EventBindingCalled>()
+            .await
+            .expect("should subscribe to binding events");
+
+        TypecastController::navigate_and_wait(
+            &page,
+            "https://studio.typecast.ai/text-to-speech",
+            std::time::Duration::from_secs(45),
+        )
+        .await
+        .expect("navigation should complete");
+
+        println!("======================================================");
+        println!("Chrome 창에서 로그인을 완료한 뒤 이 터미널에서 Enter 를 누르세요.");
+        println!("(URL 만으로는 로그인 여부를 정확히 알 수 없어 직접 확인을 기다립니다.)");
+        println!("최대 10분 기다립니다.");
+        println!("======================================================");
+
+        let wait_for_enter = tokio::task::spawn_blocking(|| {
+            let mut line = String::new();
+            let _ = std::io::stdin().read_line(&mut line);
+        });
+
+        let signed_in = tokio::select! {
+            _ = wait_for_enter => {
+                println!("입력을 받았습니다. 대본 입력을 시도합니다.");
+                true
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_secs(600)) => {
+                println!("10분 안에 확인을 받지 못했습니다. 대본 입력/재생 테스트는 건너뜁니다.");
+                false
+            }
+        };
+
+        let url = page.url().await.ok().flatten().unwrap_or_default();
+        println!("현재 URL: {}", url);
+
+        if signed_in {
+            println!("앱이 완전히 렌더링될 시간을 5초 더 준다...");
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+            println!("진단(probe)을 먼저 실행합니다.");
+            page.evaluate("window.__omnirecProbe && window.__omnirecProbe();")
+                .await
+                .expect("probe evaluate should succeed");
+            for _ in 0..4 {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    binding_events.next(),
+                )
+                .await
+                {
+                    Ok(Some(event)) => println!("probe: {}", event.payload),
+                    Ok(None) => break,
+                    Err(_) => break,
+                }
+            }
+            let sample_text = "안녕하세요. 이것은 OmniRec 자동화 테스트 대본입니다.";
+            let payload = serde_json::to_string(sample_text).expect("json encode should succeed");
+            page.evaluate(format!(
+                "window.__omnirecPrepare && window.__omnirecPrepare({});",
+                payload
+            ))
+            .await
+            .expect("prepare evaluate should succeed");
+
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+            loop {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    println!("prepare: 시간 안에 최종 결과가 오지 않았습니다");
+                    break;
+                }
+                match tokio::time::timeout(remaining, binding_events.next()).await {
+                    Ok(Some(event)) => {
+                        println!("prepare 진행: {}", event.payload);
+                        if event.payload.starts_with("step:prepared")
+                            || event.payload.starts_with("step:prepare-failed")
+                        {
+                            break;
+                        }
+                    }
+                    Ok(None) => {
+                        println!("prepare: 브리지 스트림이 끊겼습니다");
+                        break;
+                    }
+                    Err(_) => {
+                        println!("prepare: 시간 안에 최종 결과가 오지 않았습니다");
+                        break;
+                    }
+                }
+            }
+
+            println!("재생을 시도합니다.");
+            page.evaluate("window.__omnirecPlay && window.__omnirecPlay();")
+                .await
+                .expect("play evaluate should succeed");
+
+            let play_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+            loop {
+                let remaining = play_deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    println!("play: 시간 안에 최종 결과가 오지 않았습니다");
+                    break;
+                }
+                match tokio::time::timeout(remaining, binding_events.next()).await {
+                    Ok(Some(event)) => {
+                        println!("play 진행: {}", event.payload);
+                        if event.payload.starts_with("step:playing")
+                            || event.payload.starts_with("step:play-failed")
+                        {
+                            break;
+                        }
+                    }
+                    Ok(None) => {
+                        println!("play: 브리지 스트림이 끊겼습니다");
+                        break;
+                    }
+                    Err(_) => {
+                        println!("play: 시간 안에 최종 결과가 오지 않았습니다");
+                        break;
+                    }
+                }
+            }
+
+            // 낭독을 몇 초 들어볼 시간을 준다.
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            page.evaluate("window.__omnirecStopPlayback && window.__omnirecStopPlayback();")
+                .await
+                .ok();
+        }
+
+        println!("테스트 종료, 브라우저를 정리합니다.");
+        let _ = browser.close().await;
+        let _ = browser.wait().await;
+        handler_task.abort();
     }
 }
