@@ -217,15 +217,38 @@ export const App: React.FC = () => {
     }
   };
 
-  /** 녹음을 시작하고 저장될 파일 경로를 반환한다. 실패 시 null. */
+  /**
+   * 녹음을 시작하고 저장될 파일 경로를 반환한다. 실패 또는 사용자가 덮어쓰기를
+   * 취소하면 null.
+   *
+   * `exactFileName` 요청(대본 & TTS 녹음)은 시작 전에 같은 이름의 파일이 이미
+   * 있는지 확인해 덮어쓰기 확인을 받는다. 실제 저장 경로 계산은 Rust 쪽
+   * `AudioRecorderSession::resolve_output_path` 하나로 모아 어긋나지 않게 한다.
+   */
   const handleStartAudioRecord = async (
     options?: StartTtsRecordOptions,
   ): Promise<string | null> => {
+    const mergedSettings = { ...settings, ...(options?.settingsOverride ?? {}) };
     try {
+      if (options?.exactFileName && options.fileNamePrefix) {
+        const existingPath = await invoke<string | null>('check_script_recording_exists', {
+          settings: mergedSettings,
+          fileNamePrefix: options.fileNamePrefix,
+        });
+        if (
+          existingPath &&
+          !window.confirm(
+            `이미 같은 이름으로 저장된 파일이 있습니다:\n${existingPath}\n\n덮어쓸까요?`,
+          )
+        ) {
+          return null;
+        }
+      }
       const outputPath = await invoke<string>('start_audio_record', {
-        settings: { ...settings, ...(options?.settingsOverride ?? {}) },
+        settings: mergedSettings,
         fileNamePrefix: options?.fileNamePrefix ?? null,
         showMiniController: options?.showMiniController ?? false,
+        exactFileName: options?.exactFileName ?? false,
       });
       setRecordingStatus((prev) => ({
         ...prev,

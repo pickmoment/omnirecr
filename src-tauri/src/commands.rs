@@ -94,8 +94,11 @@ pub fn start_audio_record(
     settings: Settings,
     file_name_prefix: Option<String>,
     show_mini_controller: Option<bool>,
+    exact_file_name: Option<bool>,
 ) -> Result<String, String> {
-    let result = state.recorder.start_audio(&settings, file_name_prefix);
+    let result = state
+        .recorder
+        .start_audio(&settings, file_name_prefix, exact_file_name.unwrap_or(false));
 
     // TTS 낭독 녹음처럼 다른 창(Typecast)에서 작업하는 동안에는
     // 항상 위에 뜨는 미니 컨트롤러로 정지/일시정지를 할 수 있게 한다.
@@ -114,6 +117,27 @@ pub fn start_audio_record(
     }
 
     result
+}
+
+/// 대본 & TTS 녹음이 실제로 저장할 경로를 미리 계산해, 같은 이름의 파일이 이미
+/// 있는지 확인한다. 있으면 그 경로를 반환해 프론트가 덮어쓰기 확인을 띄우게 한다.
+/// 녹음을 시작하지 않는 순수 조회이며, 실제 저장 경로 계산 로직은 `start_audio_record`
+/// 와 `AudioRecorderSession::resolve_output_path` 를 공유해 어긋나지 않는다.
+#[tauri::command]
+pub fn check_script_recording_exists(
+    settings: Settings,
+    file_name_prefix: String,
+) -> Result<Option<String>, String> {
+    let path = crate::recorder::audio::AudioRecorderSession::resolve_output_path(
+        &settings,
+        Some(&file_name_prefix),
+        true,
+    );
+    if path.exists() {
+        Ok(Some(path.to_string_lossy().to_string()))
+    } else {
+        Ok(None)
+    }
 }
 
 #[tauri::command]

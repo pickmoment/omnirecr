@@ -62,6 +62,7 @@ pub fn run() {
             commands::run_macos_shortcut,
             commands::start_screen_record,
             commands::start_audio_record,
+            commands::check_script_recording_exists,
             commands::pause_record,
             commands::resume_record,
             commands::toggle_pause_record,

@@ -57,7 +57,8 @@
 
 ### 2. Recording Management
 - `start_screen_record(settings: Settings, region: Option<RectRegion>)` ➔ `Result<String, String>`
-- `start_audio_record(settings: Settings)` ➔ `Result<String, String>`
+- `start_audio_record(settings: Settings, file_name_prefix: Option<String>, show_mini_controller: Option<bool>, exact_file_name: Option<bool>)` ➔ `Result<String, String>` (`exact_file_name: true` 는 타임스탬프 없이 `file_name_prefix` 그대로를 파일명으로 쓴다 — 대본 & TTS 녹음 전용)
+- `check_script_recording_exists(settings: Settings, file_name_prefix: String)` ➔ `Result<Option<String>, String>` (대본 & TTS 녹음이 저장할 정확한 경로에 이미 파일이 있으면 그 경로를 반환 — 덮어쓰기 확인용)
 - `pause_record()` ➔ `Result<(), String>`
 - `resume_record()` ➔ `Result<(), String>`
 - `toggle_pause_record()` ➔ `Result<(), String>`

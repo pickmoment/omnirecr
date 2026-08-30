@@ -328,6 +328,7 @@ export const TtsBatchRunner: React.FC<TtsBatchRunnerProps> = ({
       const outputPath = await onStartRecord({
         fileNamePrefix: script.title,
         showMiniController: false,
+        exactFileName: true,
         settingsOverride: {
           system_audio_enabled: true,
           // Typecast 창은 OmniRec 안의 웹뷰라, 이 값을 켜지 않으면

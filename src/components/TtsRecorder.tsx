@@ -25,6 +25,8 @@ export interface StartTtsRecordOptions {
   fileNamePrefix?: string;
   settingsOverride?: Partial<Settings>;
   showMiniController?: boolean;
+  /** true 면 타임스탬프 없이 fileNamePrefix 그대로를 파일명으로 쓴다(대본 & TTS 녹음 전용). */
+  exactFileName?: boolean;
 }
 
 interface TtsRecorderProps {
@@ -202,6 +204,7 @@ export const TtsRecorder: React.FC<TtsRecorderProps> = ({
       const outputPath = await onStartRecord({
         fileNamePrefix: selectedScript.title,
         showMiniController: true,
+        exactFileName: true,
         settingsOverride: {
           system_audio_enabled: true,
           // Typecast 창은 앱 내부 웹뷰이므로 자기 앱 소리를 포함해야 녹음된다.

@@ -91,6 +91,7 @@ impl RecorderController {
         &self,
         settings: &Settings,
         file_name_prefix: Option<String>,
+        exact_name: bool,
     ) -> Result<String, String> {
         let mut session_guard = self.session.lock();
         if session_guard.is_some() {
@@ -98,7 +99,8 @@ impl RecorderController {
         }
 
         let (tx, rx): (Sender<AudioEngineEvent>, Receiver<AudioEngineEvent>) = channel();
-        let session = AudioRecorderSession::start(settings, tx, file_name_prefix.as_deref())?;
+        let session =
+            AudioRecorderSession::start(settings, tx, file_name_prefix.as_deref(), exact_name)?;
         let path = session.output_path.clone();
 
         *session_guard = Some(ActiveSession::Audio(session));

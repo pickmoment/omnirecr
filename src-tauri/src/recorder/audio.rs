@@ -40,10 +40,50 @@ impl AudioRecorderSession {
         }
     }
 
+    /// 실제로 녹음을 시작하지 않고 저장될 경로만 계산한다. `start()` 와 파일명 규칙을
+    /// 공유해, 사전 존재 여부 확인(`check_script_recording_exists`)이 실제 저장 경로와
+    /// 어긋나지 않게 한다.
+    ///
+    /// `exact_name` 이 true 면 타임스탬프를 붙이지 않고 접두어 그대로를 파일명으로 쓴다.
+    /// 대본 & TTS 녹음은 대본 제목과 동일한 파일명을 유지해야 다음에 다시 녹음할 때도
+    /// 같은 파일을 가리킬 수 있다(덮어쓰기 확인의 전제 조건이기도 하다).
+    pub fn resolve_output_path(
+        settings: &Settings,
+        file_name_prefix: Option<&str>,
+        exact_name: bool,
+    ) -> PathBuf {
+        let ext = match settings.audio_format.to_lowercase().as_str() {
+            "mp3" => "mp3",
+            "wav" => "wav",
+            "m4a" => "m4a",
+            _ => "m4a",
+        };
+
+        let prefix = file_name_prefix
+            .and_then(Self::sanitize_prefix)
+            .unwrap_or_else(|| "Audio_Record".to_string());
+
+        let filename = if exact_name {
+            format!("{}.{}", prefix, ext)
+        } else {
+            let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
+            format!("{}_{}.{}", prefix, timestamp, ext)
+        };
+
+        let output_dir = if settings.output_dir.trim().is_empty() {
+            dirs::audio_dir().or_else(|| dirs::video_dir()).unwrap_or_else(|| PathBuf::from("."))
+        } else {
+            PathBuf::from(&settings.output_dir)
+        };
+
+        output_dir.join(filename)
+    }
+
     pub fn start(
         settings: &Settings,
         event_sender: Sender<AudioEngineEvent>,
         file_name_prefix: Option<&str>,
+        exact_name: bool,
     ) -> Result<Self, String> {
         let ffmpeg_path = SettingsManager::find_ffmpeg(settings.custom_ffmpeg_path.as_deref())?;
 
@@ -54,18 +94,10 @@ impl AudioRecorderSession {
             _ => "m4a",
         };
 
-        let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
-        let prefix = file_name_prefix
-            .and_then(Self::sanitize_prefix)
-            .unwrap_or_else(|| "Audio_Record".to_string());
-        let filename = format!("{}_{}.{}", prefix, timestamp, ext);
-        let output_dir = if settings.output_dir.trim().is_empty() {
-            dirs::audio_dir().or_else(|| dirs::video_dir()).unwrap_or_else(|| PathBuf::from("."))
-        } else {
-            PathBuf::from(&settings.output_dir)
-        };
-        let _ = std::fs::create_dir_all(&output_dir);
-        let output_path = output_dir.join(filename);
+        let output_path = Self::resolve_output_path(settings, file_name_prefix, exact_name);
+        if let Some(output_dir) = output_path.parent() {
+            let _ = std::fs::create_dir_all(output_dir);
+        }
 
         let mut cmd = Command::new(&ffmpeg_path);
 
