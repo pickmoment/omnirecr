@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::sync::Arc;
 use tauri::{AppHandle, Manager, PhysicalPosition, Position, Size, State};
 
@@ -439,44 +440,75 @@ pub fn attach_script_recording(id: String, recorded_path: String) -> Result<Scri
 // Typecast TTS 브라우저
 // ─────────────────────────────────────────────────────────────
 
+/// chromiumoxide 의 CDP 요청/응답 채널이 (드물지만) 응답을 못 받고 영원히 기다리는
+/// 경우가 실측으로 확인됐다 — Chrome 창이 죽거나, 실행 컨텍스트가 사라지는 등.
+/// 이 await 가 무한정 걸리면 `TtsBatchRunner` 의 for-loop 전체가 멈춰서, 그 스크립트의
+/// `onStopRecord()`/저장 처리까지 실행되지 못한 채 배치 전체가 정지해 버린다(실제 증상:
+/// 대본 3개 중 마지막에서 멈추고 녹음 종료 처리도 안 됨). 시간 제한을 걸어 반드시
+/// `Result` 로 돌아가게 해, 프론트엔드의 기존 실패 처리(건너뛰기/중단 선택)가 정상 동작하게 한다.
+async fn with_typecast_timeout<T>(
+    op: &str,
+    seconds: u64,
+    fut: impl Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    match tokio::time::timeout(std::time::Duration::from_secs(seconds), fut).await {
+        Ok(result) => result,
+        Err(_) => Err(format!(
+            "Typecast 응답이 {}초 안에 오지 않았습니다({}). Chrome 창이 응답하지 않는 것 같습니다.",
+            seconds, op
+        )),
+    }
+}
+
 #[tauri::command]
 pub async fn open_typecast_browser(app: AppHandle, url: Option<String>) -> Result<(), String> {
-    TypecastController::open(&app, url).await
+    with_typecast_timeout("열기", 60, TypecastController::open(&app, url)).await
 }
 
 #[tauri::command]
 pub async fn close_typecast_browser(app: AppHandle) -> Result<(), String> {
-    TypecastController::close(&app).await
+    with_typecast_timeout("닫기", 30, TypecastController::close(&app)).await
 }
 
 #[tauri::command]
 pub async fn focus_typecast_browser(app: AppHandle) -> Result<(), String> {
-    TypecastController::focus(&app).await
+    with_typecast_timeout("포커스", 20, TypecastController::focus(&app)).await
 }
 
 #[tauri::command]
 pub async fn navigate_typecast_browser(app: AppHandle, url: String) -> Result<(), String> {
-    TypecastController::navigate(&app, url).await
+    with_typecast_timeout("이동", 60, TypecastController::navigate(&app, url)).await
 }
 
 #[tauri::command]
 pub async fn typecast_go_back(app: AppHandle) -> Result<(), String> {
-    TypecastController::go_back(&app).await
+    with_typecast_timeout("뒤로 가기", 20, TypecastController::go_back(&app)).await
 }
 
 #[tauri::command]
 pub async fn typecast_reload(app: AppHandle) -> Result<(), String> {
-    TypecastController::reload(&app).await
+    with_typecast_timeout("새로고침", 30, TypecastController::reload(&app)).await
 }
 
 #[tauri::command]
 pub async fn clear_typecast_session(app: AppHandle) -> Result<(), String> {
-    TypecastController::clear_session(&app).await
+    with_typecast_timeout("세션 초기화", 60, TypecastController::clear_session(&app)).await
 }
 
 #[tauri::command]
 pub async fn get_typecast_browser_state(app: AppHandle) -> TypecastBrowserState {
-    TypecastController::state(&app).await
+    match tokio::time::timeout(std::time::Duration::from_secs(20), TypecastController::state(&app))
+        .await
+    {
+        Ok(state) => state,
+        Err(_) => TypecastBrowserState {
+            is_open: false,
+            looks_signed_in: false,
+            current_url: None,
+            account_email: None,
+            last_login_at: None,
+        },
+    }
 }
 
 /// 로그인 완료를 기록한다. 비밀번호는 저장하지 않고,
@@ -503,7 +535,7 @@ pub fn copy_text_to_clipboard(text: String) -> Result<(), String> {
 /// Typecast 페이지 위에 안내 배너를 띄운다(카운트다운 / 녹음 시작 알림).
 #[tauri::command]
 pub async fn notify_typecast(app: AppHandle, message: String, tone: Option<String>) -> Result<(), String> {
-    TypecastController::notify(&app, message, tone).await
+    with_typecast_timeout("알림 표시", 20, TypecastController::notify(&app, message, tone)).await
 }
 
 // ── Typecast 페이지 자동화 ──────────────────────────────────
@@ -511,23 +543,23 @@ pub async fn notify_typecast(app: AppHandle, message: String, tone: Option<Strin
 /// 대본을 편집기에 주입한다. 결과는 `typecast_step` 이벤트로 보고된다.
 #[tauri::command]
 pub async fn typecast_prepare_script(app: AppHandle, text: String) -> Result<(), String> {
-    TypecastController::prepare_script(&app, text).await
+    with_typecast_timeout("대본 입력", 20, TypecastController::prepare_script(&app, text)).await
 }
 
 #[tauri::command]
 pub async fn typecast_play(app: AppHandle) -> Result<(), String> {
-    TypecastController::play(&app).await
+    with_typecast_timeout("재생", 20, TypecastController::play(&app)).await
 }
 
 #[tauri::command]
 pub async fn typecast_stop_playback(app: AppHandle) -> Result<(), String> {
-    TypecastController::stop_playback(&app).await
+    with_typecast_timeout("재생 정지", 20, TypecastController::stop_playback(&app)).await
 }
 
 /// 편집기 / 재생 버튼을 어떻게 찾았는지 진단 보고를 요청한다.
 #[tauri::command]
 pub async fn typecast_probe(app: AppHandle) -> Result<(), String> {
-    TypecastController::probe(&app).await
+    with_typecast_timeout("진단", 20, TypecastController::probe(&app)).await
 }
 
 /// Chrome 실행 파일을 찾을 수 있는지 확인한다(설정 화면 "테스트" 버튼용).
