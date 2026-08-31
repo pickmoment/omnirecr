@@ -49,7 +49,7 @@ const BRIDGE_BINDING_NAME: &str = "__omnirecBridge";
 
 /// 세션이 살아 있는지 확인하는 CDP 왕복의 제한 시간.
 /// 죽은 브라우저는 응답이 아예 오지 않으므로 "안 오면 죽은 것"으로 판정한다.
-const LIVENESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const LIVENESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 
 /// 브라우저 종료(close + wait)에 허용하는 시간.
 const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -409,9 +409,38 @@ impl TypecastController {
             .spawn();
     }
 
-    #[cfg(not(target_os = "macos"))]
-    fn activate_chrome_app() {}
+    #[cfg(target_os = "windows")]
+    fn activate_chrome_app() {
+        use windows::core::BOOL;
+        use windows::Win32::Foundation::{HWND, LPARAM};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            EnumWindows, GetClassNameW, IsWindowVisible, SetForegroundWindow, ShowWindow,
+            SW_RESTORE,
+        };
 
+        unsafe extern "system" fn enum_window_proc(hwnd: HWND, _: LPARAM) -> BOOL {
+            if IsWindowVisible(hwnd).as_bool() {
+                let mut class_name = [0u16; 256];
+                let len = GetClassNameW(hwnd, &mut class_name);
+                if len > 0 {
+                    let class_str = String::from_utf16_lossy(&class_name[..len as usize]);
+                    if class_str == "Chrome_WidgetWin_1" {
+                        let _ = ShowWindow(hwnd, SW_RESTORE);
+                        let _ = SetForegroundWindow(hwnd);
+                        return BOOL(0); // 첫 번째 찾은 메인 창 활성화 후 중단
+                    }
+                }
+            }
+            BOOL(1) // 계속 탐색
+        }
+
+        unsafe {
+            let _ = EnumWindows(Some(enum_window_proc), LPARAM(0));
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    fn activate_chrome_app() {}
     fn cdp_state(app: &AppHandle) -> tauri::State<'_, TypecastCdpState> {
         app.state::<TypecastCdpState>()
     }
@@ -462,11 +491,20 @@ impl TypecastController {
 
         match tokio::time::timeout(LIVENESS_TIMEOUT, page.url()).await {
             Ok(Ok(url)) => Some((page, url)),
-            _ => {
+            Ok(Err(e)) => {
+                Self::debug(
+                    app,
+                    "session-error",
+                    &format!("브라우저 페이지 조회 오류: {}", e),
+                );
+                Self::discard_dead_session(app, id).await;
+                None
+            }
+            Err(_) => {
                 Self::debug(
                     app,
                     "session-dead",
-                    "브라우저가 응답하지 않아 세션을 정리합니다",
+                    "브라우저가 응답하지 않아 세션을 정리합니다(시간 초과)",
                 );
                 Self::discard_dead_session(app, id).await;
                 None
@@ -551,6 +589,19 @@ impl TypecastController {
         let deadline = tokio::time::Instant::now() + timeout;
         let url_literal = serde_json::to_string(url).map_err(|e| e.to_string())?;
         let token = NAV_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // 먼저 현재 상태를 확인한다. 이미 목표 URL에 있고 로딩이 끝난 상태라면 그대로 통과한다.
+        if let Ok(Some(serde_json::Value::Bool(true))) = Self::eval_before(
+            page,
+            format!(
+                "location.href === {} && document.readyState === 'complete'",
+                url_literal
+            ),
+            deadline,
+        )
+        .await
+        {
+            return Ok(());
+        }
 
         // 표식을 심고 현재 URL 을 한 왕복으로 읽는다. 문자열이 돌아왔다는 것 자체가
         // 표식 대입이 실행됐다는 증거다 — 표식을 못 심었다면 이동 완료를 검증할 수
@@ -564,7 +615,6 @@ impl TypecastController {
         .map_err(|e| format!("페이지가 스크립트에 응답하지 않습니다: {}", e))?
         .and_then(|value| value.as_str().map(|s| s.to_string()))
         .ok_or_else(|| "이동 표식을 심을 수 없어 이동을 검증할 수 없습니다".to_string())?;
-
         // 프래그먼트만 바뀌는 이동은 문서가 새로 만들어지지 않아 표식이 남는다.
         // 이 앱의 이동 대상(에디터/로그인 URL)에는 프래그먼트가 없어 실제로는 발생하지
         // 않지만, 나중에 그런 URL 이 들어왔을 때 45초를 통째로 날리지 않도록 그 경우만
@@ -589,8 +639,8 @@ impl TypecastController {
             )
         } else {
             format!(
-                "window.__omnirecNavToken !== {} && document.readyState !== 'loading'",
-                token
+                "(window.__omnirecNavToken !== {} || location.href === {}) && document.readyState !== 'loading'",
+                token, url_literal
             )
         };
 
@@ -663,11 +713,8 @@ impl TypecastController {
             Ok(pair) => Ok(pair),
             Err(launch_err) => {
                 let message = launch_err.to_string();
-                if !message.contains("SingletonLock") {
-                    return Err(message);
-                }
 
-                // (1) 이미 떠 있는 Chrome 에 접속을 시도한다.
+                // (1) 이미 떠 있는 Chrome 에 접속을 시도한다 (기존 프로세스 재사용).
                 //     `DevToolsActivePort` 는 비정상 종료 후에도 남을 수 있어, 그 포트가
                 //     응답하지 않으면 접속이 끝나지 않는다 — 시간 제한을 건다.
                 if let Some(port) = Self::read_devtools_port(profile_dir) {
@@ -690,7 +737,7 @@ impl TypecastController {
                     }
                 }
 
-                // (2) 접속도 안 되면 죽은 프로세스가 남긴 락으로 보고 정리한 뒤 재시도한다.
+                // (2) 접속도 안 되면 죽은 프로세스가 남긴 락/포트 잔여물로 보고 정리한 뒤 재시도한다.
                 //     방금 닫은 Chrome 이 아직 정리 중일 수 있어 잠깐 기다렸다 다시 띄운다.
                 //     재시도는 유한하게 유지한다(무한 루프 금지).
                 let mut last_error = message;
@@ -708,12 +755,25 @@ impl TypecastController {
     }
 
     fn read_devtools_port(profile_dir: &std::path::Path) -> Option<u16> {
-        let content = std::fs::read_to_string(profile_dir.join("DevToolsActivePort")).ok()?;
-        content.lines().next()?.trim().parse::<u16>().ok()
+        let port_file = profile_dir.join("DevToolsActivePort");
+        for _ in 0..3 {
+            if let Ok(content) = std::fs::read_to_string(&port_file) {
+                if let Some(port) = content.lines().next().and_then(|l| l.trim().parse::<u16>().ok()) {
+                    return Some(port);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        None
     }
-
     fn clear_singleton_lock_files(profile_dir: &std::path::Path) {
-        for name in ["SingletonLock", "SingletonCookie", "SingletonSocket"] {
+        for name in [
+            "SingletonLock",
+            "SingletonCookie",
+            "SingletonSocket",
+            "lockfile",
+            "DevToolsActivePort",
+        ] {
             let _ = std::fs::remove_file(profile_dir.join(name));
         }
     }
@@ -758,6 +818,17 @@ impl TypecastController {
             // 합성 클릭으로도 재생되도록 자동재생 사용자 제스처 요구를 끈다.
             // (WKWebView 시절 mediaTypesRequiringUserActionForPlayback = None 과 같은 목적.)
             .arg("--autoplay-policy=no-user-gesture-required")
+            // 창이 가려지거나 비활성화되어도 렌더러/타이머가 스로틀링되지 않게 한다 (Windows/macOS 공통 핵심 안정성 플래그)
+            .arg("--disable-background-timer-throttling")
+            .arg("--disable-backgrounding-occluded-windows")
+            .arg("--disable-renderer-backgrounding")
+            .arg("--disable-features=CalculateNativeWinOcclusion")
+            // 불필요한 백그라운드 팝업/업데이트/크래시핸들러로 인한 멈춤 방지
+            .arg("--no-first-run")
+            .arg("--no-default-browser-check")
+            .arg("--disable-breakpad")
+            .arg("--disable-component-update")
+            .arg("--disable-default-apps")
             .build()
             .map_err(|e| format!("Chrome 실행 설정을 만들 수 없습니다: {}", e))?;
 
@@ -1373,6 +1444,7 @@ impl TypecastController {
     }
 
     /// 편집기 본문을 읽는다(테스트가 대상 프로젝트 내용을 백업·복원하는 데 쓴다).
+    #[allow(dead_code)]
     async fn read_script(page: &Page) -> Result<String, String> {
         page.evaluate("window.__omnirecReadScript ? window.__omnirecReadScript() : ''")
             .await

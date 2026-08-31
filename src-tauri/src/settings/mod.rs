@@ -396,7 +396,7 @@ impl SettingsManager {
         #[cfg(target_os = "windows")]
         let candidates: Vec<PathBuf> = {
             let mut list = vec![];
-            for env_var in ["ProgramFiles", "ProgramFiles(x86)", "LocalAppData"] {
+            for env_var in ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432", "LocalAppData"] {
                 if let Ok(base) = std::env::var(env_var) {
                     list.push(
                         PathBuf::from(base)
@@ -406,6 +406,15 @@ impl SettingsManager {
                             .join("chrome.exe"),
                     );
                 }
+            }
+            for root in [r"C:\Program Files", r"C:\Program Files (x86)"] {
+                list.push(
+                    PathBuf::from(root)
+                        .join("Google")
+                        .join("Chrome")
+                        .join("Application")
+                        .join("chrome.exe"),
+                );
             }
             list
         };
