@@ -57,6 +57,10 @@ export const HistoryList: React.FC<HistoryListProps> = ({
   const [editingName, setEditingName] = useState<string>('');
   const [isRenaming, setIsRenaming] = useState<boolean>(false);
   const [renameError, setRenameError] = useState<string | null>(null);
+  // 삭제 진행·실패 상태. 백엔드는 파일이 이미 없으면 실패를 돌려주므로
+  // (예전에는 없어도 성공으로 처리했다) 실패한 항목을 그 자리에서 보여 준다.
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [deleteError, setDeleteError] = useState<{ id: string; message: string } | null>(null);
 
   // In-app Audio Preview Player State
   const [activePreview, setActivePreview] = useState<HistoryItem | null>(null);
@@ -142,6 +146,39 @@ export const HistoryList: React.FC<HistoryListProps> = ({
     }
   };
 
+  /**
+   * 파일 하나를 지운다.
+   *
+   * 실패를 조용히 삼키지 않는 것이 요점이다. 예전에는 `onDeleteFile` 의 프라미스를
+   * 그냥 흘려보내서, 삭제가 거부돼도 목록은 그대로였고 사용자는 지워진 줄 알았다.
+   * 성공한 항목만 선택에서 빼고, 실패한 항목은 선택된 채로 남겨 다시 시도할 수 있게 한다.
+   */
+  const handleDelete = async (item: HistoryItem) => {
+    if (!confirm(`'${item.file_name}' 파일을 삭제하시겠습니까?`)) return;
+
+    setDeleteError(null);
+    setDeletingId(item.id);
+    try {
+      await onDeleteFile(item.file_path);
+      setSelectedIds((prev) => {
+        if (!prev.has(item.id)) return prev;
+        const next = new Set(prev);
+        next.delete(item.id);
+        return next;
+      });
+      // 지운 파일을 미리듣기 중이었다면 재생 바도 닫는다.
+      setActivePreview((prev) => (prev?.id === item.id ? null : prev));
+    } catch (err) {
+      setDeleteError({
+        id: item.id,
+        message:
+          typeof err === 'string' ? err : err instanceof Error ? err.message : '파일 삭제 실패',
+      });
+    } finally {
+      setDeletingId((cur) => (cur === item.id ? null : cur));
+    }
+  };
+
   const handlePlayPreview = (item: HistoryItem) => {
     if (activePreview?.id === item.id) {
       if (isPlaying) {
@@ -212,6 +249,25 @@ export const HistoryList: React.FC<HistoryListProps> = ({
       isCancelled = true;
     };
   }, [activePreview]);
+
+  // 언마운트 정리. 미리듣기 blob URL 은 컴포넌트가 사라져도 자동으로 해제되지 않아
+  // (문서가 계속 참조를 들고 있다) 파일 탭을 왕복할 때마다 오디오 파일 전체가
+  // 메모리에 쌓인다. 재생도 여기서 멈춘다 — 오디오 엘리먼트가 DOM 에서 떼어져도
+  // 소리는 계속 나기 때문이다.
+  useEffect(() => {
+    return () => {
+      const audio = audioRef.current;
+      if (audio) {
+        audio.pause();
+        audio.removeAttribute('src');
+        audio.load();
+      }
+      if (currentBlobUrlRef.current) {
+        URL.revokeObjectURL(currentBlobUrlRef.current);
+        currentBlobUrlRef.current = null;
+      }
+    };
+  }, []);
 
   const formatTime = (secs: number) => {
     const s = Math.floor(secs);
@@ -467,6 +523,9 @@ export const HistoryList: React.FC<HistoryListProps> = ({
                       <span>•</span>
                       <span className="text-slate-500 text-[11px]">{item.created_at}</span>
                     </div>
+                    {deleteError?.id === item.id && (
+                      <p className="text-[11px] text-rose-400 mt-1">{deleteError.message}</p>
+                    )}
                   </div>
                 </div>
 
@@ -556,14 +615,17 @@ export const HistoryList: React.FC<HistoryListProps> = ({
                   <button
                     onClick={(e) => {
                       e.stopPropagation();
-                      if (confirm(`'${item.file_name}' 파일을 삭제하시겠습니까?`)) {
-                        onDeleteFile(item.file_path);
-                      }
+                      void handleDelete(item);
                     }}
+                    disabled={deletingId === item.id}
                     title="파일 삭제"
-                    className="p-2 rounded-xl bg-slate-950 border border-slate-800 text-slate-500 hover:text-red-400 hover:border-red-900/60 hover:bg-red-950/30 transition"
+                    className="p-2 rounded-xl bg-slate-950 border border-slate-800 text-slate-500 hover:text-red-400 hover:border-red-900/60 hover:bg-red-950/30 transition disabled:opacity-50"
                   >
-                    <Trash2 className="w-3.5 h-3.5" />
+                    {deletingId === item.id ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    ) : (
+                      <Trash2 className="w-3.5 h-3.5" />
+                    )}
                   </button>
                 </div>
               </div>

@@ -19,7 +19,7 @@ interface ScriptStudioProps {
   onStartRecord: (options: StartTtsRecordOptions) => Promise<string | null>;
   onPauseRecord: () => Promise<void>;
   onResumeRecord: () => Promise<void>;
-  onStopRecord: () => Promise<void>;
+  onStopRecord: (options?: { silent?: boolean }) => Promise<void>;
   onSendToSubtitle: (audioPath: string, scriptText: string) => void;
   onOpenExplorer: (path: string) => Promise<void>;
   onOpenDefaultPlayer: (path: string) => Promise<void>;
@@ -51,6 +51,16 @@ export const ScriptStudio: React.FC<ScriptStudioProps> = ({
     try {
       const items = await invoke<ScriptItem[]>('list_scripts');
       setScripts(items);
+      // 목록이 갱신되면 사라진 대본을 가리키던 선택을 반드시 정리한다.
+      // 이걸 빼면 삭제된 대본이 "보이지 않는 선택"으로 남아
+      // "1개 선택됨"인데 체크된 항목은 하나도 없고 시작 버튼만 활성인 상태가 되고,
+      // 그 상태로 일괄 녹음을 돌리면 존재하지 않는 id 로 백엔드를 때린다.
+      const liveIds = new Set(items.map((s) => s.id));
+      setBatchIds((prev) => {
+        const next = prev.filter((id) => liveIds.has(id));
+        return next.length === prev.length ? prev : next;
+      });
+      setSelectedId((prev) => (prev !== null && liveIds.has(prev) ? prev : null));
     } catch (err) {
       console.error('대본 목록을 불러오지 못했습니다:', err);
     } finally {
@@ -66,6 +76,14 @@ export const ScriptStudio: React.FC<ScriptStudioProps> = ({
     () => scripts.find((s) => s.id === selectedId) ?? null,
     [scripts, selectedId],
   );
+
+  // 화면에 내려보내는 일괄 선택은 항상 "현재 존재하는 대본"만 담는다.
+  // 개수 표시·시작 버튼 활성 조건이 전부 이 값에서 파생되므로,
+  // 삭제 반영이 한 박자 늦더라도 유령 선택이 UI 로 새어 나가지 않는다.
+  const validBatchIds = useMemo(() => {
+    const liveIds = new Set(scripts.map((s) => s.id));
+    return batchIds.filter((id) => liveIds.has(id));
+  }, [scripts, batchIds]);
 
   const tabs: TabBarItem<ScriptStudioView>[] = [
     {
@@ -101,7 +119,7 @@ export const ScriptStudio: React.FC<ScriptStudioProps> = ({
           <TtsBatchRunner
             settings={settings}
             scripts={scripts}
-            selectedIds={batchIds}
+            selectedIds={validBatchIds}
             onToggleSelect={toggleBatchId}
             onSelectAll={setBatchIds}
             recordingStatus={recordingStatus}
@@ -122,7 +140,7 @@ export const ScriptStudio: React.FC<ScriptStudioProps> = ({
             selectedId={selectedId}
             onSelect={setSelectedId}
             onRefresh={refreshScripts}
-            batchIds={batchIds}
+            batchIds={validBatchIds}
             onToggleBatch={toggleBatchId}
             onSendToTts={(script) => {
               setSelectedId(script.id);

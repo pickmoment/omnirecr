@@ -1,4 +1,6 @@
-use std::sync::mpsc::Sender;
+use std::sync::Arc;
+
+use crate::audio::engine::{CaptureRing, FatalReporter};
 
 use screencapturekit::cm::CMSampleBufferExt;
 
@@ -28,7 +30,16 @@ impl MacSystemAudioCapture {
     /// 기본값(false)은 화면 녹화 중 앱 자체 소리가 되먹임되는 것을 막기 위한 것이지만,
     /// 앱 안의 웹뷰(Typecast 창)가 내는 TTS 낭독을 녹음하려면 반드시 포함시켜야 한다.
     /// 이 값이 false 인 채로 녹음하면 스피커로는 소리가 나는데 파일은 무음이 된다.
-    pub fn start(sender: Sender<Vec<f32>>, include_own_app_audio: bool) -> Result<Self, String> {
+    ///
+    /// `ring` 은 **유계** 링버퍼다. 예전에는 무한 `mpsc::Sender` 였고, FFmpeg 파이프가
+    /// 막히면 이 콜백이 밀어 넣는 프레임이 그대로 쌓여 메모리를 무한히 먹었다.
+    /// `reporter` 는 되돌릴 수 없는 실패(지원하지 않는 오디오 포맷)를 세션당 한 번
+    /// 올린다 — 예전에는 eprintln 만 하고 무음 파일을 정상 결과처럼 내놨다.
+    pub fn start(
+        ring: Arc<CaptureRing>,
+        include_own_app_audio: bool,
+        reporter: Arc<FatalReporter>,
+    ) -> Result<Self, String> {
         ensure_screen_capture_permission()?;
         let content = SCShareableContent::get().map_err(|error| {
             format!("Unable to access macOS screen and system audio content: {error}")
@@ -65,11 +76,13 @@ impl MacSystemAudioCapture {
                     || format.audio_bits_per_channel() != Some(32)
                     || format.audio_is_big_endian()
                 {
-                    eprintln!(
-                        "Unsupported ScreenCaptureKit audio format: subtype={}, bits={:?}",
+                    // 포맷이 안 맞으면 이 스트림에서는 영원히 안 맞는다 →
+                    // 조용히 버리면 시스템 소리가 통째로 빠진 파일이 나온다.
+                    reporter.report(format!(
+                        "macOS 시스템 오디오 포맷을 해석할 수 없습니다(subtype={}, bits={:?}). 시스템 소리가 녹음되지 않습니다.",
                         format.media_subtype_string(),
                         format.audio_bits_per_channel()
-                    );
+                    ));
                     return;
                 }
 
@@ -78,7 +91,7 @@ impl MacSystemAudioCapture {
                 };
                 let pcm = copy_stereo_f32(&buffers);
                 if !pcm.is_empty() {
-                    let _ = sender.send(pcm);
+                    ring.push(pcm);
                 }
             },
             SCStreamOutputType::Audio,
@@ -98,7 +111,11 @@ impl MacSystemAudioCapture {
 
 impl Drop for MacSystemAudioCapture {
     fn drop(&mut self) {
-        let _ = self.stream.stop_capture();
+        // 실패해도 되돌릴 방법이 없지만, 캡처가 안 멈추면 다음 녹음이 이상하게
+        // 동작하므로 흔적은 남긴다.
+        if let Err(error) = self.stream.stop_capture() {
+            log::warn!("macOS 시스템 오디오 캡처를 멈추지 못했습니다: {error}");
+        }
     }
 }
 

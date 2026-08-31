@@ -13,7 +13,7 @@ import {
   X,
 } from 'lucide-react';
 import type { ScriptItem, Settings } from '../types';
-import { generateSubtitles } from '../services/subtitleGeneration';
+import { generateSubtitles, isSubtitleCancelled } from '../services/subtitleGeneration';
 import { formatDuration } from '../utils/format';
 import { SubtitleOptionsPanel } from './SubtitleOptionsPanel';
 
@@ -70,6 +70,9 @@ export const SubtitleBatchRunner: React.FC<SubtitleBatchRunnerProps> = ({
   const [showAdvanced, setShowAdvanced] = useState(false);
 
   const abortRef = useRef(false);
+  // 진행 중인 항목까지 실제로 끊는다. 이게 없으면 중단을 눌러도 그 항목은 끝까지 돌아
+  // '완료'로 보고되고 파일까지 쓴다(항목 사이에서만 멈추던 예전 동작).
+  const abortControllerRef = useRef<AbortController | null>(null);
 
   // 녹음 결과가 연결된 대본만 자막을 만들 수 있다.
   const recorded = useMemo(
@@ -96,6 +99,7 @@ export const SubtitleBatchRunner: React.FC<SubtitleBatchRunnerProps> = ({
 
     setErrorMsg(null);
     abortRef.current = false;
+    abortControllerRef.current = new AbortController();
     setIsRunning(true);
     setQueue(
       targets.map((s) => ({ scriptId: s.id, title: s.title, status: 'pending' as ItemStatus })),
@@ -135,11 +139,27 @@ export const SubtitleBatchRunner: React.FC<SubtitleBatchRunnerProps> = ({
           // 일괄 생성은 파일로 남기는 것이 목적이므로 항상 저장한다.
           autoSave: true,
           outputDir: settings.output_dir,
+          signal: abortControllerRef.current?.signal,
           onProgress: (message, percent) => {
             setPhaseMessage(`${script.title} — ${message}`);
             if (percent) setProgressPercent(percent);
           },
         });
+
+        // 자동 저장을 요청했는데 한 포맷이라도 저장되지 않았으면 완료가 아니다.
+        if (outcome.saveFailures.length > 0) {
+          setItem(script.id, {
+            status: 'failed',
+            message: `자막 파일 저장 실패 — ${outcome.saveFailures
+              .map((f) => `${f.format.toUpperCase()}: ${f.message}`)
+              .join(' · ')}`,
+            srtPath: outcome.srtPath,
+            vttPath: outcome.vttPath,
+            lineCount: outcome.subtitles.length,
+          });
+          if (!settings.tts_batch_continue_on_error) break;
+          continue;
+        }
 
         setItem(script.id, {
           status: 'done',
@@ -148,15 +168,31 @@ export const SubtitleBatchRunner: React.FC<SubtitleBatchRunnerProps> = ({
           vttPath: outcome.vttPath,
           lineCount: outcome.subtitles.length,
         });
-      } catch (err: any) {
+      } catch (err: unknown) {
+        // 취소는 실패가 아니다.
+        if (isSubtitleCancelled(err) || abortRef.current) {
+          setItem(script.id, { status: 'skipped', message: '중단됨' });
+          break;
+        }
         setItem(script.id, {
           status: 'failed',
-          message: `${err?.message || err}`,
+          message: `${err instanceof Error ? err.message : String(err)}`,
         });
         if (!settings.tts_batch_continue_on_error) break;
       }
     }
 
+    // 중단으로 끝났으면 남은 항목을 '건너뜀'으로 마무리한다(대기 상태로 남기지 않는다).
+    if (abortRef.current) {
+      setQueue((prev) =>
+        prev.map((item) =>
+          item.status === 'pending' || item.status === 'running'
+            ? { ...item, status: 'skipped' as ItemStatus, message: '중단됨' }
+            : item,
+        ),
+      );
+    }
+    abortControllerRef.current = null;
     setCurrentId(null);
     setPhaseMessage('');
     setProgressPercent(0);
@@ -270,7 +306,9 @@ export const SubtitleBatchRunner: React.FC<SubtitleBatchRunnerProps> = ({
               <button
                 onClick={() => {
                   abortRef.current = true;
-                  setPhaseMessage('현재 항목을 마치고 중단합니다...');
+                  // 진행 중인 항목도 즉시 끊는다(전사·저장이 끝까지 돌지 않는다).
+                  abortControllerRef.current?.abort();
+                  setPhaseMessage('중단합니다...');
                 }}
                 className="flex items-center gap-2 px-6 py-3 rounded-xl bg-red-600 hover:bg-red-500 text-white font-bold text-sm shadow-xl shadow-red-600/25 active:scale-95 transition"
               >

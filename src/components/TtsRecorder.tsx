@@ -27,6 +27,10 @@ export interface StartTtsRecordOptions {
   showMiniController?: boolean;
   /** true 면 타임스탬프 없이 fileNamePrefix 그대로를 파일명으로 쓴다(대본 & TTS 녹음 전용). */
   exactFileName?: boolean;
+  /** 덮어쓰기 확인을 이미 받았을 때 true. 자동 일괄 녹음이 시작 전에 한 번에 확인한다. */
+  skipOverwriteCheck?: boolean;
+  /** true 면 실패를 `alert` 대신 예외로 알린다(자동 일괄 녹음이 인라인으로 표시). */
+  throwOnError?: boolean;
 }
 
 interface TtsRecorderProps {
@@ -39,7 +43,7 @@ interface TtsRecorderProps {
   onStartRecord: (options: StartTtsRecordOptions) => Promise<string | null>;
   onPauseRecord: () => Promise<void>;
   onResumeRecord: () => Promise<void>;
-  onStopRecord: () => Promise<void>;
+  onStopRecord: (options?: { silent?: boolean }) => Promise<void>;
   onRefreshScripts: () => Promise<void>;
   onSendToSubtitle: (audioPath: string, scriptText: string) => void;
   onOpenExplorer: (path: string) => Promise<void>;
@@ -54,6 +58,18 @@ const CHUNK_PRESETS = [
   { label: '2,000자씩', value: 2000 },
   { label: '1,000자씩', value: 1000 },
 ];
+
+/**
+ * 녹음이 끝난 순간에 고정되는 결과 스냅샷.
+ * 결과 영역의 후속 동작(자막 생성 등)은 "현재 선택된 대본"이 아니라 반드시 이 값을 쓴다.
+ * 섞이면 A 를 녹음하고 B 를 선택한 사용자에게 A 오디오 + B 텍스트 자막이 만들어진다.
+ */
+interface RecordedResult {
+  path: string;
+  scriptId: string | null;
+  scriptTitle: string;
+  scriptContent: string;
+}
 
 export const TtsRecorder: React.FC<TtsRecorderProps> = ({
   settings,
@@ -76,7 +92,7 @@ export const TtsRecorder: React.FC<TtsRecorderProps> = ({
   const [chunkIndex, setChunkIndex] = useState(0);
   const [countdown, setCountdown] = useState<number | null>(null);
   const [isStarting, setIsStarting] = useState(false);
-  const [recordedPath, setRecordedPath] = useState<string | null>(null);
+  const [result, setResult] = useState<RecordedResult | null>(null);
   const [feedback, setFeedback] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
@@ -91,6 +107,7 @@ export const TtsRecorder: React.FC<TtsRecorderProps> = ({
   // 녹음 시작 시 백엔드가 알려준 저장 경로 (미니 컨트롤러 · 무음 자동 종료로 끝나도 동일)
   const pendingPathRef = useRef<string | null>(null);
   const sessionScriptRef = useRef<ScriptItem | null>(null);
+  const flashTimerRef = useRef<number | null>(null);
 
   const chunks = useMemo(
     () => (selectedScript ? splitIntoChunks(selectedScript.content, chunkLimit) : []),
@@ -100,8 +117,20 @@ export const TtsRecorder: React.FC<TtsRecorderProps> = ({
   const flash = useCallback((msg: string) => {
     setErrorMsg(null);
     setFeedback(msg);
-    window.setTimeout(() => setFeedback((cur) => (cur === msg ? null : cur)), 3000);
+    if (flashTimerRef.current !== null) window.clearTimeout(flashTimerRef.current);
+    flashTimerRef.current = window.setTimeout(() => {
+      flashTimerRef.current = null;
+      setFeedback((cur) => (cur === msg ? null : cur));
+    }, 3000);
   }, []);
+
+  // 탭을 옮겨 이 화면이 사라져도 안내 타이머가 남지 않게 한다.
+  useEffect(
+    () => () => {
+      if (flashTimerRef.current !== null) window.clearTimeout(flashTimerRef.current);
+    },
+    [],
+  );
 
   useEffect(() => {
     setChunkIndex(0);
@@ -133,12 +162,22 @@ export const TtsRecorder: React.FC<TtsRecorderProps> = ({
         const path =
           knownPath ?? (await invoke<string | null>('get_last_recorded_path'));
         if (!path) return;
-        setRecordedPath(path);
+        // 이 시점의 대본을 통째로 박제한다. 이후 선택이 바뀌어도 결과 영역은 흔들리지 않는다.
+        setResult({
+          path,
+          scriptId: script?.id ?? null,
+          scriptTitle: script?.title ?? '(대본 정보 없음)',
+          scriptContent: script?.content ?? '',
+        });
         if (script) {
           await invoke('attach_script_recording', { id: script.id, recordedPath: path });
           await onRefreshScripts();
         }
-        flash('녹음이 저장되고 대본에 연결되었습니다.');
+        flash(
+          script
+            ? `녹음이 저장되고 "${script.title}" 대본에 연결되었습니다.`
+            : '녹음이 저장되었습니다.',
+        );
       } catch (err) {
         setErrorMsg(`녹음 결과 연결 실패: ${err}`);
       }
@@ -186,7 +225,7 @@ export const TtsRecorder: React.FC<TtsRecorderProps> = ({
       return;
     }
     setErrorMsg(null);
-    setRecordedPath(null);
+    setResult(null);
     setIsStarting(true);
 
     try {
@@ -556,33 +595,42 @@ export const TtsRecorder: React.FC<TtsRecorderProps> = ({
       </div>
 
       {/* 4단계: 결과 */}
-      {recordedPath && (
+      {result && (
         <div className="bg-emerald-950/25 border border-emerald-800/50 rounded-2xl p-4 shadow-lg space-y-3">
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 flex-wrap">
             <span className="w-5 h-5 rounded-lg bg-emerald-600 text-white text-[10px] font-black flex items-center justify-center">
               4
             </span>
             <span className="text-sm font-bold text-emerald-200">녹음 완료</span>
+            <span className="text-[11px] font-semibold px-2 py-0.5 rounded-lg bg-slate-900 border border-slate-700 text-slate-300 max-w-full truncate">
+              대본: {result.scriptTitle}
+            </span>
+            {result.scriptId !== null && selectedScript?.id !== result.scriptId && (
+              <span className="text-[11px] font-semibold px-2 py-0.5 rounded-lg bg-amber-950/60 border border-amber-700/50 text-amber-300">
+                현재 선택된 대본과 다릅니다 — 아래 동작은 녹음한 대본을 씁니다
+              </span>
+            )}
           </div>
-          <p className="text-[11px] text-slate-300 font-mono break-all">{recordedPath}</p>
+          <p className="text-[11px] text-slate-300 font-mono break-all">{result.path}</p>
           <div className="flex flex-wrap items-center gap-2">
             <button
-              onClick={() => selectedScript && onSendToSubtitle(recordedPath, selectedScript.content)}
-              disabled={!selectedScript}
+              onClick={() => onSendToSubtitle(result.path, result.scriptContent)}
+              disabled={!result.scriptContent.trim()}
+              title={`"${result.scriptTitle}" 본문으로 자막을 만듭니다`}
               className="flex items-center gap-1.5 px-4 py-2.5 rounded-xl bg-amber-600 hover:bg-amber-500 disabled:bg-slate-800 disabled:text-slate-500 text-white text-xs font-bold shadow-lg shadow-amber-600/20 transition active:scale-95"
             >
               <FileText className="w-3.5 h-3.5" />
               <span>이 대본으로 자막 만들기</span>
             </button>
             <button
-              onClick={() => onOpenDefaultPlayer(recordedPath)}
+              onClick={() => onOpenDefaultPlayer(result.path)}
               className="flex items-center gap-1.5 px-3.5 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold border border-slate-700 transition"
             >
               <ExternalLink className="w-3.5 h-3.5 text-emerald-400" />
               <span>재생</span>
             </button>
             <button
-              onClick={() => onOpenExplorer(recordedPath)}
+              onClick={() => onOpenExplorer(result.path)}
               className="flex items-center gap-1.5 px-3.5 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold border border-slate-700 transition"
             >
               <FolderOpen className="w-3.5 h-3.5 text-emerald-400" />

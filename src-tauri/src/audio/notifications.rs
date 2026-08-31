@@ -98,11 +98,9 @@ impl NotificationSoundManager {
         let device_enumerator: IMMDeviceEnumerator =
             CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
 
-        let default_device =
-            device_enumerator.GetDefaultAudioEndpoint(eRender, eMultimedia)?;
+        let default_device = device_enumerator.GetDefaultAudioEndpoint(eRender, eMultimedia)?;
 
-        let session_manager: IAudioSessionManager2 =
-            default_device.Activate(CLSCTX_ALL, None)?;
+        let session_manager: IAudioSessionManager2 = default_device.Activate(CLSCTX_ALL, None)?;
 
         let session_enum = session_manager.GetSessionEnumerator()?;
         let count = session_enum.GetCount()?;

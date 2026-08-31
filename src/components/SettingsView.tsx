@@ -517,6 +517,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               />
             </div>
 
+
             <div className="p-3.5 rounded-xl bg-slate-950/60 border border-slate-800 space-y-2">
               <div className="flex items-center justify-between">
                 <span className="text-slate-300 text-[11px] font-medium">대본 사이 간격</span>

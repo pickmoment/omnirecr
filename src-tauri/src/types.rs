@@ -1,6 +1,11 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// 녹화 영역. 좌표는 **가상 데스크톱 전역 물리 픽셀**이다(모니터 로컬이 아니다).
+///
+/// 프론트엔드 오버레이가 모니터 원점(`SelectionScreenInfo::physical_x/y`)을 더해서
+/// 보낸다. 주 모니터보다 왼쪽/위에 있는 모니터는 음수가 될 수 있어 `x`/`y` 는 `i32` 다 —
+/// 0 으로 클램프하지 말 것.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RectRegion {
     pub x: i32,
@@ -9,20 +14,35 @@ pub struct RectRegion {
     pub height: u32,
 }
 
+/// 영역 선택 오버레이가 떠 있는 모니터의 물리 좌표계 정보.
+///
+/// `physical_x/physical_y` 는 **가상 데스크톱 전역** 원점이다. 이 값 없이 크기·배율만
+/// 보내면 프론트엔드가 뷰포트 로컬 좌표를 그대로 물리 좌표로 바꿔 보내고, Windows
+/// `gdigrab -offset_x/-offset_y` · Linux `x11grab :0.0+x,y` 는 그것을 전역 좌표로
+/// 먹기 때문에 보조 모니터에서 영역을 잡아도 주 모니터를 잘라 녹화한다(실측 증상).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SelectionScreenInfo {
+    pub physical_x: i32,
+    pub physical_y: i32,
     pub physical_width: u32,
     pub physical_height: u32,
     pub scale_factor: f64,
 }
 
+/// 설정은 **컨테이너 수준 `#[serde(default)]`** 를 반드시 유지할 것.
+///
+/// 이게 없으면 필드 하나가 빠진 옛 `settings.json`(앱을 업데이트하면 항상 생기는
+/// 상황)에서 역직렬화가 통째로 실패하고, `SettingsManager::load()` 가 그걸 "기본값
+/// 사용"으로 접어 사용자 설정 전체를 날린다. 필드별 `#[serde(default = "...")]` 는
+/// 그 필드의 기본값을 다르게 주고 싶을 때만 추가로 쓴다.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Settings {
     pub output_dir: String,
-    pub audio_format: String, // "mp3" | "m4a"
-    pub audio_bitrate: u32,   // 128, 192, 256, 320
+    pub audio_format: String,   // "mp3" | "m4a"
+    pub audio_bitrate: u32,     // 128, 192, 256, 320
     pub audio_sample_rate: u32, // 44100, 48000
-    pub video_fps: u32,       // 30, 60
+    pub video_fps: u32,         // 30, 60
     pub system_audio_enabled: bool,
     pub system_audio_volume: f32, // 0.0 to 2.0 (0% to 200%)
     /// OmniRec 자신이 내는 소리(앱 내 웹뷰의 TTS 재생 등)도 시스템 오디오에 포함할지.
@@ -30,19 +50,19 @@ pub struct Settings {
     #[serde(default)]
     pub system_audio_include_own_app: bool,
     pub mic_audio_enabled: bool,
-    pub mic_audio_volume: f32,    // 0.0 to 2.0 (0% to 200%)
+    pub mic_audio_volume: f32, // 0.0 to 2.0 (0% to 200%)
     pub noise_gate_enabled: bool,
-    pub noise_gate_threshold_db: f32, // e.g. -45.0 dB
+    pub noise_gate_threshold_db: f32,  // e.g. -45.0 dB
     pub highpass_filter_enabled: bool, // 80Hz Low-cut filter
-    pub mute_notifications: bool,     // Auto mute windows notifications during recording
+    pub mute_notifications: bool,      // Auto mute windows notifications during recording
     #[serde(default = "default_macos_shortcut_start")]
     pub macos_shortcut_start: String,
     #[serde(default = "default_macos_shortcut_stop")]
     pub macos_shortcut_stop: String,
     pub auto_pause_enabled: bool,
-    pub auto_pause_seconds: f32,      // default 1.0s
+    pub auto_pause_seconds: f32, // default 1.0s
     pub auto_stop_enabled: bool,
-    pub auto_stop_seconds: f32,       // default 5.0s
+    pub auto_stop_seconds: f32, // default 5.0s
     pub custom_ffmpeg_path: Option<String>,
     #[serde(default = "default_subtitle_generation_workflow")]
     pub subtitle_generation_workflow: String, // "with-script" | "ai-only"
@@ -348,8 +368,8 @@ pub struct MergeProgressPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioConvertTaskPayload {
     pub input_files: Vec<String>,
-    pub target_format: String, // "mp3" | "m4a"
-    pub bitrate: u32,          // e.g. 128, 192, 256, 320
+    pub target_format: String,    // "mp3" | "m4a"
+    pub bitrate: u32,             // e.g. 128, 192, 256, 320
     pub sample_rate: Option<u32>, // e.g. 44100, 48000
     pub channels: Option<u32>,    // e.g. 1, 2
     pub output_dir: Option<String>,
@@ -408,8 +428,6 @@ pub struct SubtitleGenerateResult {
     pub script_lines_count: usize,
 }
 
-
-
 // ─────────────────────────────────────────────────────────────
 // 대본 관리 (Script Library)
 // ─────────────────────────────────────────────────────────────
@@ -439,6 +457,19 @@ pub struct ScriptItem {
     pub last_recorded_at: Option<String>,
     #[serde(default)]
     pub record_count: u32,
+}
+
+/// 대본 제목 하나가 실제로 어떤 파일로 저장될지 미리 계산한 결과.
+///
+/// 파일명 규칙은 `AudioRecorderSession::resolve_output_path` 하나가 단일 출처다.
+/// 프론트엔드가 제목을 직접 정규화해 경로를 짐작하면 실제 저장 경로와 어긋나므로,
+/// 덮어쓰기 확인·중복 제목 검사 모두 이 결과를 쓴다.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScriptRecordingTarget {
+    /// 요청한 파일명 접두어(= 대본 제목). 요청 순서 그대로 돌려준다.
+    pub prefix: String,
+    pub path: String,
+    pub exists: bool,
 }
 
 /// 프론트엔드에서 넘어오는 저장 요청. `id`가 없으면 신규 생성.

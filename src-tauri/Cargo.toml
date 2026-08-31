@@ -32,6 +32,12 @@ parking_lot = "0.12"
 regex = "1.10"
 chromiumoxide = "0.9.1"
 futures = "0.3"
+
+[dev-dependencies]
+# `tauri::test::mock_app` 용. 녹음 일시정지/재개는 `AppHandle` 이 있을 때만
+# 상태 이벤트를 내보내므로, 그 경로(예전에 앱 전체를 얼렸던 자기 교착)를 테스트로
+# 재현하려면 실제 `AppHandle` 이 필요하다. dev-dependency 라 릴리스 빌드에는 들어가지 않는다.
+tauri = { version = "2.11.3", features = ["macos-private-api", "test"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 core-graphics = "0.25"
 screencapturekit = "8.0.1"

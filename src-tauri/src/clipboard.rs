@@ -23,11 +23,54 @@ pub fn copy_text(text: &str) -> Result<(), String> {
     {
         // clip.exe 는 콘솔 코드페이지를 따라가 한글이 깨지므로
         // UTF-8 임시 파일 + PowerShell Set-Clipboard 경로를 사용한다.
-        let tmp = std::env::temp_dir().join(format!(
-            "omnirec_clip_{}.txt",
-            chrono::Local::now().format("%Y%m%d%H%M%S%3f")
-        ));
-        std::fs::write(&tmp, text).map_err(|e| format!("클립보드 임시 파일 생성 실패: {}", e))?;
+        //
+        // 파일 이름에 ms 타임스탬프만 쓰면 같은 밀리초에 들어온 두 호출(수동 "대본 보내기"
+        // 와 일괄 러너의 다음 대본 복사가 실제로 겹친다)이 **같은 경로**를 잡는다. 그러면
+        // 한쪽이 남의 파일을 덮어쓰고, 먼저 끝난 쪽의 remove_file 이 아직 읽히지도 않은
+        // 다른 쪽 파일을 지워 "빈 클립보드" 또는 "엉뚱한 대본 복사"가 된다.
+        // PID + 프로세스 내 카운터로 경로를 유일하게 만들고, create_new 로 배타 생성해
+        // 남이 만든 파일은 절대 열지 않는다(그래서 지우는 것도 항상 자기 파일뿐이다).
+        use std::io::Write as _;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CLIP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let mut opened: Option<(std::path::PathBuf, std::fs::File)> = None;
+        // PID 는 재사용되므로 예전 실행이 남긴 같은 이름의 파일과 부딪힐 수 있다.
+        // 그때는 다음 카운터 값으로 넘어간다(유한 횟수 — 무한 루프 금지).
+        for _ in 0..16 {
+            let seq = CLIP_SEQ.fetch_add(1, Ordering::Relaxed);
+            let path = dir.join(format!("omnirec_clip_{}_{}.txt", pid, seq));
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(file) => {
+                    opened = Some((path, file));
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(format!("클립보드 임시 파일 생성 실패: {}", e)),
+            }
+        }
+        let (tmp, mut file) = opened.ok_or_else(|| {
+            "클립보드 임시 파일 이름을 확보할 수 없습니다(임시 폴더에 잔재가 많습니다).".to_string()
+        })?;
+
+        let mut write_result = file.write_all(text.as_bytes());
+        if write_result.is_ok() {
+            write_result = file.flush();
+        }
+        // PowerShell 이 읽기 전에 우리 핸들을 닫는다 — Windows 에서는 열린 쓰기 핸들이
+        // 남아 있으면 Get-Content 가 공유 위반으로 실패할 수 있다.
+        drop(file);
+        if let Err(e) = write_result {
+            // 정리 실패는 사용자가 할 수 있는 조치가 없고, 아래에서 진짜 원인을 돌려준다.
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("클립보드 임시 파일 쓰기 실패: {}", e));
+        }
 
         let script = format!(
             "Set-Clipboard -Value (Get-Content -LiteralPath '{}' -Raw -Encoding UTF8)",
@@ -41,6 +84,7 @@ pub fn copy_text(text: &str) -> Result<(), String> {
             .output()
             .map_err(|e| format!("클립보드 복사 실패(powershell): {}", e));
 
+        // 우리가 create_new 로 만든 정확히 그 경로만 지운다.
         let _ = std::fs::remove_file(&tmp);
         let output = output?;
         if !output.status.success() {

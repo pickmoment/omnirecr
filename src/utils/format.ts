@@ -24,11 +24,22 @@ export const formatFileSize = (bytes: number, fractionDigits?: number) => {
   return `${(bytes / Math.pow(k, index)).toFixed(digits)} ${units[index]}`;
 };
 
-/** 초를 `N분 SS초` 형태로. 예상 낭독 시간·오디오 길이 표시에 쓴다. */
+/**
+ * 초를 `N분 SS초` 형태로. 예상 낭독 시간·오디오 길이 표시에 쓴다.
+ * 1시간을 넘으면 `H시간 MM분 SS초` 로 늘린다(`125분` 같은 표시를 피한다).
+ *
+ * 반올림은 반드시 **총 초에 한 번만** 적용한다. 분을 먼저 내림한 뒤 `secs % 60` 을
+ * 따로 반올림하면 59.6초가 `0분 60초`, 119.7초가 `1분 60초` 로 표시된다.
+ */
 export const formatDuration = (secs: number) => {
-  if (!secs || secs <= 0) return '0초';
-  const mins = Math.floor(secs / 60);
-  const rest = Math.round(secs % 60);
+  if (!Number.isFinite(secs) || secs <= 0) return '0초';
+  const total = Math.round(secs);
+  if (total <= 0) return '0초';
+  const hrs = Math.floor(total / 3600);
+  const mins = Math.floor((total % 3600) / 60);
+  const rest = total % 60;
+  const ss = String(rest).padStart(2, '0');
+  if (hrs > 0) return `${hrs}시간 ${String(mins).padStart(2, '0')}분 ${ss}초`;
   if (mins <= 0) return `${rest}초`;
-  return `${mins}분 ${String(rest).padStart(2, '0')}초`;
+  return `${mins}분 ${ss}초`;
 };

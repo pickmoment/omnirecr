@@ -42,17 +42,23 @@ export const SelectionOverlay: React.FC = () => {
   const scaleX = screenInfo && screenW > 0 ? screenInfo.physical_width / screenW : (typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1);
   const scaleY = screenInfo && screenH > 0 ? screenInfo.physical_height / screenH : (typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1);
 
-  // Converts CSS logical viewport rectangle to physical pixel rectangle for FFmpeg
+  // 오버레이 뷰포트 로컬 CSS 좌표 → **가상 데스크톱 전역 물리 좌표**.
+  // 모니터 원점을 더하지 않으면 보조 모니터에서 잡은 영역이 주 모니터 좌표로 해석돼
+  // 엉뚱한 화면이 녹화된다(Windows gdigrab · Linux x11grab 은 전역 좌표를 쓴다).
+  // 원점은 음수일 수 있으므로(주 모니터 왼쪽/위 모니터) 0 으로 클램프하지 않는다.
+  const originX = screenInfo?.physical_x ?? 0;
+  const originY = screenInfo?.physical_y ?? 0;
+
   const getPhysicalRegion = useCallback(
     (rect: RectRegion | null): RectRegion | null => {
       if (!rect || rect.width <= 0 || rect.height <= 0) return null;
-      const x = Math.max(0, Math.round(rect.x * scaleX));
-      const y = Math.max(0, Math.round(rect.y * scaleY));
+      const localX = Math.max(0, Math.round(rect.x * scaleX));
+      const localY = Math.max(0, Math.round(rect.y * scaleY));
       const width = Math.max(2, Math.round(rect.width * scaleX));
       const height = Math.max(2, Math.round(rect.height * scaleY));
-      return { x, y, width, height };
+      return { x: originX + localX, y: originY + localY, width, height };
     },
-    [scaleX, scaleY]
+    [scaleX, scaleY, originX, originY]
   );
 
   const handleConfirm = useCallback(() => {
@@ -64,14 +70,14 @@ export const SelectionOverlay: React.FC = () => {
       const fullPhysWidth = screenInfo?.physical_width || Math.round(screenW * scaleX);
       const fullPhysHeight = screenInfo?.physical_height || Math.round(screenH * scaleY);
       const fullRect: RectRegion = {
-        x: 0,
-        y: 0,
+        x: originX,
+        y: originY,
         width: fullPhysWidth,
         height: fullPhysHeight,
       };
       invoke('confirm_selection_region', { region: fullRect });
     }
-  }, [currentRect, getPhysicalRegion, screenInfo, screenW, screenH, scaleX, scaleY]);
+  }, [currentRect, getPhysicalRegion, screenInfo, screenW, screenH, scaleX, scaleY, originX, originY]);
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {

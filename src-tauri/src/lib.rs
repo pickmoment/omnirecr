@@ -11,11 +11,11 @@ pub mod subtitle;
 pub mod tts;
 pub mod types;
 
-use std::sync::Arc;
 use commands::AppState;
 use converter::AudioConverterController;
 use merger::MergerController;
 use recorder::RecorderController;
+use std::sync::Arc;
 use tauri::Manager;
 use tts::TypecastCdpState;
 
@@ -51,7 +51,6 @@ pub fn run() {
                 let _ = window.hide();
             }
 
-
             #[cfg(target_os = "windows")]
             start_global_hotkeys(app.handle().clone(), recorder_for_hotkey);
 
@@ -65,7 +64,7 @@ pub fn run() {
             commands::run_macos_shortcut,
             commands::start_screen_record,
             commands::start_audio_record,
-            commands::check_script_recording_exists,
+            commands::resolve_script_recording_targets,
             commands::pause_record,
             commands::resume_record,
             commands::toggle_pause_record,
@@ -123,7 +122,6 @@ fn start_global_hotkeys(app_handle: tauri::AppHandle, recorder: Arc<RecorderCont
     use std::thread;
     use windows::Win32::UI::Input::KeyboardAndMouse::*;
     use windows::Win32::UI::WindowsAndMessaging::*;
-    use tauri::Manager;
 
     thread::spawn(move || {
         unsafe {
@@ -145,14 +143,7 @@ fn start_global_hotkeys(app_handle: tauri::AppHandle, recorder: Arc<RecorderCont
                         let st = recorder.get_status().status;
                         if st != crate::types::RecordingStateStatus::Idle {
                             let _ = recorder.stop();
-                            if let Some(mini_win) = app_handle.get_webview_window("mini-controller") {
-                                let _ = mini_win.hide();
-                            }
-                            if let Some(main_win) = app_handle.get_webview_window("main") {
-                                let _ = main_win.unminimize();
-                                let _ = main_win.show();
-                                let _ = main_win.set_focus();
-                            }
+                            crate::commands::finish_recording_windows(&app_handle);
                         }
                     } else if id == 102 || id == 104 {
                         // Toggle pause

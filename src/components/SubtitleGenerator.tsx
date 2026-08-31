@@ -38,6 +38,7 @@ import {
   buildVtt,
   formatSrtTimestamp,
   generateSubtitles,
+  isSubtitleCancelled,
 } from '../services/subtitleGeneration';
 
 interface SubtitleGeneratorProps {
@@ -122,6 +123,13 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
   const activeItemRef = useRef<HTMLDivElement | null>(null);
   const segmentTimerRef = useRef<number | null>(null);
   const isFirstSettingsSyncRef = useRef(true);
+  // 오디오 미리듣기 blob URL 은 상태가 아니라 ref 를 정리 기준으로 삼는다.
+  // (상태를 의존성으로 걸면 정리 함수가 "그 렌더 시점의" URL 만 알아서, 교체 도중
+  //  언마운트되면 어떤 URL 은 해제되지 않고 어떤 URL 은 두 번 해제된다)
+  const audioBlobUrlRef = useRef<string | null>(null);
+  // 오디오 읽기 요청의 단조 증가 토큰. 가장 최신 요청의 결과만 반영한다.
+  const audioLoadTokenRef = useRef(0);
+  const copyFeedbackTimerRef = useRef<number | null>(null);
 
   // 아직 settings 를 단일 출처로 옮기지 않은 항목만 되돌려 저장한다.
   // (자막 옵션은 위 setter 들이 즉시 settings 에 쓴다)
@@ -184,14 +192,28 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
     }
   }, [initialScriptText]);
 
-  // Load audio file into HTML5 Audio via blob
+  /**
+   * 오디오 파일을 blob 으로 읽어 미리듣기에 연결한다.
+   *
+   * A 를 고른 직후 B 로 바꾸면 두 읽기가 동시에 진행되고 응답 순서는 보장되지 않는다.
+   * 예전에는 늦게 도착한 응답을 그대로 반영해서, 화면은 B 경로를 보여 주는데 A 소리가
+   * 재생되고 자막 하이라이트가 엉뚱한 지점을 따라가는 일이 생겼다. 단조 증가 토큰으로
+   * 가장 최신 요청만 반영하고, 뒤처진 응답의 blob URL 은 그 자리에서 해제한다.
+   */
   const loadAudioFile = async (path: string) => {
     if (!path) return;
+    const token = audioLoadTokenRef.current + 1;
+    audioLoadTokenRef.current = token;
+
+    // 이전 미리듣기는 먼저 끊는다. 남겨 두면 새 파일을 읽는 동안 옛 소리가 계속 난다.
+    stopAudio();
+    if (audioBlobUrlRef.current) {
+      URL.revokeObjectURL(audioBlobUrlRef.current);
+      audioBlobUrlRef.current = null;
+    }
+    setAudioBlobUrl(null);
+
     try {
-      if (audioBlobUrl) {
-        URL.revokeObjectURL(audioBlobUrl);
-        setAudioBlobUrl(null);
-      }
       const rawBytes = await invoke<number[]>('read_audio_file', { path });
       const uint8 = new Uint8Array(rawBytes);
 
@@ -204,20 +226,45 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
 
       const blob = new Blob([uint8], { type: mime });
       const url = URL.createObjectURL(blob);
+
+      if (token !== audioLoadTokenRef.current) {
+        // 더 최신 요청(또는 언마운트)이 이미 진행 중이다. 이 결과는 버린다.
+        URL.revokeObjectURL(url);
+        return;
+      }
+
+      audioBlobUrlRef.current = url;
       setAudioBlobUrl(url);
     } catch (err) {
       console.warn('Failed to load audio for preview:', err);
+      if (token === audioLoadTokenRef.current) {
+        setErrorMsg(`오디오 미리듣기를 불러오지 못했습니다: ${err}`);
+      }
     }
   };
 
-  // Cleanup blob URL on unmount
+  // 언마운트 정리: blob URL · 구간 재생 타이머 · 복사 피드백 타이머.
+  // 하나라도 빠지면 화면을 오갈 때마다 오디오 전체가 메모리에 쌓이거나,
+  // 사라진 컴포넌트에 setState 가 날아간다.
   useEffect(() => {
     return () => {
-      if (audioBlobUrl) {
-        URL.revokeObjectURL(audioBlobUrl);
+      // 진행 중인 읽기의 결과를 버리게 만든다(위 토큰 검사).
+      audioLoadTokenRef.current += 1;
+      audioRef.current?.pause();
+      if (audioBlobUrlRef.current) {
+        URL.revokeObjectURL(audioBlobUrlRef.current);
+        audioBlobUrlRef.current = null;
+      }
+      if (segmentTimerRef.current !== null) {
+        window.clearTimeout(segmentTimerRef.current);
+        segmentTimerRef.current = null;
+      }
+      if (copyFeedbackTimerRef.current !== null) {
+        window.clearTimeout(copyFeedbackTimerRef.current);
+        copyFeedbackTimerRef.current = null;
       }
     };
-  }, [audioBlobUrl]);
+  }, []);
 
   // Auto scroll to active subtitle during playback
   useEffect(() => {
@@ -336,12 +383,27 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
         vtt: outcome.vttPath || undefined,
       });
 
-      if (!audioBlobUrl) {
+      // 자동 저장을 켰는데 파일이 안 만들어졌으면 조용히 넘기지 않는다.
+      // (자막 자체는 화면에 남으므로 사용자가 "자막 저장"으로 다시 시도할 수 있다.)
+      if (outcome.saveFailures.length > 0) {
+        setErrorMsg(
+          `자막 파일 저장 실패 — ${outcome.saveFailures
+            .map((f) => `${f.format.toUpperCase()}: ${f.message}`)
+            .join(' · ')}`,
+        );
+      }
+
+      // 렌더 시점의 상태가 아니라 ref 를 본다 — 위 await 사이에 오디오가 실렸을 수 있다.
+      if (!audioBlobUrlRef.current) {
         await loadAudioFile(audioPath);
       }
-    } catch (err: any) {
+    } catch (err: unknown) {
+      if (isSubtitleCancelled(err)) {
+        setAiStatusMsg(null);
+        return;
+      }
       console.error('Subtitle generation failed:', err);
-      setErrorMsg(`자막 생성 실패: ${err?.message || err}`);
+      setErrorMsg(`자막 생성 실패: ${err instanceof Error ? err.message : String(err)}`);
     } finally {
       setIsGenerating(false);
       setAiStatusMsg(null);
@@ -731,7 +793,13 @@ export const SubtitleGenerator: React.FC<SubtitleGeneratorProps> = ({
 
       await navigator.clipboard.writeText(content);
       setCopyFeedback(type);
-      setTimeout(() => setCopyFeedback(null), 2000);
+      if (copyFeedbackTimerRef.current !== null) {
+        window.clearTimeout(copyFeedbackTimerRef.current);
+      }
+      copyFeedbackTimerRef.current = window.setTimeout(() => {
+        copyFeedbackTimerRef.current = null;
+        setCopyFeedback(null);
+      }, 2000);
     } catch (err) {
       console.error('Clipboard copy error:', err);
     }

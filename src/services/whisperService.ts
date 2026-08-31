@@ -15,136 +15,382 @@ export interface WhisperTranscribeResult {
   chunks: WhisperChunk[];
 }
 
-let transcriberInstance: AutomaticSpeechRecognitionPipeline | null = null;
-let currentModelName: string | null = null;
-
-export function resetWhisperPipeline() {
-  transcriberInstance = null;
-  currentModelName = null;
+/** 모델 로딩 진행 상황(transformers.js progress_callback 페이로드). */
+export interface WhisperLoadProgress {
+  status: string;
+  progress?: number;
+  file?: string;
 }
 
 /**
- * Load or reuse Whisper ASR pipeline safely
+ * 취소 전용 오류.
+ *
+ * 취소는 성공도 실패도 아니다. 예전 코드는 로딩이 밀려나도 그냥 resolve 해서 사용자가 고른 모델이
+ * 아닌 파이프라인으로 전사를 끝내 놓고 "성공"으로 보고했다. 이 오류로 갈라 놓아야 UI 가 구분한다.
  */
-export async function getWhisperPipeline(
-  modelId: string = 'Xenova/whisper-base',
-  onProgress?: (progress: { status: string; progress?: number; file?: string }) => void
-): Promise<AutomaticSpeechRecognitionPipeline> {
-  if (transcriberInstance && currentModelName === modelId) {
-    return transcriberInstance;
-  }
+export class SubtitleCancelledError extends Error {
+  readonly cancelled = true;
 
-  try {
-    const pipe = (await pipeline('automatic-speech-recognition', modelId, {
-      progress_callback: onProgress,
-    })) as AutomaticSpeechRecognitionPipeline;
-    transcriberInstance = pipe;
-    currentModelName = modelId;
-    return transcriberInstance;
-  } catch (err) {
-    transcriberInstance = null;
-    currentModelName = null;
-    throw err;
+  constructor(message: string = '작업이 취소되었습니다.') {
+    super(message);
+    this.name = 'SubtitleCancelledError';
+  }
+}
+
+export function isSubtitleCancelled(err: unknown): err is SubtitleCancelledError {
+  return err instanceof SubtitleCancelledError;
+}
+
+/** 로딩이 끝나기 전에 모델이 교체(resetWhisperPipeline)되어 결과를 버린 경우. */
+export class WhisperPipelineSuperseded extends SubtitleCancelledError {
+  constructor(modelId: string) {
+    super(`AI 모델(${modelId}) 로딩이 취소되었습니다. 모델 설정이 바뀌었습니다.`);
+    this.name = 'WhisperPipelineSuperseded';
+  }
+}
+
+/** await 경계마다 불러 취소를 즉시 오류로 만든다. 취소가 성공으로 resolve 되면 안 된다. */
+export function throwIfCancelled(signal?: AbortSignal) {
+  if (signal?.aborted) {
+    throw new SubtitleCancelledError();
   }
 }
 
 /**
- * Transcribe Float32Array PCM audio using local Whisper AI with exact token/word timestamps
+ * 로드된 파이프라인 하나에 대한 리스(대여증).
+ *
+ * ONNX Runtime 세션은 GC 로 회수되지 않아 dispose 를 직접 불러 줘야 하는데, 전사 중인 파이프라인을
+ * dispose 하면 세션이 사라져 그 전사가 그 자리에서 죽는다. 그래서 사용 중인 호출자 수를 세고,
+ * 캐시에서 밀려난(retired) 뒤 마지막 호출자가 반납할 때 정리한다.
+ */
+export interface WhisperPipelineLease {
+  readonly modelId: string;
+  readonly pipe: AutomaticSpeechRecognitionPipeline;
+  /** 지금 이 파이프라인으로 전사 중인 호출자 수 */
+  users: number;
+  /** 캐시에서 밀려났다: 마지막 반납 때 dispose */
+  retired: boolean;
+  disposed: boolean;
+}
+
+type LoadListener = (progress: WhisperLoadProgress) => void;
+
+interface LoadEntry {
+  promise: Promise<WhisperPipelineLease>;
+  listeners: Set<LoadListener>;
+}
+
+/** 현재 커밋된 파이프라인. small 모델이 240MB 이므로 한 번에 하나만 들고 있는다. */
+let activeLease: WhisperPipelineLease | null = null;
+/** 모델별 in-flight 로드. 겹친 호출이 같은 큰 모델을 두 번 내려받지 않게 하나를 공유한다. */
+const inFlightLoads = new Map<string, LoadEntry>();
+/** 세대 토큰. reset 이 이 값을 올리면 그 전에 시작된 로드는 커밋되지 못한다. */
+let loadGeneration = 0;
+
+function disposeLease(lease: WhisperPipelineLease) {
+  if (lease.disposed) return;
+  lease.disposed = true;
+  lease.pipe.dispose().catch((err: unknown) => {
+    // 사용자에게 알릴 것은 없지만 조용히 삼키면 ORT 세션 누수를 추적할 수 없다.
+    console.warn(`Whisper 파이프라인(${lease.modelId}) 정리 실패:`, err);
+  });
+}
+
+/** 캐시에서 밀어낸다. 아직 전사 중이면 마지막 반납 시점에 정리된다. */
+function retireLease(lease: WhisperPipelineLease) {
+  lease.retired = true;
+  if (lease.users === 0) {
+    disposeLease(lease);
+  }
+}
+
+/**
+ * 파이프라인을 대여한다. 반드시 releaseWhisperPipeline 으로 반납해야 한다(finally).
+ *
+ * - 같은 모델에 대한 동시 호출은 하나의 로드를 공유한다(예전 코드는 큰 모델을 중복으로 내려받았다).
+ * - 한 호출의 실패는 그 로드만 걷어낸다. 예전 코드는 실패하면 캐시 전체를 지워, 다른 쪽이 방금
+ *   성공적으로 올려 둔 인스턴스까지 날려 버렸다.
+ */
+export async function acquireWhisperPipeline(
+  modelId: string = 'Xenova/whisper-base',
+  onProgress?: LoadListener
+): Promise<WhisperPipelineLease> {
+  const cached = activeLease;
+  if (cached && cached.modelId === modelId && !cached.disposed) {
+    cached.users++;
+    return cached;
+  }
+
+  let entry = inFlightLoads.get(modelId);
+  if (entry) {
+    if (onProgress) entry.listeners.add(onProgress);
+  } else {
+    const listeners = new Set<LoadListener>();
+    // 로드를 시작하기 전에 등록한다. transformers.js 가 첫 진행 콜백을 동기로 부르는 경우
+    // 나중에 붙이면 그 이벤트를 놓쳐 "0%"에서 멈춘 것처럼 보인다.
+    if (onProgress) listeners.add(onProgress);
+
+    const startedAt = loadGeneration;
+    const promise = (async (): Promise<WhisperPipelineLease> => {
+      const pipe = (await pipeline('automatic-speech-recognition', modelId, {
+        progress_callback: (progress: WhisperLoadProgress) => {
+          for (const listener of listeners) listener(progress);
+        },
+      })) as AutomaticSpeechRecognitionPipeline;
+
+      const lease: WhisperPipelineLease = {
+        modelId,
+        pipe,
+        users: 0,
+        retired: false,
+        disposed: false,
+      };
+
+      if (startedAt !== loadGeneration) {
+        // 로딩 도중 모델이 교체됐다. 커밋하면 사용자가 고른 모델과 다른 모델로 전사하게 된다.
+        retireLease(lease);
+        throw new WhisperPipelineSuperseded(modelId);
+      }
+
+      const displaced = activeLease;
+      activeLease = lease;
+      if (displaced) retireLease(displaced);
+      return lease;
+    })();
+
+    const created: LoadEntry = { promise, listeners };
+    inFlightLoads.set(modelId, created);
+    const forget = () => {
+      if (inFlightLoads.get(modelId) === created) inFlightLoads.delete(modelId);
+    };
+    // 성공/실패 양쪽을 다 처리해 unhandled rejection 없이 in-flight 항목만 걷어낸다.
+    promise.then(forget, forget);
+    entry = created;
+  }
+
+  const load = entry;
+  try {
+    const lease = await load.promise;
+    if (lease.disposed) {
+      // 커밋 직후 reset 이 끼어들어 이미 정리됐다.
+      throw new WhisperPipelineSuperseded(modelId);
+    }
+    lease.users++;
+    return lease;
+  } finally {
+    if (onProgress) load.listeners.delete(onProgress);
+  }
+}
+
+/** 대여 반납. 밀려난 파이프라인은 마지막 반납에서 dispose 된다. */
+export function releaseWhisperPipeline(lease: WhisperPipelineLease) {
+  if (lease.users > 0) lease.users--;
+  if (lease.retired && lease.users === 0) {
+    disposeLease(lease);
+  }
+}
+
+/** 세션이 깨져 재사용이 위험한 파이프라인만 캐시에서 뺀다(다른 모델 인스턴스는 건드리지 않는다). */
+export function retireWhisperPipeline(lease: WhisperPipelineLease) {
+  if (activeLease === lease) activeLease = null;
+  retireLease(lease);
+}
+
+/** 모델 교체 등으로 캐시를 비운다. 진행 중인 로드는 커밋되지 못하고 취소로 끝난다. */
+export function resetWhisperPipeline() {
+  loadGeneration++;
+  inFlightLoads.clear();
+  const lease = activeLease;
+  activeLease = null;
+  if (lease) retireLease(lease);
+}
+
+/**
+ * Float32Array PCM(16kHz)을 로컬 Whisper 로 전사한다. 단어/구간 타임스탬프를 실측한다.
+ *
+ * 주의: audioPcm 은 제자리에서 세정(NaN/Inf → 0)되므로 호출자는 원본 값을 다시 쓰지 않는다.
+ * 방어용 사본을 뜨면 1시간 오디오(5,760만 샘플)에서 230MB 를 더 태운다.
  */
 export async function runLocalWhisperTranscribe(
   audioPcm: Float32Array,
   modelId: string = 'Xenova/whisper-base',
   onProgress?: (statusMsg: string, percent?: number) => void,
-  language: string = 'korean'
+  language: string = 'korean',
+  signal?: AbortSignal
 ): Promise<WhisperTranscribeResult> {
-  onProgress?.('AI 모델을 준비하고 있습니다...', 10);
+  // 취소된 뒤에는 진행 콜백을 부르지 않는다. 언마운트된 화면의 setState 를 깨우면 안 된다.
+  const report = (message: string, percent?: number) => {
+    if (signal?.aborted) return;
+    onProgress?.(message, percent);
+  };
 
-  let transcriber: AutomaticSpeechRecognitionPipeline;
+  throwIfCancelled(signal);
+  report('AI 모델을 준비하고 있습니다...', 10);
+
+  let lease: WhisperPipelineLease;
   try {
-    transcriber = await getWhisperPipeline(modelId, (data) => {
+    lease = await acquireWhisperPipeline(modelId, (data) => {
       if (data.status === 'progress' && typeof data.progress === 'number') {
         const pct = Math.round(data.progress);
-        onProgress?.(`AI 모델 다운로드/로딩 중... (${pct}%)`, 10 + Math.round(pct * 0.4));
+        report(`AI 모델 다운로드/로딩 중... (${pct}%)`, 10 + Math.round(pct * 0.4));
       } else if (data.status === 'done') {
-        onProgress?.('AI 모델 준비 완료, 음성 전사 시작...', 50);
+        report('AI 모델 준비 완료, 음성 전사 시작...', 50);
       }
     });
   } catch (err: unknown) {
+    if (isSubtitleCancelled(err)) throw err; // 취소는 취소로 전달한다
     const msg = err instanceof Error ? err.message : String(err);
-    resetWhisperPipeline();
     throw new Error(`AI 모델 로딩 실패: ${msg}`);
   }
 
-  onProgress?.('로컬 AI가 실제 음성 단어 및 타임코드를 정밀 분석 중입니다...', 60);
-
-  const cleanPcm = new Float32Array(audioPcm);
-  const langParam = language === 'auto' || !language ? undefined : language;
-
-  interface TranscriptionResultShape {
-    text?: string;
-    chunks?: Array<{ text?: string; timestamp?: [number, number] }>;
-  }
-
-  let output: TranscriptionResultShape | null = null;
-
-  // 1. First attempt: Word-level timestamps for sub-second precision
   try {
-    const res = await transcriber(cleanPcm, {
-      return_timestamps: 'word',
-      chunk_length_s: 30,
-      stride_length_s: 5,
-      language: langParam,
-      task: 'transcribe',
-    });
-    output = (Array.isArray(res) ? res[0] : res) as TranscriptionResultShape;
-  } catch (wordErr) {
-    console.warn('Word-level timestamps failed, falling back to segment timestamps:', wordErr);
-    // 2. Fallback attempt: Segment timestamps
+    throwIfCancelled(signal);
+    report('로컬 AI가 실제 음성 단어 및 타임코드를 정밀 분석 중입니다...', 60);
+
+    // NaN/Inf 가 하나만 섞여도 Whisper 특징 추출이 전부 NaN 으로 물든다. 사본 없이 제자리에서 고친다.
+    sanitizePcmInPlace(audioPcm);
+
+    const langParam = language === 'auto' || !language ? undefined : language;
+
+    interface TranscriptionResultShape {
+      text?: string;
+      chunks?: Array<{ text?: string; timestamp?: [number, number] }>;
+    }
+
+    let output: TranscriptionResultShape | null = null;
+
+    // 1. First attempt: Word-level timestamps for sub-second precision
     try {
-      const res = await transcriber(cleanPcm, {
-        return_timestamps: true,
+      const res = await lease.pipe(audioPcm, {
+        return_timestamps: 'word',
         chunk_length_s: 30,
         stride_length_s: 5,
         language: langParam,
         task: 'transcribe',
       });
       output = (Array.isArray(res) ? res[0] : res) as TranscriptionResultShape;
-    } catch (segErr: unknown) {
-      const msg = segErr instanceof Error ? segErr.message : String(segErr);
-      resetWhisperPipeline();
-      throw new Error(`Whisper 음성 분석 중 오류 발생: ${msg}`);
+    } catch (wordErr) {
+      console.warn('Word-level timestamps failed, falling back to segment timestamps:', wordErr);
+      // 2. Fallback attempt: Segment timestamps
+      try {
+        const res = await lease.pipe(audioPcm, {
+          return_timestamps: true,
+          chunk_length_s: 30,
+          stride_length_s: 5,
+          language: langParam,
+          task: 'transcribe',
+        });
+        output = (Array.isArray(res) ? res[0] : res) as TranscriptionResultShape;
+      } catch (segErr: unknown) {
+        const msg = segErr instanceof Error ? segErr.message : String(segErr);
+        // 세션이 깨진 파이프라인을 그대로 두면 다음 시도도 같은 자리에서 죽는다. 이 리스만 뺀다.
+        retireWhisperPipeline(lease);
+        throw new Error(`Whisper 음성 분석 중 오류 발생: ${msg}`);
+      }
     }
-  }
 
-  onProgress?.('음성 분석 완료! 대본과 정밀 타임라인 정렬 중...', 95);
+    throwIfCancelled(signal);
+    report('음성 분석 완료! 대본과 정밀 타임라인 정렬 중...', 95);
 
-  const rawChunks: WhisperChunk[] = [];
-  if (output && Array.isArray(output.chunks)) {
-    for (const c of output.chunks) {
-      if (c && c.timestamp && Array.isArray(c.timestamp)) {
-        const rawStart = typeof c.timestamp[0] === 'number' && !isNaN(c.timestamp[0]) ? c.timestamp[0] : 0;
-        const rawEnd = typeof c.timestamp[1] === 'number' && !isNaN(c.timestamp[1]) ? c.timestamp[1] : rawStart + 0.3;
-        const start = Math.max(0, rawStart);
-        const end = Math.max(start + 0.05, rawEnd);
-        const text = (c.text || '').trim();
-        if (text.length > 0) {
-          rawChunks.push({
-            text,
-            timestamp: [start, end],
-          });
+    const rawChunks: WhisperChunk[] = [];
+    if (output && Array.isArray(output.chunks)) {
+      for (const c of output.chunks) {
+        if (c && c.timestamp && Array.isArray(c.timestamp)) {
+          const rawStart = typeof c.timestamp[0] === 'number' && !isNaN(c.timestamp[0]) ? c.timestamp[0] : 0;
+          const rawEnd = typeof c.timestamp[1] === 'number' && !isNaN(c.timestamp[1]) ? c.timestamp[1] : rawStart + 0.3;
+          const start = Math.max(0, rawStart);
+          const end = Math.max(start + 0.05, rawEnd);
+          const text = (c.text || '').trim();
+          if (text.length > 0) {
+            rawChunks.push({
+              text,
+              timestamp: [start, end],
+            });
+          }
         }
       }
     }
+
+    return {
+      text: (output?.text || '').trim(),
+      chunks: rawChunks,
+    };
+  } finally {
+    releaseWhisperPipeline(lease);
+  }
+}
+
+/** NaN/Inf 를 제자리에서 0 으로 바꾼다. 추가 배열을 만들지 않는다(1시간 오디오 = 230MB). */
+function sanitizePcmInPlace(pcm: Float32Array) {
+  for (let i = 0; i < pcm.length; i++) {
+    if (!Number.isFinite(pcm[i])) {
+      pcm[i] = 0;
+    }
+  }
+}
+
+/** LRC 타임스탬프 `[mm:ss.xx]` */
+const LRC_TIMESTAMP = /\[\d{1,2}:\d{2}(?:\.\d+)?\]/g;
+/** SRT/VTT 타임코드 줄 `00:00:01,000 --> 00:00:03,000` */
+const CUE_TIME_LINE = /^\d{2}:\d{2}:\d{2}[,.]\d{3}\s*-->\s*\d{2}:\d{2}:\d{2}[,.]\d{3}/;
+/** SRT 블록 머리의 숫자 인덱스 줄 */
+const CUE_INDEX_LINE = /^\d{1,6}$/;
+/** VTT 큐 설정(`align:start position:50%`)만 남은 줄 */
+const CUE_SETTINGS_ONLY = /^[a-zA-Z]+:\S+(?:\s+[a-zA-Z]+:\S+)*$/;
+
+/**
+ * 대본 원문에서 자막 본문으로 쓸 줄만 뽑는다.
+ *
+ * 이미 만든 SRT 를 그대로 붙여 넣는 경우가 많아 블록 단위로 파싱한다. 예전 코드는 타임코드만
+ * 지웠기 때문에 블록 머리의 숫자 인덱스("1", "2"...)가 자막 본문으로 남아, 자막 줄 절반이
+ * 숫자만 있는 줄이 됐다.
+ */
+function extractContentLines(rawText: string): string[] {
+  const rawLines = rawText.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
+  const contentLines: string[] = [];
+
+  const nextNonEmpty = (from: number): number => {
+    for (let j = from; j < rawLines.length; j++) {
+      if (rawLines[j].trim().length > 0) return j;
+    }
+    return -1;
+  };
+
+  for (let i = 0; i < rawLines.length; i++) {
+    const line = rawLines[i].trim();
+    if (line.length === 0) continue;
+    if (/^WEBVTT/.test(line)) continue; // VTT 헤더
+
+    // 숫자 인덱스 + 타임코드 = SRT 블록 머리. 인덱스와 타임코드 줄을 함께 소비한다.
+    if (CUE_INDEX_LINE.test(line)) {
+      const next = nextNonEmpty(i + 1);
+      if (next >= 0 && CUE_TIME_LINE.test(rawLines[next].trim())) {
+        i = next;
+        continue;
+      }
+    }
+
+    if (CUE_TIME_LINE.test(line)) {
+      // 타임코드와 같은 줄에 본문이 붙어 있는 변종도 있다. 큐 설정만 남으면 버린다.
+      const rest = line.replace(CUE_TIME_LINE, '').trim();
+      if (rest.length > 0 && !CUE_SETTINGS_ONLY.test(rest)) {
+        contentLines.push(rest);
+      }
+      continue;
+    }
+
+    const withoutLrc = line.replace(LRC_TIMESTAMP, '').trim();
+    if (withoutLrc.length > 0) contentLines.push(withoutLrc);
   }
 
-  return {
-    text: (output?.text || '').trim(),
-    chunks: rawChunks,
-  };
+  return contentLines;
 }
 
 /**
  * Robust sentence and chunk splitter for subtitles
+ *
+ * 길이 기준은 코드포인트다. Rust 쪽(`chars().count()`)과 같은 기준이어야 VAD 엔진과 Whisper
+ * 엔진이 같은 대본에서 같은 줄을 만든다.
  */
 export function splitScriptIntoLines(
   rawText: string,
@@ -152,25 +398,14 @@ export function splitScriptIntoLines(
   maxChars: number = 28,
   splitOnComma: boolean = false
 ): string[] {
-  // 1. Remove timestamps like [00:01.00] or SRT format headers
-  const lrcRegex = /\[\d{1,2}:\d{2}(?:\.\d+)?\]/g;
-  const srtRegex = /\d{2}:\d{2}:\d{2}[,\.]\d{3}\s*-->\s*\d{2}:\d{2}:\d{2}[,\.]\d{3}/g;
-  const cleanRaw = rawText
-    .replace(lrcRegex, '')
-    .replace(srtRegex, '')
-    .replace(/\r\n/g, '\n')
-    .replace(/\r/g, '\n');
+  const initialLines = extractContentLines(rawText);
 
-  // 2. Line mode: return non-empty lines directly
+  // Line mode: 정리된 본문 줄을 그대로 쓴다
   if (mode === 'line') {
-    return cleanRaw
-      .split('\n')
-      .map((l) => l.trim())
-      .filter((l) => l.length > 0);
+    return initialLines;
   }
 
-  // 3. Sentence / Auto / Length splitting
-  const initialLines = cleanRaw.split('\n').map((l) => l.trim()).filter((l) => l.length > 0);
+  const limit = Math.max(1, Math.floor(maxChars));
   const sentences: string[] = [];
 
   for (const line of initialLines) {
@@ -216,10 +451,10 @@ export function splitScriptIntoLines(
       if (mode === 'sentence') {
         sentences.push(p);
       } else if (mode === 'auto' || mode === 'length') {
-        if (p.length <= maxChars) {
+        if (codePointLength(p) <= limit) {
           sentences.push(p);
         } else {
-          const subChunks = splitByLength(p, maxChars);
+          const subChunks = splitByLength(p, limit);
           sentences.push(...subChunks);
         }
       }
@@ -229,28 +464,103 @@ export function splitScriptIntoLines(
   return sentences.filter((s) => s.length > 0);
 }
 
-function splitByLength(text: string, maxChars: number): string[] {
-  if (text.length <= maxChars) return [text];
+/**
+ * 코드포인트 개수. Rust `chars().count()` 와 같은 값이어야 한다.
+ *
+ * `String.length`(UTF-16 코드유닛)로 세면 이모지·희귀 한자가 두 글자로 잡혀 자막 줄 길이가
+ * 백엔드와 어긋난다. 반복자 대신 인덱스로 훑어 코드포인트마다 문자열을 새로 만들지 않는다.
+ */
+function codePointLength(text: string): number {
+  let count = 0;
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    if (code >= 0xd800 && code <= 0xdbff && i + 1 < text.length) {
+      const low = text.charCodeAt(i + 1);
+      if (low >= 0xdc00 && low <= 0xdfff) i++; // 서로게이트 페어는 코드포인트 1개
+    }
+    count++;
+  }
+  return count;
+}
 
-  const words = text.split(/\s+/).filter((w) => w.length > 0);
-  if (words.length <= 1) return [text];
+/** 코드포인트 경계에서만 자른다(서로게이트 페어를 반토막 내지 않는다). */
+function splitByCodePoints(text: string, limit: number): string[] {
+  const pieces: string[] = [];
+  let start = 0;
+  let count = 0;
 
-  const chunks: string[] = [];
-  let current = '';
-
-  for (const w of words) {
-    if (current.length + w.length + 1 > maxChars && current.length > 0) {
-      chunks.push(current.trim());
-      current = w;
-    } else {
-      current += (current ? ' ' : '') + w;
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    if (code >= 0xd800 && code <= 0xdbff && i + 1 < text.length) {
+      const low = text.charCodeAt(i + 1);
+      if (low >= 0xdc00 && low <= 0xdfff) i++;
+    }
+    count++;
+    if (count >= limit) {
+      pieces.push(text.slice(start, i + 1));
+      start = i + 1;
+      count = 0;
     }
   }
 
-  if (current.trim()) {
-    chunks.push(current.trim());
+  if (start < text.length) {
+    pieces.push(text.slice(start));
+  }
+  return pieces;
+}
+
+/**
+ * 긴 줄을 maxChars(코드포인트) 이하로 쪼갠다.
+ *
+ * 예전 코드는 공백에서만 쪼개고 단어가 하나면 원문을 그대로 돌려줬다. 그래서 공백 없이 이어 쓴
+ * 한국어/중국어 장문은 한계를 완전히 무시한 한 줄로 남아 화면을 덮었다. 토큰 자체가 한계를
+ * 넘으면 코드포인트 경계로 자른다.
+ */
+function splitByLength(text: string, maxChars: number): string[] {
+  const limit = Math.max(1, Math.floor(maxChars));
+  if (codePointLength(text) <= limit) return [text];
+
+  const chunks: string[] = [];
+  let current = '';
+  let currentLen = 0;
+
+  const flush = () => {
+    const trimmed = current.trim();
+    if (trimmed.length > 0) chunks.push(trimmed);
+    current = '';
+    currentLen = 0;
+  };
+
+  for (const word of text.split(/\s+/)) {
+    if (word.length === 0) continue;
+    const wordLen = codePointLength(word);
+
+    if (wordLen > limit) {
+      flush();
+      const pieces = splitByCodePoints(word, limit);
+      for (let i = 0; i < pieces.length - 1; i++) {
+        chunks.push(pieces[i]);
+      }
+      // 마지막 조각은 뒤따르는 단어와 합칠 수 있으므로 현재 줄로 넘긴다.
+      current = pieces[pieces.length - 1];
+      currentLen = codePointLength(current);
+      continue;
+    }
+
+    if (currentLen > 0 && currentLen + 1 + wordLen > limit) {
+      flush();
+    }
+
+    if (currentLen > 0) {
+      current += ' ' + word;
+      currentLen += 1 + wordLen;
+    } else {
+      current = word;
+      currentLen = wordLen;
+    }
   }
 
+  flush();
   return chunks;
 }
 
@@ -479,18 +789,33 @@ export function alignScriptWithWhisperChunks(
 
   if (U === 0) return [];
 
-  // 3. Dynamic Programming Matrix Alignment (Needleman-Wunsch with banded diagonal)
+  // 3. Dynamic Programming Alignment (Needleman-Wunsch with banded diagonal)
   const NEG_INF = -1e9;
   const band = Math.max(50, Math.round(V * 0.45));
 
-  const dp: Float32Array[] = Array.from({ length: U + 1 }, () => new Float32Array(V + 1).fill(NEG_INF));
-  const ptr: Uint8Array[] = Array.from({ length: U + 1 }, () => new Uint8Array(V + 1)); // 1: match, 2: skip_script, 3: skip_token
+  // dp 는 (u-1) 행과 u 행만 읽으므로 두 줄만 들고 돈다. 전체 행렬을 잡으면 1시간 녹음
+  // (대본 9천 단어 × 토큰 1만)에서 점수 행렬만 360MB 를 태운다.
+  let prevRow = new Float32Array(V + 1);
+  let curRow = new Float32Array(V + 1);
 
-  dp[0][0] = 0;
+  // 백포인터는 역추적에 전부 필요하지만 밴드 밖은 애초에 기록되지 않는다. 그래서 밴드 폭만 잡고
+  // 셀당 2비트(0: 미기입, 1: 매치, 2: 대본 건너뜀, 3: 토큰 건너뜀)로 눌러 담는다.
+  const rowWidth = Math.min(V, 2 * band + 1);
+  const rowMin = new Int32Array(U + 1);
+  const moves = new Uint8Array(Math.ceil((U * rowWidth) / 4));
 
+  // 밴드 밖 조회는 0(미기입)이다. 예전 전체 행렬에서 손대지 않은 칸을 읽던 것과 결과가 같다.
+  const readMove = (u: number, v: number): number => {
+    const offset = v - rowMin[u];
+    if (offset < 0 || offset >= rowWidth) return 0;
+    const cell = (u - 1) * rowWidth + offset;
+    return (moves[cell >> 2] >> ((cell & 3) << 1)) & 3;
+  };
+
+  prevRow.fill(NEG_INF);
+  prevRow[0] = 0;
   for (let v = 1; v <= V; v++) {
-    dp[0][v] = dp[0][v - 1] - 0.05; // tiny penalty for leading noise
-    ptr[0][v] = 3;
+    prevRow[v] = prevRow[v - 1] - 0.05; // tiny penalty for leading noise
   }
 
   for (let u = 1; u <= U; u++) {
@@ -498,9 +823,13 @@ export function alignScriptWithWhisperChunks(
     const centerV = Math.round((u / U) * V);
     const minV = Math.max(1, centerV - band);
     const maxV = Math.min(V, centerV + band);
+    rowMin[u] = minV;
 
-    dp[u][0] = dp[u - 1][0] - 0.3;
-    ptr[u][0] = 2;
+    // 행을 재사용하므로 이전 사용 흔적을 반드시 지운다. 밴드 밖은 NEG_INF 여야 한다.
+    curRow.fill(NEG_INF);
+    curRow[0] = prevRow[0] - 0.3;
+
+    const rowBase = (u - 1) * rowWidth;
 
     for (let v = minV; v <= maxV; v++) {
       const tWord = cleanTokens[v - 1];
@@ -508,19 +837,18 @@ export function alignScriptWithWhisperChunks(
 
       // Match transition
       let matchScore = NEG_INF;
-      if (dp[u - 1][v - 1] > NEG_INF / 2) {
-        if (sim >= 0.35) {
-          matchScore = dp[u - 1][v - 1] + (sim * 2.5) - 0.1;
-        } else {
-          matchScore = dp[u - 1][v - 1] - 0.6;
-        }
+      const diag = prevRow[v - 1];
+      if (diag > NEG_INF / 2) {
+        matchScore = sim >= 0.35 ? diag + sim * 2.5 - 0.1 : diag - 0.6;
       }
 
       // Skip script word (deletion in audio)
-      const skipScriptScore = dp[u - 1][v] > NEG_INF / 2 ? dp[u - 1][v] - 0.35 : NEG_INF;
+      const up = prevRow[v];
+      const skipScriptScore = up > NEG_INF / 2 ? up - 0.35 : NEG_INF;
 
       // Skip token (insertion in audio / noise)
-      const skipTokenScore = dp[u][v - 1] > NEG_INF / 2 ? dp[u][v - 1] - 0.15 : NEG_INF;
+      const left = curRow[v - 1];
+      const skipTokenScore = left > NEG_INF / 2 ? left - 0.15 : NEG_INF;
 
       let best = matchScore;
       let move = 1;
@@ -534,29 +862,36 @@ export function alignScriptWithWhisperChunks(
         move = 3;
       }
 
-      dp[u][v] = best;
-      ptr[u][v] = move;
+      curRow[v] = best;
+      const cell = rowBase + (v - minV);
+      moves[cell >> 2] |= move << ((cell & 3) << 1); // 셀마다 한 번만 쓰므로 OR 로 충분하다
     }
+
+    const swap = prevRow;
+    prevRow = curRow;
+    curRow = swap;
   }
+
+  // swap 때문에 마지막 행(u = U)은 prevRow 에 들어 있다.
+  const lastRow = prevRow;
 
   // 4. Backtrack to extract matched token intervals
   let currU = U;
-  let currV = V;
 
   let bestEndV = V;
-  let maxEndScore = dp[U][V];
+  let maxEndScore = lastRow[V];
   for (let v = Math.max(1, V - 20); v <= V; v++) {
-    if (dp[U][v] > maxEndScore) {
-      maxEndScore = dp[U][v];
+    if (lastRow[v] > maxEndScore) {
+      maxEndScore = lastRow[v];
       bestEndV = v;
     }
   }
-  currV = bestEndV;
+  let currV = bestEndV;
 
   const scriptMatches: Array<{ tokenIndex: number; sim: number; start: number; end: number } | null> = new Array(U).fill(null);
 
   while (currU > 0 && currV > 0) {
-    const move = ptr[currU][currV];
+    const move = readMove(currU, currV);
     if (move === 1) {
       const sim = computeWordSimilarity(scriptWords[currU - 1].clean, cleanTokens[currV - 1].clean);
       if (sim >= 0.3) {
@@ -699,20 +1034,24 @@ export function generateSubtitlesFromAiChunks(
   if (words.length === 0) return [];
 
   const items: SubtitleItem[] = [];
+  const limit = Math.max(1, Math.floor(maxChars));
   let currentWords: string[] = [];
+  // 줄 길이는 코드포인트 기준(백엔드 `chars().count()` 와 동일)으로 누적한다. 매 단어마다
+  // join 해서 길이를 재면 긴 자막에서 O(n^2) 로 늘어나기도 한다.
+  let currentLen = 0;
   let currentStart = words[0].start;
   let currentEnd = words[0].end;
 
   for (let i = 0; i < words.length; i++) {
     const w = words[i];
     const prevW = i > 0 ? words[i - 1] : null;
+    const wordLen = codePointLength(w.text);
 
     // Check pause between words (> 0.45s indicates phrase break)
     const hasLongPause = prevW ? w.start - prevW.end > 0.45 : false;
-    const currentLineLen = currentWords.join(' ').length;
-    const isPunctuationEnd = prevW && /[.?!…~]$/.test(prevW.text);
+    const isPunctuationEnd = prevW ? /[.?!…~]$/.test(prevW.text) : false;
 
-    if (currentWords.length > 0 && (hasLongPause || isPunctuationEnd || currentLineLen + w.text.length + 1 > maxChars)) {
+    if (currentWords.length > 0 && (hasLongPause || isPunctuationEnd || currentLen + 1 + wordLen > limit)) {
       items.push({
         index: items.length + 1,
         start_secs: currentStart,
@@ -722,11 +1061,15 @@ export function generateSubtitlesFromAiChunks(
         text: currentWords.join(' '),
       });
       currentWords = [w.text];
+      currentLen = wordLen;
       currentStart = w.start;
       currentEnd = w.end;
     } else {
       if (currentWords.length === 0) {
         currentStart = w.start;
+        currentLen = wordLen;
+      } else {
+        currentLen += 1 + wordLen;
       }
       currentWords.push(w.text);
       currentEnd = w.end;

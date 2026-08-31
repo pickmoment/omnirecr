@@ -1,3 +1,8 @@
+/**
+ * 녹화 영역. 좌표는 **가상 데스크톱 전역 물리 픽셀**이다(모니터 로컬이 아니다).
+ * 오버레이가 모니터 원점(`SelectionScreenInfo.physical_x/y`)을 더해서 보낸다.
+ * 주 모니터보다 왼쪽/위에 있는 모니터는 음수가 될 수 있어 0 으로 클램프하면 안 된다.
+ */
 export interface RectRegion {
   x: number;
   y: number;
@@ -6,6 +11,10 @@ export interface RectRegion {
 }
 
 export interface SelectionScreenInfo {
+  /** 이 모니터의 가상 데스크톱 전역 물리 원점 X */
+  physical_x: number;
+  /** 이 모니터의 가상 데스크톱 전역 물리 원점 Y */
+  physical_y: number;
   physical_width: number;
   physical_height: number;
   scale_factor: number;
@@ -273,6 +282,13 @@ export interface TypecastDebugPayload {
   at: string;
 }
 
+
+/** 대본 제목이 실제로 어떤 파일로 저장될지 Rust 가 계산해 준 결과. */
+export interface ScriptRecordingTarget {
+  prefix: string;
+  path: string;
+  exists: boolean;
+}
 
 export type BatchItemStatus =
   | 'pending'

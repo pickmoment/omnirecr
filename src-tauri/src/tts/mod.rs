@@ -43,19 +43,51 @@ use crate::types::{
 /// 페이지 → 앱 브리지에 쓰는 CDP 바인딩 이름. 최상위 프레임에서만 호출된다.
 const BRIDGE_BINDING_NAME: &str = "__omnirecBridge";
 
+/// 세션이 살아 있는지 확인하는 CDP 왕복의 제한 시간.
+/// 죽은 브라우저는 응답이 아예 오지 않으므로 "안 오면 죽은 것"으로 판정한다.
+const LIVENESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// 브라우저 종료(close + wait)에 허용하는 시간.
+const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// 네비게이션 완료를 기다리는 예산. `page.goto()` 의 하드코딩된 30초를 쓰지 않고
+/// 우리가 폴링하므로 값도 우리가 정한다(무거운 SPA 는 30초를 쉽게 넘긴다).
+const NAVIGATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// 브리지 페이로드의 바이트 상한.
+///
+/// 바인딩(`__omnirecBridge`)은 **원격 페이지에 그대로 노출된 함수**다. 페이지 코드나
+/// 거기 끼어든 서드파티 스크립트가 임의 크기 문자열을 밀어 넣을 수 있으므로, 파싱
+/// 전에 크기부터 본다. 이게 없으면 한 번의 호출로 Tauri 이벤트 큐와 프론트엔드 진단
+/// 로그가 통째로 잠긴다.
+const MAX_BRIDGE_PAYLOAD_BYTES: usize = 16 * 1024;
+
+/// `typecast_step` 으로 내보내는 단계 이름 / 상세의 상한(문자 수).
+/// UTF-8 경계에서 자르기 위해 바이트가 아니라 문자 수로 센다(`debug()` 와 같은 방식).
+const MAX_STEP_NAME_CHARS: usize = 64;
+const MAX_STEP_DETAIL_CHARS: usize = 600;
+
+/// 세션 세대 발급기.
+///
+/// `discard_dead_session` 이 **자기 세션만** 버리도록 하는 표식이다. 이 값이 없으면
+/// 뒤늦게 종료된 옛 handler 태스크가 방금 만든 새 세션을 지운다.
+static SESSION_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// 네비게이션 표식 발급기. 이동 전 문서에 심어 두고, 이 값이 사라진 것으로
+/// "새 문서가 커밋됐다"를 판정한다(`navigate_and_wait`).
+static NAV_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 /// 로그인 화면으로 판단할 URL 경로 조각.
 const SIGN_IN_PATH_HINTS: [&str; 6] = [
-    "/sign-in",
-    "/signin",
-    "/login",
-    "/sign-up",
-    "/signup",
-    "/auth",
+    "/sign-in", "/signin", "/login", "/sign-up", "/signup", "/auth",
 ];
 
 /// 실행 중인 Chrome 세션 하나. 앱 전체에 Typecast 창은 하나만 존재하는 모델이라
 /// 세션도 하나만 유지한다.
 struct CdpSession {
+    /// 이 세션의 세대. 슬롯에 있는 세션이 "내가 만든 그 세션"인지 확인하는 데 쓴다.
+    /// 세션 객체를 비교할 수단이 없어(Browser 는 Clone/Eq 둘 다 아니다) 번호로 판정한다.
+    id: u64,
     browser: Browser,
     main_page: Page,
     handler_task: tokio::task::JoinHandle<()>,
@@ -69,8 +101,23 @@ impl CdpSession {
         // browser.close() 는 CDP 요청/응답 왕복이라 handler_task(연결을 실제로 읽는 루프)가
         // 계속 돌고 있어야 응답을 받는다. handler_task 를 먼저 abort 하면 close() 가
         // 영원히 응답을 못 받아 멈춘다 — 반드시 close() → wait() 다음에 태스크들을 정리한다.
-        let _ = self.browser.close().await;
-        let _ = self.browser.wait().await;
+        //
+        // 브라우저가 **이미 죽어 있으면** 그 응답은 영영 오지 않는다(사용자가 Chrome 창을
+        // 직접 닫은 뒤 앱의 닫기를 누른 경우). 시간 제한을 걸어 반드시 태스크 정리까지
+        // 도달하게 한다 — 여기서 멈추면 다음 `open()` 이 상태 잠금을 못 얻어 창이 안 뜬다.
+        {
+            let browser = &mut self.browser;
+            let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, async move {
+                let _ = browser.close().await;
+                let _ = browser.wait().await;
+            })
+            .await;
+        }
+        self.abort_tasks();
+    }
+
+    /// CDP 왕복 없이 백그라운드 태스크만 정리한다. 브라우저가 이미 죽은 경우에 쓴다.
+    fn abort_tasks(&self) {
         self.handler_task.abort();
         self.binding_task.abort();
         self.navigation_task.abort();
@@ -78,12 +125,29 @@ impl CdpSession {
     }
 }
 
-/// Tauri 관리 상태. 세션이 없으면 `None`.
-pub struct TypecastCdpState(AsyncMutex<Option<CdpSession>>);
+/// Tauri 관리 상태.
+///
+/// **잠금 순서는 `transition` → `session` 이며, 반대로 잡지 말 것.**
+///
+/// - `session`: 세션 슬롯(없으면 `None`). **CDP `await` 너머로 들고 있지 말 것** —
+///   죽은 세션의 응답을 기다리는 동안 붙들면, 연결이 끊겨 세션을 정리하려는 handler
+///   태스크가 이 잠금을 못 얻어 서로 영원히 기다린다. 핸들(`Page` 클론)만 꺼내거나
+///   세션을 통째로 `take()` 한 뒤 잠금을 놓고 왕복한다.
+/// - `transition`: open/close/clear_session 전이 직렬화용. 이 잠금은 CDP 왕복을 넘어
+///   들고 있어도 된다 — handler 태스크(`discard_dead_session`)는 `session` 만 잡으므로
+///   교착이 생기지 않는다. 대신 이 잠금을 든 상태에서 `session` 을 CDP `await` 너머로
+///   겹쳐 잡지 말 것(그 순간 위의 교착이 그대로 되살아난다).
+pub struct TypecastCdpState {
+    session: AsyncMutex<Option<CdpSession>>,
+    transition: AsyncMutex<()>,
+}
 
 impl TypecastCdpState {
     pub fn new() -> Self {
-        Self(AsyncMutex::new(None))
+        Self {
+            session: AsyncMutex::new(None),
+            transition: AsyncMutex::new(()),
+        }
     }
 }
 
@@ -140,6 +204,20 @@ impl TypecastController {
     /// `open`/`close`/`msg` 같은 팝업 브리지 케이스는 실제 브라우저에서는 필요 없다 —
     /// 진짜 팝업의 `window.opener.postMessage` / `popup.close()` 가 그대로 동작한다.
     fn handle_bridge_message(app: &AppHandle, message: &str) {
+        // 크기부터 본다. 원격 페이지가 부르는 함수이므로 내용은 신뢰할 수 없다.
+        if message.len() > MAX_BRIDGE_PAYLOAD_BYTES {
+            Self::debug(
+                app,
+                "bridge:oversized",
+                &format!(
+                    "{}바이트 페이로드를 버렸습니다(상한 {}바이트)",
+                    message.len(),
+                    MAX_BRIDGE_PAYLOAD_BYTES
+                ),
+            );
+            return;
+        }
+
         let (kind, payload) = match message.split_once(':') {
             Some((k, p)) => (k, p),
             None => (message, ""),
@@ -149,9 +227,13 @@ impl TypecastController {
 
         if kind == "step" {
             let (name, detail) = match payload.split_once(':') {
-                Some((n, d)) => (n.to_string(), d.to_string()),
-                None => (payload.to_string(), String::new()),
+                Some((n, d)) => (n, d),
+                None => (payload, ""),
             };
+            // 상한을 넘기면 자른다. 문자 단위로 세어 UTF-8 경계를 깨지 않는다 —
+            // 바이트로 자르면 한글 진단 문자열 중간이 잘려 프론트엔드가 깨진 글자를 받는다.
+            let name: String = name.chars().take(MAX_STEP_NAME_CHARS).collect();
+            let detail: String = detail.chars().take(MAX_STEP_DETAIL_CHARS).collect();
             let _ = app.emit("typecast_step", TypecastStepPayload { name, detail });
         }
     }
@@ -173,13 +255,116 @@ impl TypecastController {
         app.state::<TypecastCdpState>()
     }
 
+    /// 남아 있는 세션 객체를 버린다. `browser.close()` 는 부르지 않는다 — 이 경로는
+    /// 브라우저가 이미 죽었을 때만 쓰이고, CDP 응답을 기다리면 영원히 멈춘다.
+    ///
+    /// **슬롯의 세션이 `id` 와 같을 때만** 버린다. 세대 검증이 없던 시절에는 뒤늦게
+    /// 종료된 옛 handler 태스크가 슬롯을 무조건 `take()` 해, 그 사이 새로 만들어진
+    /// 멀쩡한 세션을 지우고 그 백그라운드 태스크 4개까지 abort 했다 — 창은 떠 있는데
+    /// 브리지·네비게이션 이벤트가 전부 죽어 자동 녹음이 조용히 멈춘다.
+    async fn discard_dead_session(app: &AppHandle, id: u64) {
+        let session = {
+            let state = Self::cdp_state(app);
+            let mut guard = state.session.lock().await;
+            // 세대가 다르면 손대지 않는다(슬롯의 세션은 내 것이 아니다).
+            if guard.as_ref().map(|session| session.id) == Some(id) {
+                guard.take()
+            } else {
+                None
+            }
+        };
+        if let Some(session) = session {
+            session.abort_tasks();
+        }
+    }
+
+    /// 살아 있는 메인 페이지와 그 URL 을 돌려준다. 세션이 없거나 죽었으면 `None`.
+    ///
+    /// 세션 객체가 남아 있다고 브라우저가 살아 있는 것은 아니다 — 사용자가 Chrome 창을
+    /// 직접 닫거나 프로세스가 죽으면 객체만 남고 CDP 응답은 오지 않는다. 이 상태를 걸러
+    /// 내지 않으면 다음 `open()` 이 "이미 열려 있다"고 판단해 창을 새로 띄우지 않는다
+    /// (실측: 한 번 녹음한 뒤 창을 닫고 다시 시작하면 브라우저가 안 뜨는 증상).
+    ///
+    /// **상태 잠금을 CDP `await` 너머로 들고 있지 말 것.** 죽은 세션의 응답을 기다리는
+    /// 동안 잠금을 붙들면, 연결이 끊겼을 때 세션을 정리하려는 handler 태스크가 그 잠금을
+    /// 못 얻어 서로 영원히 기다린다.
+    async fn live_main_page(app: &AppHandle) -> Option<(Page, Option<String>)> {
+        // 세대까지 함께 꺼낸다 — 왕복이 실패했을 때 버려야 할 대상은 **그때 확인한 그
+        // 세션**이다. 그 사이 새 세션이 설치됐다면 그것을 지워선 안 된다.
+        let (page, id) = {
+            let state = Self::cdp_state(app);
+            let guard = state.session.lock().await;
+            guard
+                .as_ref()
+                .map(|session| (session.main_page.clone(), session.id))
+        }?;
+
+        match tokio::time::timeout(LIVENESS_TIMEOUT, page.url()).await {
+            Ok(Ok(url)) => Some((page, url)),
+            _ => {
+                Self::debug(
+                    app,
+                    "session-dead",
+                    "브라우저가 응답하지 않아 세션을 정리합니다",
+                );
+                Self::discard_dead_session(app, id).await;
+                None
+            }
+        }
+    }
+
     async fn get_main_page(app: &AppHandle) -> Result<Page, String> {
         let state = Self::cdp_state(app);
-        let guard = state.0.lock().await;
+        let guard = state.session.lock().await;
         guard
             .as_ref()
             .map(|session| session.main_page.clone())
             .ok_or_else(|| "Typecast 브라우저가 열려 있지 않습니다.".to_string())
+    }
+
+    /// 남은 데드라인 안에서 페이지 JS 를 평가하고 결과 값을 그대로 돌려준다
+    /// (반환값이 `undefined` 면 `Ok(None)`).
+    ///
+    /// 개별 왕복에 시간 제한이 없으면 폴링 한 번이 멈추는 것만으로 전체 예산을 넘겨
+    /// 커맨드 타임아웃까지 밀린다 — 그러면 프론트엔드는 "이동 실패"가 아니라 "앱이
+    /// 멈췄다"를 보게 된다.
+    async fn eval_before(
+        page: &Page,
+        script: String,
+        deadline: tokio::time::Instant,
+    ) -> Result<Option<serde_json::Value>, String> {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err("남은 시간이 없습니다".to_string());
+        }
+        match tokio::time::timeout(remaining, page.evaluate(script)).await {
+            Ok(Ok(result)) => Ok(result.value().cloned()),
+            Ok(Err(e)) => Err(e.to_string()),
+            Err(_) => Err("응답 없음(시간 초과)".to_string()),
+        }
+    }
+
+    /// 프래그먼트(`#…`)만 다른 이동인가?
+    ///
+    /// 그런 이동은 같은 문서 안에서 처리되어 문서가 새로 만들어지지 않으므로,
+    /// "이동 표식이 사라졌는가"로는 완료를 영원히 판정할 수 없다. 두 URL 이 완전히
+    /// 같은 경우는 여기에 해당하지 않는다 — `location.replace()` 가 문서를 다시
+    /// 로드하므로 표식 경로가 맞다.
+    fn fragment_only_change(current: &str, target: &str) -> bool {
+        let mut from = match tauri::Url::parse(current) {
+            Ok(url) => url,
+            Err(_) => return false,
+        };
+        let mut to = match tauri::Url::parse(target) {
+            Ok(url) => url,
+            Err(_) => return false,
+        };
+        if to.fragment().is_none() || from.fragment() == to.fragment() {
+            return false;
+        }
+        from.set_fragment(None);
+        to.set_fragment(None);
+        from == to
     }
 
     /// `page.goto()`(CDP `Page.navigate`)는 chromiumoxide 0.9.1 내부에 **하드코딩된 30초**
@@ -189,35 +374,113 @@ impl TypecastController {
     /// `load` 이벤트가 30초를 넘겨 실측으로 타임아웃이 났다(예: `studio.typecast.ai`).
     ///
     /// `Page.navigate` CDP 커맨드 자체를 보내지 않고 `location.replace()` JS 로 이동시킨
-    /// 뒤 `document.readyState` 를 우리가 직접 폴링해, 타임아웃 값도 우리가 정한다.
-    /// 네비게이션이 시작되며 실행 컨텍스트가 파괴돼 `evaluate` 호출 자체가 에러를 낼 수
-    /// 있는데, 정상적인 현상이라 결과는 무시한다.
+    /// 뒤 우리가 직접 폴링해, 타임아웃 값도 우리가 정한다.
+    ///
+    /// **`document.readyState` 만 봐서는 안 된다.** `location.replace()` 는 비동기라서
+    /// 호출이 돌아온 뒤에도 잠시 **옛 문서**가 그대로 살아 있고, 그 문서의 readyState 는
+    /// 이미 `'complete'` 다. 그래서 첫 폴링이 옛 문서에서 통과해, 아무것도 로드되지
+    /// 않았는데 "이동 완료"로 넘어간다(그 다음 조작이 사라진 컨텍스트에서 실패한다).
+    /// 이동 전 문서에 표식(`window.__omnirecNavToken`)을 심고, **그 표식이 사라진**
+    /// 새 문서에서 readyState 까지 확인한 뒤에야 완료로 본다.
     async fn navigate_and_wait(
         page: &Page,
         url: &str,
         timeout: std::time::Duration,
     ) -> Result<(), String> {
-        let script = format!(
-            "location.replace({});",
-            serde_json::to_string(url).map_err(|e| e.to_string())?
-        );
-        let _ = page.evaluate(script).await;
-
         let deadline = tokio::time::Instant::now() + timeout;
+        let url_literal = serde_json::to_string(url).map_err(|e| e.to_string())?;
+        let token = NAV_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        // 표식을 심고 현재 URL 을 한 왕복으로 읽는다. 문자열이 돌아왔다는 것 자체가
+        // 표식 대입이 실행됐다는 증거다 — 표식을 못 심었다면 이동 완료를 검증할 수
+        // 없으므로(옛 문서를 새 문서로 오인한다) 이동을 시작하지 않고 실패로 끝낸다.
+        let current_url = Self::eval_before(
+            page,
+            format!("(window.__omnirecNavToken = {}, location.href)", token),
+            deadline,
+        )
+        .await
+        .map_err(|e| format!("페이지가 스크립트에 응답하지 않습니다: {}", e))?
+        .and_then(|value| value.as_str().map(|s| s.to_string()))
+        .ok_or_else(|| "이동 표식을 심을 수 없어 이동을 검증할 수 없습니다".to_string())?;
+
+        // 프래그먼트만 바뀌는 이동은 문서가 새로 만들어지지 않아 표식이 남는다.
+        // 이 앱의 이동 대상(에디터/로그인 URL)에는 프래그먼트가 없어 실제로는 발생하지
+        // 않지만, 나중에 그런 URL 이 들어왔을 때 45초를 통째로 날리지 않도록 그 경우만
+        // URL 일치로 판정한다.
+        let fragment_only = Self::fragment_only_change(&current_url, url);
+
+        // 이동을 시작한다. 네비게이션이 커밋되며 실행 컨텍스트가 파괴돼 이 호출 자체가
+        // 에러로 끝날 수 있는데, 정상적인 현상이라 실패로 보지 않는다. 대신 아래 폴링이
+        // 끝까지 완료되지 못했을 때 원인을 알 수 있게 메시지는 들고 있는다.
+        let replace_error = Self::eval_before(
+            page,
+            format!("location.replace({});", url_literal),
+            deadline,
+        )
+        .await
+        .err();
+
+        let ready_script = if fragment_only {
+            format!(
+                "location.href === {} && document.readyState !== 'loading'",
+                url_literal
+            )
+        } else {
+            format!(
+                "window.__omnirecNavToken !== {} && document.readyState !== 'loading'",
+                token
+            )
+        };
+
+        let mut last_poll_error: Option<String> = None;
         loop {
-            let ready = page
-                .evaluate("document.readyState !== 'loading'")
-                .await
-                .ok()
-                .and_then(|r| r.into_value::<bool>().ok())
-                .unwrap_or(false);
-            if ready {
-                return Ok(());
+            match Self::eval_before(page, ready_script.clone(), deadline).await {
+                Ok(Some(serde_json::Value::Bool(true))) => return Ok(()),
+                // 아직 옛 문서이거나(false) 문서 교체 중이라 컨텍스트가 잠깐 사라진
+                // 상태(에러)다. 둘 다 정상적인 과도 상태이므로 데드라인까지 계속 본다.
+                Ok(_) => {}
+                Err(e) => last_poll_error = Some(e),
             }
             if tokio::time::Instant::now() >= deadline {
-                return Err("페이지 로딩이 너무 오래 걸립니다(시간 초과)".to_string());
+                let mut message = "페이지 로딩이 너무 오래 걸립니다(시간 초과)".to_string();
+                if let Some(e) = replace_error.as_ref() {
+                    message.push_str(&format!(" · 이동 시작: {}", e));
+                }
+                if let Some(e) = last_poll_error.as_ref() {
+                    message.push_str(&format!(" · 마지막 확인: {}", e));
+                }
+                return Err(message);
             }
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    }
+
+    /// 무해한 CDP 왕복 하나로 이 브라우저가 실제로 명령을 받는지 확인한다.
+    ///
+    /// **`Handler` 를 이 자리에서 직접 굴려야 한다.** 연결을 실제로 읽는 것은 handler 이고
+    /// 이 시점에는 아직 폴링 태스크가 없으므로, 여기서 돌리지 않으면 응답이 영원히 오지
+    /// 않아 "검증"이 그냥 타임아웃으로 끝난다.
+    async fn browser_responds(
+        browser: &Browser,
+        handler: &mut Handler,
+        timeout: std::time::Duration,
+    ) -> bool {
+        let probe = browser.version();
+        tokio::pin!(probe);
+        let deadline = tokio::time::sleep(timeout);
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                result = &mut probe => return result.is_ok(),
+                event = handler.next() => {
+                    // 스트림이 끝났거나 에러가 나오면 연결이 죽은 것이다.
+                    if !matches!(event, Some(Ok(()))) {
+                        return false;
+                    }
+                }
+                _ = &mut deadline => return false,
+            }
         }
     }
 
@@ -236,7 +499,7 @@ impl TypecastController {
         profile_dir: &std::path::Path,
     ) -> Result<(Browser, Handler), String> {
         match Browser::launch(config.clone()).await {
-            Ok(pair) => return Ok(pair),
+            Ok(pair) => Ok(pair),
             Err(launch_err) => {
                 let message = launch_err.to_string();
                 if !message.contains("SingletonLock") {
@@ -244,16 +507,41 @@ impl TypecastController {
                 }
 
                 // (1) 이미 떠 있는 Chrome 에 접속을 시도한다.
+                //     `DevToolsActivePort` 는 비정상 종료 후에도 남을 수 있어, 그 포트가
+                //     응답하지 않으면 접속이 끝나지 않는다 — 시간 제한을 건다.
                 if let Some(port) = Self::read_devtools_port(profile_dir) {
-                    if let Ok(pair) = Browser::connect(format!("http://127.0.0.1:{}", port)).await
+                    let connect = Browser::connect(format!("http://127.0.0.1:{}", port));
+                    if let Ok(Ok((browser, mut handler))) =
+                        tokio::time::timeout(LIVENESS_TIMEOUT, connect).await
                     {
-                        return Ok(pair);
+                        // **접속 성공을 그대로 반환하지 말 것.** 죽어 가는 Chrome 은
+                        // 웹소켓 핸드셰이크까지는 받아 주면서 그 뒤 커맨드에는 응답하지
+                        // 않는다. 그대로 넘기면 나중에 `new_page()`/바인딩 등록이 실패해
+                        // "Typecast 페이지를 열 수 없습니다"로 끝나고, 락 파일 정리
+                        // 경로로는 영영 못 넘어간다(사용자에게는 창이 안 뜨는 증상).
+                        if Self::browser_responds(&browser, &mut handler, LIVENESS_TIMEOUT).await {
+                            return Ok((browser, handler));
+                        }
+                        // 쓸 수 없는 연결은 여기서 버린다(연결만 놓는 것이라 CDP 왕복이
+                        // 없다 — 이미 응답하지 않는 브라우저에 close() 를 걸면 멈춘다).
+                        drop(handler);
+                        drop(browser);
                     }
                 }
 
                 // (2) 접속도 안 되면 죽은 프로세스가 남긴 락으로 보고 정리한 뒤 재시도한다.
-                Self::clear_singleton_lock_files(profile_dir);
-                Browser::launch(config).await.map_err(|e| e.to_string())
+                //     방금 닫은 Chrome 이 아직 정리 중일 수 있어 잠깐 기다렸다 다시 띄운다.
+                //     재시도는 유한하게 유지한다(무한 루프 금지).
+                let mut last_error = message;
+                for _ in 0..2 {
+                    Self::clear_singleton_lock_files(profile_dir);
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    match Browser::launch(config.clone()).await {
+                        Ok(pair) => return Ok(pair),
+                        Err(e) => last_error = e.to_string(),
+                    }
+                }
+                Err(last_error)
             }
         }
     }
@@ -279,14 +567,23 @@ impl TypecastController {
         let target = Self::parse_url(&target)?;
 
         let state = Self::cdp_state(app);
-        {
-            let guard = state.0.lock().await;
-            if let Some(session) = guard.as_ref() {
-                let _ = session.main_page.bring_to_front().await;
-                drop(guard);
-                Self::activate_chrome_app();
-                return Ok(());
+        // open/close/clear 전이를 직렬화한다. 두 번 연달아 눌리면(프론트엔드의 재시도,
+        // 일괄 러너의 "창 열림 확인" 폴링) 두 실행이 겹쳐 뒤에 온 쪽이 앞의 세션을
+        // 덮어써 Chrome 프로세스와 백그라운드 태스크 4개가 통째로 누출된다.
+        // 잠금 순서는 transition → session 이며, 이 잠금은 CDP 왕복을 넘어 들고 있어도
+        // 된다(handler 태스크는 session 만 잡으므로 교착이 없다).
+        let _transition = state.transition.lock().await;
+
+        // 이미 살아 있는 창이 있으면 그것을 앞으로 올리기만 한다.
+        // 죽은 세션은 `live_main_page` 가 걸러 내며, 아래 실행 경로로 넘어간다.
+        if let Some((page, _url)) = Self::live_main_page(app).await {
+            match tokio::time::timeout(LIVENESS_TIMEOUT, page.bring_to_front()).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => Self::debug(app, "focus-failed", &e.to_string()),
+                Err(_) => Self::debug(app, "focus-timeout", "탭 활성화에 응답이 없습니다"),
             }
+            Self::activate_chrome_app();
+            return Ok(());
         }
 
         let chrome_path = SettingsManager::find_chrome(settings.custom_chrome_path.as_deref())?;
@@ -307,6 +604,12 @@ impl TypecastController {
             .await
             .map_err(|e| format!("Chrome 을 실행할 수 없습니다: {}", e))?;
 
+        // 세션 세대를 여기서 발급해 handler 태스크에 넘긴다. handler 는 자기 세션만
+        // 버려야 한다 — 예전에는 세대 없이 슬롯을 통째로 take 했고, 뒤늦게 끝난 옛
+        // handler 가 방금 만든 새 세션을 지우고 그 태스크 4개를 abort 해 브라우저가
+        // 열려 있는데 아무 명령도 먹지 않는 상태가 됐다.
+        let session_id = SESSION_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
         let handler_app = app.clone();
         let handler_task = tokio::spawn(async move {
             while let Some(event) = handler.next().await {
@@ -316,6 +619,11 @@ impl TypecastController {
             }
             // 이벤트 스트림이 끝났다는 것은 연결이 끊겼다는 뜻이다(사용자가 Chrome 을 직접 닫은 경우 포함).
             let _ = handler_app.emit("typecast_browser_closed", ());
+            // 남은 세션 객체를 반드시 버린다. 그냥 두면 다음 `open()` 이 "이미 열려 있다"고
+            // 판단해 죽은 페이지를 앞으로 올리려다 커맨드 타임아웃까지 멈추고, 정작 창은
+            // 뜨지 않는다. (프론트엔드의 `typecast_browser_closed` 처리만으로는 Rust 쪽
+            // 상태가 그대로 남는다.)
+            Self::discard_dead_session(&handler_app, session_id).await;
         });
 
         let setup: Result<
@@ -353,7 +661,7 @@ impl TypecastController {
                 .await
                 .map_err(|e| format!("팝업 감지 구독 실패: {}", e))?;
 
-            Self::navigate_and_wait(&page, &target, std::time::Duration::from_secs(45))
+            Self::navigate_and_wait(&page, &target, NAVIGATE_TIMEOUT)
                 .await
                 .map_err(|e| format!("Typecast 페이지로 이동할 수 없습니다: {}", e))?;
 
@@ -408,22 +716,40 @@ impl TypecastController {
         let (page, binding_task, navigation_task, target_task) = match setup {
             Ok(parts) => parts,
             Err(error) => {
-                let _ = browser.close().await;
+                // close() 는 handler_task 가 살아 있어야 CDP 응답을 받는다 — 순서를
+                // 바꾸지 말 것. 이미 죽은 브라우저면 응답이 오지 않으므로 시간 제한을 건다.
+                let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, async {
+                    let _ = browser.close().await;
+                    let _ = browser.wait().await;
+                })
+                .await;
                 handler_task.abort();
                 return Err(error);
             }
         };
 
-        let mut guard = state.0.lock().await;
-        *guard = Some(CdpSession {
-            browser,
-            main_page: page,
-            handler_task,
-            binding_task,
-            navigation_task,
-            target_task,
-        });
-        drop(guard);
+        // 슬롯이 이미 차 있으면 **정리한 뒤** 설치한다. 예전에는 그냥 덮어써서, 그
+        // 세션의 Chrome 프로세스와 백그라운드 태스크 4개가 아무도 정리하지 않는 상태로
+        // 영구 누출됐다(창이 두 개 떠 있는데 앱은 새 것만 아는 증상).
+        // 정리(CDP 왕복)는 반드시 상태 잠금을 놓은 뒤에 한다.
+        let previous = {
+            let mut guard = state.session.lock().await;
+            let previous = guard.take();
+            *guard = Some(CdpSession {
+                id: session_id,
+                browser,
+                main_page: page,
+                handler_task,
+                binding_task,
+                navigation_task,
+                target_task,
+            });
+            previous
+        };
+        if let Some(previous) = previous {
+            Self::debug(app, "session-replaced", "남아 있던 이전 세션을 정리합니다");
+            previous.shutdown().await;
+        }
 
         Self::activate_chrome_app();
         Ok(())
@@ -431,8 +757,10 @@ impl TypecastController {
 
     pub async fn close(app: &AppHandle) -> Result<(), String> {
         let state = Self::cdp_state(app);
+        // open() 과 직렬화한다. 잠금 순서는 transition → session.
+        let _transition = state.transition.lock().await;
         let session = {
-            let mut guard = state.0.lock().await;
+            let mut guard = state.session.lock().await;
             guard.take()
         };
         if let Some(session) = session {
@@ -453,16 +781,17 @@ impl TypecastController {
     pub async fn navigate(app: &AppHandle, url: String) -> Result<(), String> {
         let target = Self::parse_url(&url)?;
         let state = Self::cdp_state(app);
+        // 핸들만 꺼내고 잠금을 바로 놓는다 — 아래 이동은 최대 45초짜리 CDP 왕복이다.
         let existing = {
-            let guard = state.0.lock().await;
+            let guard = state.session.lock().await;
             guard.as_ref().map(|session| session.main_page.clone())
         };
         match existing {
-            Some(page) => {
-                Self::navigate_and_wait(&page, &target, std::time::Duration::from_secs(45))
-                    .await
-                    .map_err(|e| format!("페이지 이동 실패: {}", e))
-            }
+            Some(page) => Self::navigate_and_wait(&page, &target, NAVIGATE_TIMEOUT)
+                .await
+                .map_err(|e| format!("페이지 이동 실패: {}", e)),
+            // 세션이 없으면 창부터 띄운다. open() 이 전이 잠금을 잡으므로 여기서는
+            // 잠금을 들고 있지 않아야 한다(위 블록에서 이미 놓았다).
             None => Self::open(app, Some(url)).await,
         }
     }
@@ -488,62 +817,127 @@ impl TypecastController {
     /// 세션이 열려 있으면 CDP 로 쿠키/오리진 스토리지를 지운 뒤 로그인 페이지로 이동한다.
     /// 세션이 없으면 쿠키가 디스크의 프로필 디렉터리에만 존재하므로, 그 디렉터리 자체를
     /// 지우는 쪽이 더 확실하다(Chrome 이 실행 중이 아니므로 파일 삭제가 안전하다).
+    ///
+    /// **상태 잠금을 CDP `await` 너머로 들고 있지 않는다.** 예전에는 `state.session` 가드를
+    /// 든 채로 `clear_cookies()` / `ClearDataForOrigin` / `navigate_and_wait()` 를 모두
+    /// 기다렸다. 그 사이 연결이 끊기면 세션을 정리하려는 handler 태스크가 같은 잠금을
+    /// 기다려, 둘이 서로 영원히 멈춘다(Typecast 관련 커맨드 전체가 굳는다).
+    /// `Browser::clear_cookies` 는 `&Browser` 가 필요하고 `Browser` 는 `Clone` 이 아니므로,
+    /// 세션을 슬롯에서 통째로 꺼내 잠금을 **놓은 뒤** 왕복하고 끝나면 되돌려 놓는다.
     pub async fn clear_session(app: &AppHandle) -> Result<(), String> {
         let settings = SettingsManager::load();
         let state = Self::cdp_state(app);
 
-        let session_open = {
-            let guard = state.0.lock().await;
-            if let Some(session) = guard.as_ref() {
-                session
-                    .browser
-                    .clear_cookies()
-                    .await
-                    .map_err(|e| format!("쿠키 삭제 실패: {}", e))?;
-                if let Ok(origin_url) = tauri::Url::parse(&settings.typecast_editor_url) {
-                    let _ = session
-                        .main_page
-                        .execute(ClearDataForOriginParams::new(
-                            origin_url.origin().ascii_serialization(),
-                            "all",
-                        ))
-                        .await;
+        // 세션을 슬롯 밖으로 들고 있는 동안 `open()` 이 새 세션을 설치하면 둘 중 하나가
+        // 누출되므로 전이 잠금으로 직렬화한다. 잠금 순서는 transition → session.
+        let _transition = state.transition.lock().await;
+
+        let session = {
+            let mut guard = state.session.lock().await;
+            guard.take()
+        };
+
+        let outcome = match session {
+            Some(session) => {
+                let result = Self::clear_open_session(&session, &settings).await;
+                // 성공/실패 어느 경로에서도 세션 슬롯을 계약대로 되돌린다. 창은 여전히
+                // 열려 있고, 정말 죽었다면 다음 `live_main_page()` 왕복이 세대 검증으로
+                // 버린다(그때 태스크도 함께 정리된다).
+                let leftover = {
+                    let mut guard = state.session.lock().await;
+                    if guard.is_some() {
+                        // 전이 잠금 덕에 정상 경로에는 없다. 그래도 남의 세션을 덮어써
+                        // 브라우저와 태스크 4개를 누출시키는 것보다 우리 것을 정리한다.
+                        Some(session)
+                    } else {
+                        *guard = Some(session);
+                        None
+                    }
+                };
+                if let Some(leftover) = leftover {
+                    Self::debug(
+                        app,
+                        "session-conflict",
+                        "세션 초기화 중 새 세션이 설치되어 이전 세션을 정리합니다",
+                    );
+                    leftover.shutdown().await;
                 }
-                if let Ok(signin) = Self::parse_url(&settings.typecast_signin_url) {
-                    let _ = Self::navigate_and_wait(
-                        &session.main_page,
-                        &signin,
-                        std::time::Duration::from_secs(45),
-                    )
-                    .await;
+                result
+            }
+            None => {
+                // Chrome 이 실행 중이 아니므로 프로필 디렉터리를 지우는 것이 안전하다.
+                let dir = SettingsManager::typecast_chrome_profile_dir();
+                match std::fs::remove_dir_all(&dir) {
+                    Ok(()) => Ok(()),
+                    // 애초에 없으면 지울 것도 없다(한 번도 로그인하지 않은 상태).
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(e) => Err(format!(
+                        "로그인 프로필 디렉터리를 지울 수 없습니다({}): {}",
+                        dir.display(),
+                        e
+                    )),
                 }
-                true
-            } else {
-                false
             }
         };
 
-        if !session_open {
-            let _ = std::fs::remove_dir_all(SettingsManager::typecast_chrome_profile_dir());
-        }
-
+        // 플래그는 어느 경로에서든 내린다. 삭제가 중간에 실패했더라도 "저장된 세션이
+        // 있다"고 계속 표시하면 사용자가 재로그인 경로를 찾지 못한다.
         let mut updated = settings;
         updated.typecast_session_saved = false;
         updated.typecast_last_login_at = None;
         SettingsManager::save(&updated)?;
 
-        Ok(())
+        // 실패는 실패로 보고한다 — 쿠키가 남아 있는데 "초기화 완료"로 끝내면 사용자는
+        // 왜 여전히 로그인된 상태인지 알 수 없다.
+        outcome
+    }
+
+    /// 열려 있는 세션의 쿠키/오리진 스토리지를 지우고 로그인 페이지로 되돌린다.
+    ///
+    /// **호출 전에 세션을 슬롯에서 꺼내 상태 잠금을 놓아야 한다** — 아래는 전부 CDP 왕복이다.
+    /// 죽은 브라우저는 응답이 오지 않으므로 왕복마다 시간 제한을 건다.
+    async fn clear_open_session(
+        session: &CdpSession,
+        settings: &crate::types::Settings,
+    ) -> Result<(), String> {
+        tokio::time::timeout(LIVENESS_TIMEOUT, session.browser.clear_cookies())
+            .await
+            .map_err(|_| "쿠키 삭제에 응답이 없습니다(브라우저가 죽었을 수 있습니다).".to_string())?
+            .map_err(|e| format!("쿠키 삭제 실패: {}", e))?;
+
+        let origin = tauri::Url::parse(&settings.typecast_editor_url)
+            .map_err(|e| {
+                format!(
+                    "오리진 주소를 해석할 수 없습니다({}): {}",
+                    settings.typecast_editor_url, e
+                )
+            })?
+            .origin()
+            .ascii_serialization();
+        tokio::time::timeout(
+            LIVENESS_TIMEOUT,
+            session
+                .main_page
+                .execute(ClearDataForOriginParams::new(origin, "all")),
+        )
+        .await
+        .map_err(|_| "스토리지 삭제에 응답이 없습니다.".to_string())?
+        .map_err(|e| format!("스토리지 삭제 실패: {}", e))?;
+
+        let signin = Self::parse_url(&settings.typecast_signin_url)?;
+        Self::navigate_and_wait(&session.main_page, &signin, NAVIGATE_TIMEOUT)
+            .await
+            .map_err(|e| format!("로그인 페이지로 되돌리지 못했습니다: {}", e))
     }
 
     pub async fn state(app: &AppHandle) -> TypecastBrowserState {
         let settings = SettingsManager::load();
-        let cdp_state = Self::cdp_state(app);
-        let guard = cdp_state.0.lock().await;
-        let (is_open, current_url) = match guard.as_ref() {
-            Some(session) => (true, session.main_page.url().await.ok().flatten()),
+        // 세션 객체의 존재가 아니라 **실제 응답**으로 판정한다. 죽은 세션을 "열려 있음"
+        // 으로 보고하면 프론트엔드가 창을 다시 열지 않아 자동 녹음이 통째로 실패한다.
+        let (is_open, current_url) = match Self::live_main_page(app).await {
+            Some((_page, url)) => (true, url),
             None => (false, None),
         };
-        drop(guard);
 
         TypecastBrowserState {
             is_open,
@@ -557,30 +951,47 @@ impl TypecastController {
         }
     }
 
-    /// 자동화용 선택자를 페이지에 심는다. 비워두면 내장 휴리스틱을 쓴다.
-    pub async fn apply_selectors(app: &AppHandle) -> Result<(), String> {
+    /// 자동화 선택자를 페이지에 심는다. 비워두면 내장 휴리스틱을 쓴다.
+    ///
+    /// 페이지가 새로 로드되면 주입 스크립트가 다시 실행되며 기본값으로 돌아가므로,
+    /// 실제 조작(`prepare_script` · `play` · `probe`) 직전에 매번 다시 심는다.
+    pub async fn apply_automation_options(app: &AppHandle) -> Result<(), String> {
         let settings = SettingsManager::load();
         let page = Self::get_main_page(app).await?;
-        let editor = serde_json::to_string(&settings.typecast_editor_selector)
-            .map_err(|e| e.to_string())?;
+        let editor =
+            serde_json::to_string(&settings.typecast_editor_selector).map_err(|e| e.to_string())?;
         let play =
             serde_json::to_string(&settings.typecast_play_selector).map_err(|e| e.to_string())?;
         page.evaluate(format!(
-            "window.__omnirecSetSelectors && window.__omnirecSetSelectors({}, {});",
+            "window.__omnirecSetOptions && window.__omnirecSetOptions({}, {});",
             editor, play
         ))
         .await
         .map(|_| ())
-        .map_err(|e| format!("선택자 적용 실패: {}", e))
+        .map_err(|e| format!("자동화 옵션 적용 실패: {}", e))
     }
 
     /// 대본을 편집기에 채우고, 결과를 `typecast_step` 이벤트로 보고한다.
     ///
     /// 자동 입력이 실패하더라도 사용자가 직접 붙여넣을 수 있도록 클립보드에도 넣어 둔다.
     /// 수동 녹음 화면의 "대본 보내기"도 같은 경로를 쓴다.
-    pub async fn prepare_script(app: &AppHandle, text: String) -> Result<(), String> {
-        let _ = crate::clipboard::copy_text(&text);
-        Self::apply_selectors(app).await?;
+    ///
+    /// `copy_to_clipboard` 는 자동 일괄 녹음을 위한 예외다. 무인 실행이라 붙여넣을 사람이
+    /// 없는데, 대본마다 복사하면 사용자가 쓰던 클립보드를 대본 수만큼 덮어써 버린다.
+    pub async fn prepare_script(
+        app: &AppHandle,
+        text: String,
+        copy_to_clipboard: bool,
+    ) -> Result<(), String> {
+        if copy_to_clipboard {
+            // 클립보드 복사는 자동 입력이 실패했을 때의 수동 붙여넣기 폴백이다.
+            // 실패해도 자동 입력은 계속 시도해야 하므로 오류로 올리지 않지만(AGENTS.md),
+            // 조용히 버리면 "붙여넣기가 안 되는" 원인을 아무 데서도 알 수 없다.
+            if let Err(e) = crate::clipboard::copy_text(&text) {
+                Self::debug(app, "clipboard-failed", &e);
+            }
+        }
+        Self::apply_automation_options(app).await?;
         let page = Self::get_main_page(app).await?;
         let payload = serde_json::to_string(&text).map_err(|e| e.to_string())?;
         page.evaluate(format!(
@@ -589,12 +1000,20 @@ impl TypecastController {
         ))
         .await
         .map_err(|e| format!("대본 주입 실패: {}", e))?;
-        let _ = page.bring_to_front().await;
+        // 탭 활성화 실패는 대본 주입 결과를 바꾸지 않는다(주입은 위에서 이미 성공했다).
+        // 다만 진단에는 남긴다 — 창이 앞으로 오지 않는 증상의 단서다.
+        if let Err(e) = page.bring_to_front().await {
+            Self::debug(app, "focus-failed", &e.to_string());
+        }
         Ok(())
     }
 
     /// 편집기의 재생 버튼을 누른다.
+    ///
+    /// 누르기 전에 자동화 선택자를 다시 심는다. 대본 주입 이후 페이지가 다시
+    /// 로드됐을 수 있기 때문이다.
     pub async fn play(app: &AppHandle) -> Result<(), String> {
+        Self::apply_automation_options(app).await?;
         let page = Self::get_main_page(app).await?;
         page.evaluate("window.__omnirecPlay && window.__omnirecPlay();")
             .await
@@ -613,7 +1032,7 @@ impl TypecastController {
 
     /// 편집기 / 재생 버튼 후보를 찾아 진단 정보를 보고한다.
     pub async fn probe(app: &AppHandle) -> Result<(), String> {
-        Self::apply_selectors(app).await?;
+        Self::apply_automation_options(app).await?;
         let page = Self::get_main_page(app).await?;
         page.evaluate("window.__omnirecProbe && window.__omnirecProbe();")
             .await
@@ -622,7 +1041,11 @@ impl TypecastController {
     }
 
     /// Typecast 페이지 위에 안내 토스트를 띄운다(카운트다운 / 녹음 시작 알림 용도).
-    pub async fn notify(app: &AppHandle, message: String, tone: Option<String>) -> Result<(), String> {
+    pub async fn notify(
+        app: &AppHandle,
+        message: String,
+        tone: Option<String>,
+    ) -> Result<(), String> {
         let page = Self::get_main_page(app).await?;
         let msg = serde_json::to_string(&message).map_err(|e| e.to_string())?;
         let tone = serde_json::to_string(&tone.unwrap_or_else(|| "info".to_string()))
@@ -691,6 +1114,7 @@ const MAIN_INIT_SCRIPT: &str = r#"
 
   // ── 페이지 자동화 ──────────────────────────────────────────
   var selectors = { editor: '', play: '' };
+
 
   function isVisible(el) {
     if (!el) return false;
@@ -799,6 +1223,11 @@ const MAIN_INIT_SCRIPT: &str = r#"
   // 정지 요청(doStop)으로 인한 pause 는 오동작 신호로 취급하지 않는다.
   var intentionalStop = false;
 
+  // 재생 버튼 활성화를 기다리는 콜백 취소용 세대 번호.
+  // doPlay()/doStop() 이 모두 이 값을 올리고, 최대 5초간 도는 활성화 대기는
+  // 자기 세대가 아니면 클릭도 보고도 하지 않고 즉시 끝낸다.
+  var playGeneration = 0;
+
   function buttonLabel(el) {
     var cls = el.className;
     if (cls && cls.baseVal !== undefined) cls = cls.baseVal;
@@ -853,6 +1282,7 @@ const MAIN_INIT_SCRIPT: &str = r#"
     playSource = '';
     return null;
   }
+
 
   function closestButton(el) {
     try {
@@ -1095,8 +1525,35 @@ const MAIN_INIT_SCRIPT: &str = r#"
     return 'textContent';
   }
 
+  // 편집기 내용과 대본을 비교하기 위한 정규화.
+  //
+  // Slate 가 **필연적으로** 바꾸는 것만 흡수한다. 그 밖의 차이는 전부 "대본이 제대로
+  // 들어가지 않았다"는 뜻이므로 여기서 관대하게 지워 없애면 안 된다.
+  //  1) 공백·개행: Slate 는 대본을 단락으로 쪼개고(readEditor 가 '\n' 으로 다시 이어붙인다),
+  //     줄 끝에 렌더링용 개행을 하나 더 붙이며, 연속 공백을 NBSP(\u00A0 — \s 에 포함된다)로
+  //     바꾼다.
+  //  2) 제로폭 문자: 빈 리프 자리에 Slate 가 넣는 스캐폴딩(\uFEFF 등)이며 대본 글자가 아니다.
+  //  3) 한글 조합 형태: DOM 왕복에서 조합형/완성형이 뒤바뀌어도 같은 글자다(NFC 로 통일).
   function normalize(value) {
-    return String(value || '').replace(/\s+/g, '');
+    var text = String(value === null || value === undefined ? '' : value)
+      .replace(/[\u200B-\u200D\uFEFF]/g, '')
+      .replace(/\s+/g, '');
+    try { return text.normalize('NFC'); } catch (e) { return text; }
+  }
+
+  // 두 문자열이 어디서부터 갈라졌는지(문자 인덱스).
+  // 앞부분이 같고 길이만 다르면 짧은 쪽의 길이를 돌려준다.
+  function firstDifference(a, b) {
+    var len = Math.min(a.length, b.length);
+    for (var i = 0; i < len; i++) {
+      if (a.charCodeAt(i) !== b.charCodeAt(i)) return i;
+    }
+    return len;
+  }
+
+  // 불일치 지점 주변만 잘라 보여준다(진단 로그가 대본 전체로 넘치지 않게).
+  function excerpt(value, at) {
+    return String(value).slice(Math.max(0, at - 8), at + 12);
   }
 
   // 선택을 해제하고 캐럿을 본문 맨 앞으로 옮긴다.
@@ -1172,7 +1629,14 @@ const MAIN_INIT_SCRIPT: &str = r#"
     attempt = attempt || 0;
     var editor = findEditor();
     if (!editor) {
-      if (attempt < 1 && enterFirstProjectAndRetry(function () { doPrepare(rawText, attempt + 1); })) {
+      // 프로젝트로 들어가 재시도하는 경로는 이 프레임이 요청을 "처리했다"고 표시되므로
+      // (markHandled), 상위 프레임의 미처리 폴백이 돌지 않는다. 재시도까지 실패하면
+      // 여기서 직접 실패를 보고해야 앱이 타임아웃까지 멍하니 기다리지 않는다.
+      if (attempt < 1 && enterFirstProjectAndRetry(function () {
+        if (!doPrepare(rawText, attempt + 1)) {
+          report('step:prepare-failed:프로젝트를 열었지만 편집기를 찾지 못했습니다');
+        }
+      })) {
         return true;
       }
       return false;
@@ -1197,7 +1661,6 @@ const MAIN_INIT_SCRIPT: &str = r#"
         setTimeout(function () {
           var actual = normalize(readEditor(editor));
           var expected = normalize(text);
-          var head = expected.slice(0, 40);
           var paragraphs = editor.querySelectorAll('[data-slate-node="element"]').length;
           // 처음부터 낭독되도록 선택 해제 + 캐럿을 맨 앞으로 옮긴다.
           var caret = collapseCaretToStart(editor);
@@ -1208,15 +1671,25 @@ const MAIN_INIT_SCRIPT: &str = r#"
             (cleared ? '' : ' · 비우기실패') +
             (caret ? ' · 캐럿맨앞' : ' · 캐럿이동실패');
 
-          if (actual.indexOf(head) < 0) {
-            report('step:prepare-failed:입력 확인 실패' + details);
-            return;
-          }
-          // 이전 대본이 남아 있으면 글자 수가 눈에 띄게 많아진다.
-          if (actual.length > expected.length + 20) {
+          // **완전 일치**로 검증한다.
+          //
+          // 예전에는 "앞 40자가 어딘가 들어 있다" + "기대보다 20자 넘게 길지 않다"만 봤다.
+          // 하한이 없어서 3,000자 대본에서 앞 50자만 들어가도 step:prepared 가 나갔고,
+          // 앞부분만 낭독한 파일이 정상 완료로 저장됐다. 관대한 오차 허용으로 되돌리지
+          // 말 것 — 편집기가 필연적으로 바꾸는 부분은 normalize() 안에서만 흡수한다.
+          if (actual !== expected) {
+            var at = firstDifference(actual, expected);
+            var reason = (actual.length < expected.length && at === actual.length)
+              ? '대본 앞부분만 들어갔습니다'
+              : (actual.length > expected.length && at === expected.length)
+                ? '이전 대본이 뒤에 남아 있습니다'
+                : '내용이 어긋납니다';
             report(
-              'step:prepare-failed:이전 대본이 남아 있습니다 (기대 ' + expected.length +
-              '자 / 실제 ' + actual.length + '자)' + details
+              'step:prepare-failed:입력 확인 실패 — ' + reason +
+              ' (기대 ' + expected.length + '자 / 실제 ' + actual.length + '자' +
+              ' / 첫 불일치 ' + at + '번째' +
+              ' / 기대 [' + excerpt(expected, at) + '] 실제 [' + excerpt(actual, at) + '])' +
+              details
             );
             return;
           }
@@ -1235,9 +1708,18 @@ const MAIN_INIT_SCRIPT: &str = r#"
   function doPlay(attempt) {
     attempt = attempt || 0;
     intentionalStop = false;
+    // 이 호출 이전에 예약된 클릭/대기 콜백을 전부 무효화한다(중복 트리거 방지).
+    var generation = ++playGeneration;
     var button = findPlayButton();
     if (!button) {
-      if (attempt < 1 && enterFirstProjectAndRetry(function () { doPlay(attempt + 1); })) {
+      // doPrepare 와 같은 이유로, 재시도까지 실패하면 여기서 직접 실패를 보고한다.
+      if (attempt < 1 && enterFirstProjectAndRetry(function () {
+        // 2초 사이에 정지 요청이나 새 재생 요청이 들어왔으면 이 재시도는 버린다.
+        if (generation !== playGeneration) return;
+        if (!doPlay(attempt + 1)) {
+          report('step:play-failed:프로젝트를 열었지만 재생 버튼을 찾지 못했습니다');
+        }
+      })) {
         return true;
       }
       return false;
@@ -1247,46 +1729,51 @@ const MAIN_INIT_SCRIPT: &str = r#"
     var caret = collapseCaretToStart(findEditor());
 
     // 붙여넣기 직후에는 재생 버튼이 잠시 비활성일 수 있어 활성화될 때까지 기다린다.
-    var attempts = 0;
-    (function attempt() {
-      attempts += 1;
+    var waits = 0;
+    (function waitUntilEnabled() {
+      // 기다리는 동안 정지 요청이 들어왔으면 클릭하지 않는다.
+      if (generation !== playGeneration) return;
+      waits += 1;
       if (isDisabled(button)) {
-        if (attempts < 25) {
-          setTimeout(attempt, 200);
+        if (waits < 25) {
+          setTimeout(waitUntilEnabled, 200);
           return;
         }
         report('step:play-failed:재생 버튼이 계속 비활성 상태입니다 ' + describe(button));
         return;
       }
-
-      // 클릭이 실제로 버튼까지 전달됐는지 확인해 진단에 남긴다.
-      var target = closestButton(button);
-      var delivered = false;
-      var probeListener = function () { delivered = true; };
-      target.addEventListener('click', probeListener, true);
-
-      clickLikeUser(button);
-
-      setTimeout(function () {
-        target.removeEventListener('click', probeListener, true);
-        var playing = false;
-        deepQueryAll('audio, video').forEach(function (media) {
-          if (!media.paused && !media.ended) playing = true;
-        });
-        report(
-          'step:playing:' + describe(button) +
-          (source ? ' · ' + source : '') +
-          (caret ? ' · 캐럿맨앞' : '') +
-          ' · 클릭' + (delivered ? '전달' : '미전달') +
-          (playing ? ' · 미디어재생중' : '')
-        );
-      }, 700);
+      clickPlayOnce(button, source, caret);
     })();
     return true;
   }
 
+  /**
+   * 재생 버튼을 정확히 한 번 누르고, 클릭 전달 여부를 진단에 남긴다.
+   *
+   * 반복 합성 클릭은 Typecast 가 아직 합성을 준비하는 동안 재생/정지 토글을
+   * 연속으로 바꿔 화면만 재생 상태이고 소리는 나지 않는 경합을 만들 수 있다.
+   * 편집기 안정화는 호출자가 녹음 시작 전에 기다리고, 여기서는 단일 클릭만 보낸다.
+   */
+  function clickPlayOnce(button, source, caret) {
+    var target = closestButton(button);
+    var delivered = 0;
+    var probeListener = function () { delivered += 1; };
+    target.addEventListener('click', probeListener, true);
+    clickLikeUser(button);
+    try { target.removeEventListener('click', probeListener, true); } catch (e) {}
+
+    report(
+      'step:playing:' + describe(button) +
+      (source ? ' · ' + source : '') +
+      (caret ? ' · 캐럿맨앞' : '') +
+      ' · 클릭 1회(전달 ' + delivered + ')'
+    );
+  }
+
   function doStop() {
     intentionalStop = true;
+    // 활성화 대기 중이면 아래 정지 처리 뒤 재생 버튼을 누르지 못하게 취소한다.
+    playGeneration += 1;
     var button = findButton(STOP_HINTS, null);
     if (button) clickLikeUser(button);
     deepQueryAll('audio, video').forEach(function (el) {
@@ -1309,7 +1796,7 @@ const MAIN_INIT_SCRIPT: &str = r#"
       'canvas=' + deepQueryAll('canvas').length,
       'buttons=' + buttons.length,
       'editor=' + describe(findEditor()),
-      'play=' + describe(findPlayButton()) + (playSource ? '(' + playSource + ')' : '')
+      'play=' + describe(findPlayButton()) + (playSource ? '(' + playSource + ')' : ''),
     ];
     report('step:probe:' + info.join(' '));
 
@@ -1365,10 +1852,14 @@ const MAIN_INIT_SCRIPT: &str = r#"
   });
 
   if (IS_TOP) {
-    window.__omnirecSetSelectors = function (editor, play) {
+    window.__omnirecSetOptions = function (editor, play) {
       selectors.editor = editor || '';
       selectors.play = play || '';
-      dispatchRequest({ type: 'selectors', editor: editor, play: play });
+      dispatchRequest({
+        type: 'options',
+        editor: editor,
+        play: play
+      });
     };
 
     window.__omnirecProbe = function () { dispatchRequest({ type: 'probe' }); };
@@ -1400,7 +1891,7 @@ const MAIN_INIT_SCRIPT: &str = r#"
     // 서브프레임은 상위에서 온 selectors 요청도 처리해야 한다.
     var baseHandle = handleRequest;
     handleRequest = function (request) {
-      if (request && request.type === 'selectors') {
+      if (request && request.type === 'options') {
         selectors.editor = request.editor || '';
         selectors.play = request.play || '';
         return;
@@ -1456,6 +1947,140 @@ mod tests {
         }
     }
 
+    #[test]
+    fn devtools_port_is_read_only_when_the_file_is_usable() {
+        let dir = std::env::temp_dir().join(format!(
+            "omnirec-devtools-port-test-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 파일이 아예 없는 경우(정상 종료 후)
+        assert_eq!(TypecastController::read_devtools_port(&dir), None);
+
+        // Chrome 이 남기는 형식: 첫 줄이 포트, 둘째 줄이 브라우저 타깃 경로
+        std::fs::write(
+            dir.join("DevToolsActivePort"),
+            "51234\n/devtools/browser/abc\n",
+        )
+        .unwrap();
+        assert_eq!(TypecastController::read_devtools_port(&dir), Some(51234));
+
+        // 깨진 내용이면 포트로 쓰지 않는다(엉뚱한 곳에 접속을 시도하면 안 된다).
+        std::fs::write(dir.join("DevToolsActivePort"), "").unwrap();
+        assert_eq!(TypecastController::read_devtools_port(&dir), None);
+        std::fs::write(dir.join("DevToolsActivePort"), "not-a-port\n").unwrap();
+        assert_eq!(TypecastController::read_devtools_port(&dir), None);
+
+        // 락 파일 정리는 없는 파일에도 조용히 성공해야 한다.
+        TypecastController::clear_singleton_lock_files(&dir);
+        std::fs::write(dir.join("SingletonLock"), "x").unwrap();
+        TypecastController::clear_singleton_lock_files(&dir);
+        assert!(!dir.join("SingletonLock").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 이동 완료 판정의 기준선. 프래그먼트만 다른 이동은 문서가 새로 만들어지지 않으므로
+    /// `navigate_and_wait` 가 "표식이 사라졌는가"로 판정할 수 없고, 그 밖의 모든 이동은
+    /// 반드시 표식 경로로 판정해야 한다(옛 문서의 `readyState: complete` 를 완료로
+    /// 오인하는 것이 이 헬퍼가 막는 사고다).
+    #[test]
+    fn only_fragment_navigations_skip_the_document_marker() {
+        // 프래그먼트만 다르다 — 같은 문서에서 처리된다.
+        assert!(TypecastController::fragment_only_change(
+            "https://studio.typecast.ai/text-to-speech",
+            "https://studio.typecast.ai/text-to-speech#editor"
+        ));
+
+        // 완전히 같은 URL 은 다시 로드된다(새 문서) — 표식으로 판정해야 한다.
+        assert!(!TypecastController::fragment_only_change(
+            "https://studio.typecast.ai/sign-in",
+            "https://studio.typecast.ai/sign-in"
+        ));
+        // 경로가 다르면 당연히 새 문서다.
+        assert!(!TypecastController::fragment_only_change(
+            "https://studio.typecast.ai/text-to-speech",
+            "https://studio.typecast.ai/sign-in#a"
+        ));
+        // 첫 이동은 about:blank 에서 출발한다.
+        assert!(!TypecastController::fragment_only_change(
+            "about:blank",
+            "https://studio.typecast.ai/text-to-speech"
+        ));
+        // 해석할 수 없는 주소는 엄격한(표식) 경로로 보낸다.
+        assert!(!TypecastController::fragment_only_change(
+            "",
+            "https://studio.typecast.ai/text-to-speech#editor"
+        ));
+    }
+
+    /// 사용자가 보고한 증상("한 번 녹음한 뒤 브라우저를 닫고 다시 시작하면 잘 안 뜬다")의
+    /// 백엔드 절반 — 같은 프로필 디렉터리로 띄우고, 완전히 종료한 직후 곧바로 다시 띄울 수
+    /// 있는지 확인한다. 종료가 남긴 `SingletonLock` 잔재 때문에 두 번째 실행이 실패하면
+    /// 여기서 잡힌다.
+    ///
+    /// 수동 실행: `cargo test --manifest-path src-tauri/Cargo.toml --lib tts::tests::relaunches_immediately_after_a_clean_shutdown -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn relaunches_immediately_after_a_clean_shutdown() {
+        use crate::settings::SettingsManager;
+        use chromiumoxide::browser::BrowserConfig;
+        use futures::StreamExt;
+
+        let chrome_path =
+            SettingsManager::find_chrome(None).expect("Chrome executable should be discoverable");
+        let profile_dir =
+            std::env::temp_dir().join(format!("omnirec-relaunch-test-{}", std::process::id()));
+
+        let build_config = || {
+            BrowserConfig::builder()
+                .chrome_executable(&chrome_path)
+                .user_data_dir(&profile_dir)
+                .with_head()
+                .window_size(800, 600)
+                .build()
+                .expect("browser config should build")
+        };
+
+        for round in 1..=2 {
+            let (mut browser, mut handler) =
+                TypecastController::launch_with_recovery(build_config(), &profile_dir)
+                    .await
+                    .unwrap_or_else(|e| panic!("round {round}: Chrome should launch: {e}"));
+            let handler_task = tokio::spawn(async move {
+                while let Some(event) = handler.next().await {
+                    if event.is_err() {
+                        break;
+                    }
+                }
+            });
+
+            let page = browser
+                .new_page("about:blank")
+                .await
+                .unwrap_or_else(|e| panic!("round {round}: page should open: {e}"));
+            let value: i32 = page
+                .evaluate("1 + 1")
+                .await
+                .unwrap_or_else(|e| panic!("round {round}: evaluate should succeed: {e}"))
+                .into_value()
+                .expect("should be a number");
+            assert_eq!(value, 2, "round {round}");
+            println!("round {round}: ok");
+
+            let _ = browser.close().await;
+            let _ = browser.wait().await;
+            handler_task.abort();
+        }
+
+        let _ = std::fs::remove_dir_all(&profile_dir);
+    }
+
     /// 실제 Chrome + CDP 왕복이 이 머신에서 동작하는지 확인하는 수동 스모크 테스트.
     /// 일반 `cargo test` 에는 포함하지 않는다(실제 Chrome 프로세스를 띄우고 로그인 없이도
     /// 접근 가능한 studio.typecast.ai 초기 페이지로 이동한다 — CI/헤드리스 환경에서 불안정할
@@ -1472,10 +2097,8 @@ mod tests {
             SettingsManager::find_chrome(None).expect("Chrome executable should be discoverable");
         println!("using chrome executable: {}", chrome_path.display());
 
-        let profile_dir = std::env::temp_dir().join(format!(
-            "omnirec-cdp-smoke-test-{}",
-            std::process::id()
-        ));
+        let profile_dir =
+            std::env::temp_dir().join(format!("omnirec-cdp-smoke-test-{}", std::process::id()));
 
         let config = BrowserConfig::builder()
             .chrome_executable(&chrome_path)
@@ -1533,13 +2156,11 @@ mod tests {
             .await
             .expect("evaluate should succeed");
 
-        let received = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            binding_events.next(),
-        )
-        .await
-        .expect("should receive a probe step within 5s")
-        .expect("binding stream should not end");
+        let received =
+            tokio::time::timeout(std::time::Duration::from_secs(5), binding_events.next())
+                .await
+                .expect("should receive a probe step within 5s")
+                .expect("binding stream should not end");
         assert_eq!(received.name, BRIDGE_BINDING_NAME);
         assert!(
             received.payload.starts_with("step:probe:"),
@@ -1654,11 +2275,8 @@ mod tests {
                 .await
                 .expect("probe evaluate should succeed");
             for _ in 0..4 {
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(2),
-                    binding_events.next(),
-                )
-                .await
+                match tokio::time::timeout(std::time::Duration::from_secs(2), binding_events.next())
+                    .await
                 {
                     Ok(Some(event)) => println!("probe: {}", event.payload),
                     Ok(None) => break,
@@ -1701,6 +2319,9 @@ mod tests {
                 }
             }
 
+            // 프로덕션 배치 러너와 같이 Slate 내부 상태와 합성 준비가 반영될 시간을 준다.
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
             println!("재생을 시도합니다.");
             page.evaluate("window.__omnirecPlay && window.__omnirecPlay();")
                 .await
@@ -1708,7 +2329,8 @@ mod tests {
 
             let play_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
             loop {
-                let remaining = play_deadline.saturating_duration_since(tokio::time::Instant::now());
+                let remaining =
+                    play_deadline.saturating_duration_since(tokio::time::Instant::now());
                 if remaining.is_zero() {
                     println!("play: 시간 안에 최종 결과가 오지 않았습니다");
                     break;
@@ -1759,10 +2381,8 @@ mod tests {
 
         let chrome_path =
             SettingsManager::find_chrome(None).expect("Chrome executable should be discoverable");
-        let profile_dir = std::env::temp_dir().join(format!(
-            "omnirec-lock-recovery-test-{}",
-            std::process::id()
-        ));
+        let profile_dir =
+            std::env::temp_dir().join(format!("omnirec-lock-recovery-test-{}", std::process::id()));
 
         let build_config = || {
             BrowserConfig::builder()
