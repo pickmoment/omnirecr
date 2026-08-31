@@ -108,6 +108,7 @@ pub fn run() {
             commands::mark_typecast_login,
             commands::copy_text_to_clipboard,
             commands::notify_typecast,
+            commands::typecast_editor_ready,
             commands::typecast_prepare_script,
             commands::typecast_play,
             commands::typecast_stop_playback,

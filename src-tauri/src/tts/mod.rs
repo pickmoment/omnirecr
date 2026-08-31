@@ -954,7 +954,7 @@ impl TypecastController {
     /// 자동화 선택자를 페이지에 심는다. 비워두면 내장 휴리스틱을 쓴다.
     ///
     /// 페이지가 새로 로드되면 주입 스크립트가 다시 실행되며 기본값으로 돌아가므로,
-    /// 실제 조작(`prepare_script` · `play` · `probe`) 직전에 매번 다시 심는다.
+    /// 실제 조작(`editor_ready` · `prepare_script` · `play` · `probe`) 직전에 매번 다시 심는다.
     pub async fn apply_automation_options(app: &AppHandle) -> Result<(), String> {
         let settings = SettingsManager::load();
         let page = Self::get_main_page(app).await?;
@@ -969,6 +969,17 @@ impl TypecastController {
         .await
         .map(|_| ())
         .map_err(|e| format!("자동화 옵션 적용 실패: {}", e))
+    }
+
+    /// 사용자가 직접 연 Typecast 프로젝트에 편집기와 플레이어가 모두 준비됐는지 확인한다.
+    pub async fn editor_ready(app: &AppHandle) -> Result<bool, String> {
+        Self::apply_automation_options(app).await?;
+        let page = Self::get_main_page(app).await?;
+        page.evaluate("Boolean(window.__omnirecEditorReady && window.__omnirecEditorReady())")
+            .await
+            .map_err(|e| format!("프로젝트 편집기 확인 실패: {}", e))?
+            .into_value::<bool>()
+            .map_err(|e| format!("프로젝트 편집기 확인 결과 해석 실패: {}", e))
     }
 
     /// 대본을 편집기에 채우고, 결과를 `typecast_step` 이벤트로 보고한다.
@@ -1611,35 +1622,13 @@ const MAIN_INIT_SCRIPT: &str = r#"
     }
   }
 
-  // Typecast 가 프로젝트 기반으로 바뀌어, typecast_editor_url 이 이제 에디터가 아니라
-  // 프로젝트 목록 화면으로 갈 수 있다. 에디터를 못 찾았을 때 목록의 첫 번째(가장 최근)
-  // 프로젝트로 들어가 한 번만 다시 시도한다. 새 프로젝트를 만들지 않는다 — 사용자가
-  // 이미 갖고 있는 프로젝트를 그대로 쓴다.
-  function enterFirstProjectAndRetry(retry) {
-    var links = deepQueryAll('a[href*="/text-to-speech/"]');
-    if (!links.length) return false;
-    report('step:entering-project:' + (links[0].getAttribute('href') || ''));
-    clickLikeUser(links[0]);
-    setTimeout(retry, 2000);
-    return true;
-  }
 
   // 이 프레임에서 실제 작업을 수행한다. 대상이 없으면 조용히 false 를 돌려준다.
-  function doPrepare(rawText, attempt) {
-    attempt = attempt || 0;
+  function doPrepare(rawText) {
     var editor = findEditor();
     if (!editor) {
-      // 프로젝트로 들어가 재시도하는 경로는 이 프레임이 요청을 "처리했다"고 표시되므로
-      // (markHandled), 상위 프레임의 미처리 폴백이 돌지 않는다. 재시도까지 실패하면
-      // 여기서 직접 실패를 보고해야 앱이 타임아웃까지 멍하니 기다리지 않는다.
-      if (attempt < 1 && enterFirstProjectAndRetry(function () {
-        if (!doPrepare(rawText, attempt + 1)) {
-          report('step:prepare-failed:프로젝트를 열었지만 편집기를 찾지 못했습니다');
-        }
-      })) {
-        return true;
-      }
-      return false;
+      report('step:prepare-failed:작업할 Typecast 프로젝트를 직접 열어 둔 뒤 다시 시작하세요');
+      return true;
     }
 
     // 빈 줄을 걷어내 빈 단락이 생기지 않게 한다.
@@ -1705,24 +1694,14 @@ const MAIN_INIT_SCRIPT: &str = r#"
     return true;
   }
 
-  function doPlay(attempt) {
-    attempt = attempt || 0;
+  function doPlay() {
     intentionalStop = false;
     // 이 호출 이전에 예약된 클릭/대기 콜백을 전부 무효화한다(중복 트리거 방지).
     var generation = ++playGeneration;
     var button = findPlayButton();
     if (!button) {
-      // doPrepare 와 같은 이유로, 재시도까지 실패하면 여기서 직접 실패를 보고한다.
-      if (attempt < 1 && enterFirstProjectAndRetry(function () {
-        // 2초 사이에 정지 요청이나 새 재생 요청이 들어왔으면 이 재시도는 버린다.
-        if (generation !== playGeneration) return;
-        if (!doPlay(attempt + 1)) {
-          report('step:play-failed:프로젝트를 열었지만 재생 버튼을 찾지 못했습니다');
-        }
-      })) {
-        return true;
-      }
-      return false;
+      report('step:play-failed:작업할 Typecast 프로젝트의 재생 버튼을 찾지 못했습니다');
+      return true;
     }
     var source = playSource;
     // 입력 후 재생까지 사이에 커서가 움직였을 수 있으므로 직전에 다시 맨 앞으로 보낸다.
@@ -1861,6 +1840,10 @@ const MAIN_INIT_SCRIPT: &str = r#"
         play: play
       });
     };
+    window.__omnirecEditorReady = function () {
+      return !!findEditor() && !!findPlayButton();
+    };
+
 
     window.__omnirecProbe = function () { dispatchRequest({ type: 'probe' }); };
 
@@ -1870,8 +1853,8 @@ const MAIN_INIT_SCRIPT: &str = r#"
       // 어떤 프레임도 편집기를 찾지 못하면 실패로 보고한다.
       setTimeout(function () {
         if (!window.__omnirecHandled.prepare) {
-          report('step:prepare-failed:편집기를 찾지 못했습니다 (모든 프레임 탐색)');
-          toast('대본이 클립보드에 복사되었습니다. 편집기를 클릭하고 붙여넣기 하세요.', 'warn');
+          report('step:prepare-failed:작업할 Typecast 프로젝트를 직접 열어 둔 뒤 다시 시작하세요');
+          toast('Typecast에서 작업할 프로젝트를 직접 열어 주세요.', 'warn');
         }
       }, 1200);
     };
@@ -1881,7 +1864,7 @@ const MAIN_INIT_SCRIPT: &str = r#"
       dispatchRequest({ type: 'play' });
       setTimeout(function () {
         if (!window.__omnirecHandled.play) {
-          report('step:play-failed:재생 버튼을 찾지 못했습니다 (모든 프레임 탐색)');
+          report('step:play-failed:작업할 Typecast 프로젝트의 재생 버튼을 찾지 못했습니다');
         }
       }, 1200);
     };
@@ -2168,6 +2151,41 @@ mod tests {
             received.payload
         );
         println!("real automation probe payload: {}", received.payload);
+
+        let editor_ready: bool = page
+            .evaluate("Boolean(window.__omnirecEditorReady && window.__omnirecEditorReady())")
+            .await
+            .expect("editor readiness evaluate should succeed")
+            .into_value()
+            .expect("editor readiness should be boolean");
+        assert!(
+            !editor_ready,
+            "a page without a project editor must not pass batch preflight"
+        );
+
+        let project_ready: bool = page
+            .evaluate(
+                r#"(() => {
+                  const editor = document.createElement('div');
+                  editor.setAttribute('data-slate-editor', 'true');
+                  editor.setAttribute('contenteditable', 'true');
+                  editor.style.cssText = 'width:400px;height:200px';
+                  document.body.appendChild(editor);
+                  const play = document.createElement('button');
+                  play.setAttribute('aria-label', 'Play');
+                  play.style.cssText = 'width:40px;height:40px';
+                  document.body.appendChild(play);
+                  return Boolean(window.__omnirecEditorReady && window.__omnirecEditorReady());
+                })()"#,
+            )
+            .await
+            .expect("project editor readiness evaluate should succeed")
+            .into_value()
+            .expect("project editor readiness should be boolean");
+        assert!(
+            project_ready,
+            "a visible Slate editor and play button must pass batch preflight"
+        );
 
         let _ = browser.close().await;
         let _ = browser.wait().await;

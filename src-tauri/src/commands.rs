@@ -615,6 +615,17 @@ pub async fn notify_typecast(
 
 // ── Typecast 페이지 자동화 ──────────────────────────────────
 
+/// 사용자가 직접 연 Typecast 프로젝트에 편집기와 재생 버튼이 준비됐는지 확인한다.
+#[tauri::command]
+pub async fn typecast_editor_ready(app: AppHandle) -> Result<bool, String> {
+    with_typecast_timeout(
+        "프로젝트 편집기 확인",
+        20,
+        TypecastController::editor_ready(&app),
+    )
+    .await
+}
+
 /// 대본을 편집기에 주입한다. 결과는 `typecast_step` 이벤트로 보고된다.
 ///
 /// `copy_to_clipboard` 는 기본 true(수동 입력 폴백). 자동 일괄 녹음만 false 로 끈다.

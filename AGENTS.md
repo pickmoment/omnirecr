@@ -115,6 +115,7 @@
 - `typecast_go_back()` / `typecast_reload()` ➔ `Result<(), String>`
 - `clear_typecast_session()` ➔ `Result<(), String>` (쿠키/스토리지 전체 삭제 → 재로그인)
 - `get_typecast_browser_state()` ➔ `TypecastBrowserState`
+- `typecast_editor_ready()` ➔ `Result<bool, String>` (사람이 직접 연 프로젝트에 편집기 · 재생 버튼이 모두 있는지 확인)
 - `mark_typecast_login(email: Option<String>)` ➔ `Result<Settings, String>`
 - `push_script_to_typecast(text: String)` ➔ `Result<bool, String>` (클립보드 복사 + 편집기 자동 입력 시도)
 - `notify_typecast(message: String, tone: Option<String>)` ➔ `Result<(), String>`
@@ -408,10 +409,11 @@ URL 휴리스틱 대신 사람 확인을 기다린다 — `hub send` 로 표준�
 
 ```
 preflight (루프 전에 한 번)
+         get_typecast_browser_state → 사람이 Chrome에서 프로젝트 편집기를 직접 열어 뒀는지 확인
+         typecast_editor_ready → 편집기 · 재생 버튼이 없으면 대본/녹음을 건드리기 전에 시작 거부
          resolve_script_recording_targets → ① 제목이 같은 파일로 저장되는 대본이 있으면
            시작 거부(뒤 대본이 앞 대본 결과를 조용히 덮어쓴다) ② 이미 있는 파일은
            한 번에 모아서 덮어쓰기 확인
-         get_typecast_browser_state → 창이 열릴 때까지 1초 간격 확인 + looks_signed_in 확인
 prepare  typecast_prepare_script  → step:prepared / step:prepare-failed (10s 타임아웃)
          (대본 전체를 한 번에 넣는다. 입력 후 선택 해제 + 캐럿을 본문 맨 앞으로 —
           Typecast 는 커서 위치부터 낭독하므로 이 처리가 없으면 소리가 나지 않는다)
@@ -510,14 +512,14 @@ DOM 구조가 평범한 `contenteditable` 이 아니라 아래처럼 생겼다. 
 4. **`execCommand('selectAll')` 은 문단 하나만 선택할 수 있다.** 그 상태로 붙여넣으면 첫 문단만 새 대본으로 바뀌고 이전 대본의 나머지 문단이 그대로 남는다. `selectAllIn()` 은 첫 `[data-slate-string]` 텍스트 노드부터 마지막 노드까지 범위를 직접 만들고, `doPrepare()` 는 붙여넣기 **전에** `clearEditor()` 로 편집기를 완전히 비운다(최대 4회 반복).
 5. **`execCommand('delete')` 로 지우지 말 것 — Slate 의 "문단 최소 1개" 불변식이 깨진다.** 실측: 전체 선택 후 `execCommand('delete')` 를 반복하면 문단이 화자 선택 버튼까지 통째로 사라져 `[data-slate-node="element"]` 가 0개가 되는 경우가 있었다. 이 상태가 되면 Slate 가 이 DOM 과 완전히 어긋나 이후 어떤 `execCommand`(`insertText` 포함)로도 복구되지 않고 — 붙여넣기가 조용히 사라진다("입력 확인 실패"). `execCommand` 는 Slate 의 `onKeyDown` 컨트롤을 거치지 않고 DOM 을 직접 바꾸기 때문이다. `clearEditor()` 는 대신 진짜 `KeyboardEvent('keydown', { key: 'Backspace', ... })` 를 보낸다 — Slate 가 이 키를 자기 핸들러에서 가로채 자신의 delete 트랜잭션으로 처리하므로 불변식이 유지된다. **`execCommand` 기반 삭제/삽입으로 되돌리지 말 것.**
 
-**Typecast 는 프로젝트 기반이다 — `typecast_editor_url` 이 에디터가 아니라 프로젝트 목록으로 갈 수 있다.**
-실측(2026-08): 기본 URL(`studio.typecast.ai/text-to-speech`)이 에디터가 아니라 "새 프로젝트 / 대본
-가져오기 / 새 폴더" 가 있는 프로젝트 목록 화면으로 감. `findEditor()`/`findPlayButton()` 이 못 찾으면
-(즉 `editor`/`button` 이 `null`) `doPrepare()`/`doPlay()` 가 `enterFirstProjectAndRetry()` 를 호출해
-목록의 **첫 번째(가장 최근) 프로젝트** 링크(`a[href*="/text-to-speech/"]`)를 클릭하고 2초 뒤 **한 번만**
-재시도한다. **새 프로젝트를 만들지 않는다** — 사용자가 이미 갖고 있는 프로젝트를 그대로 쓴다(재시도
-횟수를 `attempt < 1` 로 제한해 무한 재귀도 막는다). 이 로직을 지울 때는 목록 화면 자체가 없어졌는지
-먼저 확인할 것 — 사이트가 다시 개편되면 이 부분이 가장 먼저 깨진다.
+**Typecast 프로젝트 이동은 사람이 한다.** 기본 URL(`studio.typecast.ai/text-to-speech`)은 "새 프로젝트 /
+대본 가져오기 / 새 폴더"가 있는 프로젝트 목록이고, 페이지 이동 과정에서 Typecast 자체 오류가 날 수
+있다. OmniRec은 목록의 첫 프로젝트를 자동 클릭하거나 프로젝트 URL로 자동 이동하지 않는다.
+
+사용자가 `Typecast 열기` 후 Chrome에서 녹음에 사용할 프로젝트를 직접 열고, 대본 편집기와 재생
+버튼이 보이는 상태로 둔 뒤 배치를 시작한다. 시작 전 `typecast_editor_ready`가 두 요소를 모두
+확인하며, 준비되지 않았으면 대본 입력·출력 덮어쓰기 확인·녹음을 시작하지 않는다. `doPrepare()`와
+`doPlay()`도 편집기/버튼이 없으면 자동 이동 대신 직접 프로젝트를 열라는 실패를 즉시 보고한다.
 
 입력 검증은 **정규화 후 완전 일치**다. "앞 40자가 어딘가 있다 + 기대보다 20자 넘게 길지 않다"는
 예전 휴리스틱에는 **하한이 없어**, 3,000자 대본에서 앞 50자만 들어가도 `step:prepared` 를 내고

@@ -82,8 +82,6 @@ const VU_GRACE_MS = 5000;
 const PLAYBACK_RECOVERY_MS = 5000;
 /** Typecast 재생 상태를 정지로 되돌린 뒤 다시 누르기 전 안정화 시간. */
 const PLAYBACK_RESTART_GAP_MS = 700;
-/** Typecast 창이 실제로 열릴 때까지 1초 간격으로 확인할 횟수. */
-const BROWSER_READY_POLLS = 12;
 
 /**
  * 대본을 붙여넣은 뒤 재생을 요청하기까지의 안정화 시간.
@@ -519,38 +517,39 @@ export const TtsBatchRunner: React.FC<TtsBatchRunnerProps> = ({
   };
 
   /**
-   * Typecast 창이 열려 있고 **로그인까지 되어 있는지** 확인한다.
-   * 로그인이 안 돼 있으면 대본마다 똑같은 이유로 실패하므로 시작 전에 한 번만 막는다.
+   * 사용자가 Typecast 프로젝트 편집기를 직접 열어 둔 상태인지 확인한다.
+   * 프로젝트 목록에서 자동 이동하지 않는다. 사이트 자체의 이동 오류와 엉뚱한 프로젝트 선택을
+   * 모두 피하고, 준비되지 않았으면 대본이나 녹음을 건드리기 전에 시작을 막는다.
    */
   const ensureBrowserReady = async (): Promise<boolean> => {
     try {
-      let state = await invoke<TypecastBrowserState>('get_typecast_browser_state');
+      const state = await invoke<TypecastBrowserState>('get_typecast_browser_state');
       if (!state.is_open) {
-        setPhaseMessage('Typecast 창을 여는 중...');
-        await invoke('open_typecast_browser', { url: settings.typecast_editor_url });
-        // 고정 대기 대신 창이 실제로 잡힐 때까지 확인한다.
-        for (let i = 0; i < BROWSER_READY_POLLS && !state.is_open; i += 1) {
-          if (abortRef.current) return false;
-          await sleep(1000);
-          state = await invoke<TypecastBrowserState>('get_typecast_browser_state');
-        }
-      }
-      if (!state.is_open) {
-        setErrorMsg('Typecast 창이 열리지 않았습니다. Chrome 경로와 연동 진단 로그를 확인하세요.');
+        setErrorMsg(
+          'Typecast 열기를 누른 뒤, Chrome에서 작업할 프로젝트를 직접 열어 둔 상태로 다시 시작하세요.',
+        );
         return false;
       }
       if (!state.looks_signed_in) {
         setErrorMsg(
-          'Typecast 에 로그인되어 있지 않습니다. 위 카드에서 로그인한 뒤 다시 시작하세요.' +
+          'Typecast 에 로그인되어 있지 않습니다. 위 카드에서 로그인한 뒤 작업할 프로젝트를 직접 열어 주세요.' +
             (state.current_url ? ` (현재 ${state.current_url})` : ''),
         );
         return false;
       }
-      // SPA 가 편집기를 그릴 시간을 준다.
-      await sleep(1500);
+
+      setPhaseMessage('열려 있는 Typecast 프로젝트를 확인하는 중...');
+      const ready = await invoke<boolean>('typecast_editor_ready');
+      if (!ready) {
+        setErrorMsg(
+          'Typecast Chrome 창에서 작업할 프로젝트를 직접 열고, 대본 편집기와 재생 버튼이 보이는 상태에서 다시 시작하세요.' +
+            (state.current_url ? ` (현재 ${state.current_url})` : ''),
+        );
+        return false;
+      }
       return true;
     } catch (err) {
-      setErrorMsg(`Typecast 창을 준비하지 못했습니다: ${err}`);
+      setErrorMsg(`Typecast 프로젝트 편집기를 확인하지 못했습니다: ${err}`);
       return false;
     }
   };
@@ -844,8 +843,8 @@ export const TtsBatchRunner: React.FC<TtsBatchRunnerProps> = ({
       }
       // 사전 점검을 통과하기 전에는 큐를 만들지 않는다. 여기서 되돌아가면 아직 아무것도
       // 시작하지 않은 것이므로, 목록에 '건너뜀' 항목이 남지 않게 한다.
-      if (!(await confirmOutputTargets(targets))) return;
       if (!(await ensureBrowserReady())) return;
+      if (!(await confirmOutputTargets(targets))) return;
       setQueue(
         targets.map((s) => ({
           scriptId: s.id,

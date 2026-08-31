@@ -233,6 +233,15 @@ export const TypecastSessionCard: React.FC<TypecastSessionCardProps> = ({
         </button>
       </div>
 
+      <div className="rounded-xl bg-blue-950/25 border border-blue-900/40 p-3 flex gap-2.5">
+        <Info className="w-4 h-4 text-blue-400 shrink-0 mt-0.5" />
+        <p className="text-[11px] text-slate-300 leading-relaxed">
+          <b className="text-blue-300">Typecast 열기</b> 후 Chrome에서 녹음에 사용할 프로젝트를 직접
+          여세요. 대본 편집기와 재생 버튼이 보이는 상태에서 자동 처리를 시작해야 하며, OmniRec은
+          프로젝트 목록에서 자동으로 이동하지 않습니다.
+        </p>
+      </div>
+
       <div className="flex items-center gap-2 text-[10px] text-slate-500 font-mono">
         <span className={browserState.is_open ? 'text-emerald-500' : 'text-slate-600'}>
           ● {browserState.is_open ? '창 열림' : '창 닫힘'}
