@@ -542,17 +542,49 @@ Typecast 의 ErrorBoundary 가 화면을 버리고 프로젝트 목록으로 되
 보내도 렌더러가 편집 동작을 실행하지 않는다(네이티브 키 바인딩이 담당하는 영역이다). 실측:
 명령 없이 보내면 전체 선택은 되지만 삭제가 안 돼 새 대본이 이전 대본 뒤에 덧붙는다.
 
+**입력 전에 탭을 앞으로 올릴 것(`bring_to_front`).** 실측: 배경 탭에서는 마우스 클릭은 전달되는데
+`selectAll` · `deleteBackward` · `Input.insertText` 가 **조용히 무시된다** — 내용이 그대로 남거나
+입력이 사라진다. `click_into_editor()` 가 좌표를 재기 전에 항상 탭을 활성화한다.
+
+**전체 선택과 삭제 사이에 간격을 둘 것(`SELECTION_SYNC_DELAY`, 250ms).** Slate 는 내부 선택을 DOM
+`selectionchange` 로부터 **비동기로** 동기화한다. 곧바로 삭제를 보내면 Slate 가 아직 접힌 옛 선택을
+들고 있어 **한 글자만** 지운다(실측: 2,536자를 선택했는데 2,535자가 남았다). 그러면 새 대본이 이전
+대본 뒤에 덧붙어 검증에서 실패한다. 지운 뒤에는 `__omnirecEditorEmpty()` 를 **폴링**해 실제로
+비었는지 확인하고(최대 1.5초, 3회 재시도), 입력 뒤에는 `__omnirecScriptSettled()` 를 폴링해
+반영이 끝난 다음에 검증한다 — 고정 지연으로 판정하면 단락이 많을 때 간헐적으로 어긋난다.
+
+**클릭 지점은 편집 가능한 본문이어야 한다.** 단락마다 앞에 붙는 화자 선택 버튼은
+`contenteditable="false"` 서브트리다. 편집기 안이지만 여기를 클릭하면 캐럿이 아니라 음성 선택 UI 가
+열리고, 뒤따르는 selectAll/삭제/Enter 가 그 UI 로 들어가 사이트가 튕긴다(실측: 클릭 대상이
+`span.chakra-text"필재"` 였고 편집기 내용이 하나도 바뀌지 않았다). `editorPoint()` 는
+`contenteditable="false"` 서브트리를 제외하고, 열(3곳) × 행(23곳)을 훑어 편집 가능한 지점을 고르며,
+`click_into_editor()` 는 클릭 후 `__omnirecEditorFocused()` 로 캐럿이 실제로 본문에 들어갔는지 확인한다.
+
+**빈 Slate 편집기에서 `textContent` 로 물러나지 말 것.** 편집기가 비면 `[data-slate-string]` 이 아예
+없어지는데, 그때 `textContent` 를 읽으면 화자 이름("필재")이 본문으로 잡혀 "비어 있음"을 영원히
+만족하지 못한다(실측: `readEditor` 가 `"필재\uFEFF"` 를 돌려줘 삭제가 성공했는데도 실패로 판정됐다).
+
 **클릭 좌표는 세 조건을 모두 만족해야 한다** — 편집기 안 · 화면 안 · 가려지지 않음.
 첫 단락은 스크롤 컨테이너가 이미 맨 위라 `scrollIntoView` 로 더 내릴 수 없고 그 자리는 프로젝트
 헤더 밑이라 클릭이 헤더로 들어가며(실측), 뷰포트보다 긴 단락은 스크롤해도 위쪽이 화면 밖에 남는다.
-`editorPoint()` 는 편집기의 보이는 구간을 위에서 아래로 훑어 `elementFromPoint` 가 편집기를
-가리키는 첫 지점을 고른다. 어느 단락을 클릭해도 무해하다 — 캐럿은 곧바로 맨 앞으로 옮긴다.
+어느 단락을 클릭해도 무해하다 — 캐럿은 곧바로 맨 앞으로 옮긴다.
 
 주입 스크립트(`MAIN_INIT_SCRIPT`)가 편집기에 대해 하는 일은 **읽기와 좌표 계산뿐**이다
-(`findEditor` · `readEditor` · `cleanScript` · `editorPoint` · `verifyScript`). 회귀 테스트:
-`tts::tests::trusted_input_survives_shrinking_replacement`(`#[ignore]`) — 실행 중인 Typecast
-Chrome 에 재접속해 **긴 대본 → 짧은 대본** 순서로 채우고, 두 번 다 `step:prepared` 가 나오며
-페이지가 같은 프로젝트에 남아 있는지(= 사이트가 튕기지 않았는지) 확인한다.
+(`findEditor` · `readEditor` · `cleanScript` · `editorPoint` · `editorFocused` · `editorEmpty` ·
+`scriptSettled` · `verifyScript`). 회귀 테스트:
+`tts::tests::trusted_input_survives_shrinking_replacement`(`#[ignore]`) — 실행 중인 Typecast Chrome 에
+재접속해 **긴 대본 → 짧은 대본 → 여러 단락** 순서로 채우고 사이사이 재생·정지까지 돌린 뒤, 매번
+`step:prepared` 가 나오고 페이지가 같은 프로젝트에 남아 있는지(= 사이트가 튕기지 않았는지) 본다.
+
+이 테스트는 **대상 프로젝트의 대본을 덮어쓴다.** 그래서 `OMNIREC_TEST_PROJECT_URL` 로 대상을 직접
+지정해야 실행되고(열려 있는 아무 프로젝트나 잡으면 작업 중인 대본이 지워진다 — 실제로 한 번 겪었다),
+시작 전 내용을 백업해 끝에 되돌린다. 복원이 실패하면 백업 전문을 stdout 에 찍는다.
+
+```bash
+OMNIREC_TEST_PROJECT_URL=https://studio.typecast.ai/text-to-speech/<id> \
+  cargo test --manifest-path src-tauri/Cargo.toml --lib \
+  tts::tests::trusted_input_survives_shrinking_replacement -- --ignored --nocapture
+```
 
 **Typecast 프로젝트 이동은 사람이 한다.** 기본 URL(`studio.typecast.ai/text-to-speech`)은 "새 프로젝트 /
 대본 가져오기 / 새 폴더"가 있는 프로젝트 목록이고, 페이지 이동 과정에서 Typecast 자체 오류가 날 수

@@ -77,6 +77,12 @@ const MAX_STEP_DETAIL_CHARS: usize = 600;
 /// 뒤늦게 종료된 옛 handler 태스크가 방금 만든 새 세션을 지운다.
 static SESSION_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+/// 전체 선택 뒤 삭제까지 두는 간격.
+///
+/// Slate 는 DOM `selectionchange` 를 비동기로 받아 내부 선택을 갱신한다. 이 간격이 없으면
+/// 삭제가 옛 선택(접힌 캐럿)으로 처리돼 한 글자만 지워지고, 새 대본이 이전 대본 뒤에 덧붙는다.
+const SELECTION_SYNC_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// 네비게이션 표식 발급기. 이동 전 문서에 심어 두고, 이 값이 사라진 것으로
 /// "새 문서가 커밋됐다"를 판정한다(`navigate_and_wait`).
 static NAV_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -1143,6 +1149,13 @@ impl TypecastController {
     /// 지점). JS 로 DOM Range 를 만들어 선택을 강제하던 방식으로 되돌리지 말 것 — Slate
     /// 내부 상태가 DOM 과 어긋나 사이트가 통째로 튕긴다.
     async fn click_into_editor(page: &Page) -> Result<String, String> {
+        // **편집 명령은 전면 탭에서만 실행된다.** 실측: 배경 탭에서는 마우스 클릭은 전달되는데
+        // `selectAll` · `deleteBackward` · `Input.insertText` 가 조용히 무시돼, 내용이 그대로
+        // 남거나 입력이 사라진다. 그래서 좌표를 재기 전에 탭을 앞으로 올린다.
+        page.bring_to_front()
+            .await
+            .map_err(|e| format!("Typecast 탭을 앞으로 올릴 수 없습니다: {}", e))?;
+
         let point = page
             .evaluate("window.__omnirecEditorPoint && window.__omnirecEditorPoint()")
             .await
@@ -1161,6 +1174,21 @@ impl TypecastController {
         }
 
         Self::click_at(page, point.x, point.y).await?;
+
+        // 클릭이 편집 가능한 본문에 닿았는지 확인한다. 화자 선택 버튼이나 가려진 영역을
+        // 클릭하면 이후 selectAll/삭제/입력이 조용히 아무 일도 하지 않는다(실측).
+        let focused = page
+            .evaluate("Boolean(window.__omnirecEditorFocused && window.__omnirecEditorFocused())")
+            .await
+            .map_err(|e| format!("편집기 포커스 확인 실패: {}", e))?
+            .into_value::<bool>()
+            .unwrap_or(false);
+        if !focused {
+            return Err(format!(
+                "편집기에 캐럿을 놓지 못했습니다(클릭 지점 {}). 프로젝트 화면이 앞에 있고 배너·팝업이 없는지 확인하세요",
+                point.at
+            ));
+        }
         Ok(point.at)
     }
 
@@ -1251,9 +1279,30 @@ impl TypecastController {
 
         // 이전 대본을 남기지 않는다. 전체 선택과 삭제는 편집 명령으로 보낸다 — macOS 에서는
         // ⌘A · Backspace 키 조합만으로는 렌더러가 편집 명령을 실행하지 않는다(실측).
-        Self::press_key(page, &KeyStroke::select_all()).await?;
-        Self::press_key(page, &KeyStroke::backspace()).await?;
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        //
+        // **전체 선택과 삭제 사이에 반드시 간격을 둔다.** Slate 는 내부 선택 상태를 DOM
+        // `selectionchange` 로부터 **비동기로** 동기화한다. 곧바로 삭제를 보내면 Slate 가 아직
+        // 접힌(collapsed) 옛 선택을 들고 있어 한 글자만 지운다(실측: 2,536자 선택 → 2,535자 남음).
+        // 그 상태로 입력하면 이전 대본 위에 새 대본이 덧붙는다.
+        //
+        // 그리고 비었는지 **폴링으로** 확인하고, 안 비었으면 다시 시도한다. Slate 의 삭제 반영도
+        // 비동기라 한 번만 보고 판정하면 이미 지워졌는데도 실패로 오인한다.
+        let mut cleared = false;
+        for _ in 0..3 {
+            Self::press_key(page, &KeyStroke::select_all()).await?;
+            tokio::time::sleep(SELECTION_SYNC_DELAY).await;
+            Self::press_key(page, &KeyStroke::backspace()).await?;
+            if Self::wait_until_empty(page, std::time::Duration::from_millis(1500)).await? {
+                cleared = true;
+                break;
+            }
+        }
+        if !cleared {
+            return Err(
+                "이전 대본을 비우지 못했습니다. Typecast 프로젝트 화면에 열려 있는 팝업·메뉴를 닫고 다시 시작하세요"
+                    .to_string(),
+            );
+        }
 
         let lines: Vec<&str> = cleaned.split('\n').collect();
         for (index, line) in lines.iter().enumerate() {
@@ -1270,10 +1319,75 @@ impl TypecastController {
 
         // 낭독은 커서 위치부터 시작한다. 입력 직후 캐럿은 본문 끝에 있으므로 맨 앞으로 되돌린다.
         Self::press_key(page, &KeyStroke::to_document_start()).await?;
-        // Slate 가 입력을 반영·정규화할 시간을 준 뒤에 검증한다.
-        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+        // 고정 대기 대신 **내용이 기대와 일치할 때까지** 기다린다. Slate 는 입력을 비동기로
+        // 반영·정규화하므로, 고정 지연으로 잡으면 단락이 많을 때 검증이 간헐적으로 어긋난다.
+        // 예산 안에 일치하지 않아도 검증은 그대로 진행한다 — 그 쪽이 원인별 진단을 남긴다.
+        Self::wait_until_script_settled(page, raw_text, std::time::Duration::from_millis(2500))
+            .await?;
 
         Ok(format!("신뢰된 입력 · {}단락 · 클릭 {}", lines.len(), at))
+    }
+
+    /// 편집기 내용이 기대한 대본과 일치할 때까지 기다린다.
+    async fn wait_until_script_settled(
+        page: &Page,
+        raw_text: &str,
+        budget: std::time::Duration,
+    ) -> Result<bool, String> {
+        let payload = serde_json::to_string(raw_text).map_err(|e| e.to_string())?;
+        let expression = format!(
+            "Boolean(window.__omnirecScriptSettled && window.__omnirecScriptSettled({}))",
+            payload
+        );
+        let deadline = tokio::time::Instant::now() + budget;
+        loop {
+            let settled = page
+                .evaluate(expression.clone())
+                .await
+                .map_err(|e| format!("입력 반영 확인 실패: {}", e))?
+                .into_value::<bool>()
+                .unwrap_or(false);
+            if settled {
+                return Ok(true);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(false);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
+    /// 편집기가 비워질 때까지 기다린다. Slate 의 삭제 반영이 비동기라서 폴링해야 한다.
+    async fn wait_until_empty(page: &Page, budget: std::time::Duration) -> Result<bool, String> {
+        let deadline = tokio::time::Instant::now() + budget;
+        loop {
+            if Self::editor_is_empty(page).await? {
+                return Ok(true);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(false);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
+    /// 편집기 본문을 읽는다(테스트가 대상 프로젝트 내용을 백업·복원하는 데 쓴다).
+    async fn read_script(page: &Page) -> Result<String, String> {
+        page.evaluate("window.__omnirecReadScript ? window.__omnirecReadScript() : ''")
+            .await
+            .map_err(|e| format!("편집기 내용 읽기 실패: {}", e))?
+            .into_value::<String>()
+            .map_err(|e| format!("편집기 내용 해석 실패: {}", e))
+    }
+
+    /// 편집기 본문이 비었는지 확인한다(삭제가 실제로 통했는지 판정용).
+    async fn editor_is_empty(page: &Page) -> Result<bool, String> {
+        page.evaluate("Boolean(window.__omnirecEditorEmpty && window.__omnirecEditorEmpty())")
+            .await
+            .map_err(|e| format!("편집기 비우기 확인 실패: {}", e))?
+            .into_value::<bool>()
+            .map_err(|e| format!("편집기 비우기 확인 결과 해석 실패: {}", e))
     }
 
     /// 편집기의 재생 버튼을 누른다.
@@ -1616,6 +1730,13 @@ const MAIN_INIT_SCRIPT: &str = r#"
         .call(strings, function (node) { return node.textContent || ''; })
         .join('\n');
     }
+
+    // Slate 편집기는 **비어 있을 때** `[data-slate-string]` 이 아예 없다. 이때 textContent 로
+    // 물러나면 화자 이름("필재")이 본문으로 잡혀 "비어 있음"을 영원히 만족하지 못하고, 삭제가
+    // 성공했는데도 실패로 판정된다(실측: `readEditor` 가 `"필재\uFEFF"` 를 돌려줬다).
+    if (el.getAttribute && el.getAttribute('data-slate-editor') === 'true') return '';
+    if (el.querySelector('[data-slate-node]')) return '';
+
     return el.textContent || '';
   }
 
@@ -1655,38 +1776,68 @@ const MAIN_INIT_SCRIPT: &str = r#"
     var rect = target.getBoundingClientRect();
     if (rect.width < 2 || rect.height < 2) return null;
 
-    // 클릭 지점은 (1) 편집기 안이고 (2) 화면 안이며 (3) 스티키 헤더·배너에 가려지지
-    // 않아야 한다. 세 조건이 다 필요하다는 것은 실측으로 확인했다:
-    //  - 첫 단락은 컨테이너가 이미 맨 위라 `scrollIntoView` 로 더 내릴 수 없고, 그 자리는
-    //    프로젝트 헤더 밑이라 클릭이 헤더로 들어간다.
-    //  - 뷰포트보다 긴 단락은 스크롤해도 위쪽이 화면 밖에 남는다(밖을 클릭하면 아무 곳에도
-    //    닿지 않는다).
-    // 그래서 편집기의 보이는 구간을 위에서 아래로 훑어 실제로 편집기에 닿는 첫 지점을 쓴다.
-    // 어느 단락을 클릭해도 무해하다 — 캐럿은 곧바로 `moveToBeginningOfDocument` 로 옮긴다.
+    // 클릭 지점은 네 조건을 모두 만족해야 한다. 전부 실측으로 확인한 것이다:
+    //  (1) 편집기 안 — 밖이면 캐럿이 편집기에 들어가지 않는다.
+    //  (2) **편집 가능한 영역** — 단락마다 앞에 붙는 화자 선택 버튼은 `contenteditable="false"`
+    //      서브트리다. 편집기 안이지만 여기를 클릭하면 캐럿이 아니라 음성 선택 UI 가 열리고,
+    //      뒤따르는 selectAll/삭제/Enter 키가 그 UI 로 들어가 사이트가 튕긴다(실측: 클릭
+    //      대상이 `span.chakra-text"필재"` 였고 편집기 내용이 하나도 바뀌지 않았다).
+    //  (3) 화면 안 — 뷰포트 밖을 클릭하면 아무 곳에도 닿지 않는다.
+    //  (4) 가려지지 않음 — 첫 단락은 스크롤 컨테이너가 이미 맨 위라 `scrollIntoView` 로 더
+    //      내릴 수 없고 그 자리는 프로젝트 헤더 밑이라 클릭이 헤더로 들어간다.
+    // 그래서 편집기의 보이는 구간을 여러 지점으로 훑어 **편집 가능한 텍스트에 닿는** 첫 지점을
+    // 고른다. 어느 단락을 클릭해도 무해하다 — 캐럿은 곧바로 맨 앞으로 옮긴다.
     var editorRect = editor.getBoundingClientRect();
     var top = Math.max(Math.min(rect.top, editorRect.top), 0);
     var bottom = Math.min(Math.max(rect.bottom, editorRect.bottom), window.innerHeight);
-    var x = Math.min(Math.max(rect.left + 4, 4), Math.min(rect.right - 4, window.innerWidth - 4));
+    var columns = [rect.left + 4, rect.left + rect.width / 2, rect.right - 4];
     var lastHit = null;
     var steps = 24;
 
-    for (var i = 1; i < steps; i++) {
-      var y = top + ((bottom - top) * i) / steps;
-      if (y < 1 || y > window.innerHeight - 1) continue;
-      var hit = document.elementFromPoint(x, y);
-      if (hit && (editor === hit || editor.contains(hit))) {
-        return { x: x, y: y, covered: false, at: describe(hit), cover: '' };
+    for (var c = 0; c < columns.length; c++) {
+      var x = Math.min(Math.max(columns[c], 4), window.innerWidth - 4);
+      for (var i = 1; i < steps; i++) {
+        var y = top + ((bottom - top) * i) / steps;
+        if (y < 1 || y > window.innerHeight - 1) continue;
+        var hit = document.elementFromPoint(x, y);
+        if (isEditableHit(editor, hit)) {
+          return { x: x, y: y, covered: false, at: describe(hit), cover: '' };
+        }
+        if (hit) lastHit = hit;
       }
-      if (hit) lastHit = hit;
     }
 
     return {
-      x: x,
+      x: Math.min(Math.max(rect.left + 4, 4), window.innerWidth - 4),
       y: Math.min(Math.max(top + 8, 8), Math.max(bottom - 4, 8)),
       covered: true,
       at: describe(target),
       cover: describe(lastHit)
     };
+  }
+
+  /**
+   * 그 지점을 클릭하면 편집기 본문에 캐럿이 놓이는가.
+   *
+   * 편집기 안이어도 `contenteditable="false"` 서브트리(화자 선택 버튼)는 안 된다 —
+   * 캐럿이 아니라 음성 선택 UI 가 열린다.
+   */
+  function isEditableHit(editor, hit) {
+    if (!hit) return false;
+    if (!(editor === hit || editor.contains(hit))) return false;
+    var node = hit;
+    while (node && node !== editor) {
+      if (node.getAttribute && node.getAttribute('contenteditable') === 'false') return false;
+      node = node.parentElement;
+    }
+    return true;
+  }
+
+  /** 지금 캐럿이 편집기 본문에 있는가(클릭이 실제로 통했는지 확인용). */
+  function editorFocused() {
+    var editor = findEditor();
+    if (!editor) return false;
+    return isEditableHit(editor, document.activeElement);
   }
 
   // 편집기 내용과 대본을 비교하기 위한 정규화.
@@ -1910,6 +2061,10 @@ const MAIN_INIT_SCRIPT: &str = r#"
         play: play
       });
     };
+    window.__omnirecScriptSettled = function (text) {
+      var editor = findEditor();
+      return !!editor && normalize(readEditor(editor)) === normalize(cleanScript(text));
+    };
     window.__omnirecEditorReady = function () {
       return !!findEditor() && !!findPlayButton();
     };
@@ -1920,6 +2075,15 @@ const MAIN_INIT_SCRIPT: &str = r#"
     // 앱이 CDP 입력으로 대본을 넣기 위해 쓰는 훅. 편집기 내용을 JS 로 고치지 않는다.
     window.__omnirecCleanScript = function (text) { return cleanScript(text); };
     window.__omnirecEditorPoint = function () { return editorPoint(); };
+    window.__omnirecEditorFocused = function () { return editorFocused(); };
+    window.__omnirecEditorEmpty = function () {
+      var editor = findEditor();
+      return !!editor && normalize(readEditor(editor)).length === 0;
+    };
+    window.__omnirecReadScript = function () {
+      var editor = findEditor();
+      return editor ? readEditor(editor) : '';
+    };
     window.__omnirecVerifyScript = function (text, inputDetail) {
       verifyScript(text, inputDetail);
     };
@@ -2545,11 +2709,16 @@ mod tests {
     /// 내부 선택이 옛 문서의 offset 을 가리킨 채 남아, 더 짧은 대본으로 교체되는 순간
     /// `Cannot resolve a DOM point from Slate point: {"path":[0,0,0],"offset":4328}` 예외가
     /// 나고 Typecast 의 ErrorBoundary 가 목록으로 되돌린다(Sentry 페이로드로 실측 확인).
-    /// 그래서 이 테스트는 **긴 대본 → 짧은 대본** 순서로 두 번 채운 뒤, 페이지가 여전히
-    /// 그 프로젝트에 남아 있고 두 번 다 `step:prepared` 가 나오는지 본다.
+    /// 그래서 이 테스트는 **긴 대본 → 짧은 대본 → 여러 단락** 순서로 채우고 사이사이 재생·정지까지
+    /// 돌린 뒤, 페이지가 여전히 그 프로젝트에 남아 있고 매번 `step:prepared` 가 나오는지 본다.
     ///
-    /// 준비: 앱에서 `Typecast 열기` 로 창을 띄우고 작업할 프로젝트를 직접 열어 둘 것.
-    /// 수동 실행: `cargo test --manifest-path src-tauri/Cargo.toml --lib tts::tests::trusted_input_survives_shrinking_replacement -- --ignored --nocapture`
+    /// **이 테스트는 대상 프로젝트의 대본을 덮어쓴다.** 그래서 반드시 `OMNIREC_TEST_PROJECT_URL`
+    /// 로 대상을 직접 지정해야 하고(실수로 작업 중인 프로젝트를 지우지 않도록), 시작 전 내용을
+    /// 백업해 끝에 되돌린다. 복원이 실패하면 백업 전문을 stdout 에 찍어 사람이 살릴 수 있게 한다.
+    ///
+    /// 준비: 앱에서 `Typecast 열기` → **버려도 되는 프로젝트**를 직접 열고 그 URL 을 넘긴다.
+    /// 수동 실행:
+    /// `OMNIREC_TEST_PROJECT_URL=https://studio.typecast.ai/text-to-speech/<id> cargo test --manifest-path src-tauri/Cargo.toml --lib tts::tests::trusted_input_survives_shrinking_replacement -- --ignored --nocapture`
     #[tokio::test]
     #[ignore]
     async fn trusted_input_survives_shrinking_replacement() {
@@ -2574,6 +2743,11 @@ mod tests {
 
         // 재접속 직후에는 chromiumoxide 가 아직 기존 탭에 붙지 않았을 수 있다(핸들러가
         // 타깃 이벤트를 처리해야 목록이 채워진다). 몇 초간 다시 훑는다.
+        // 대상은 환경변수로 못박는다. 열려 있는 아무 프로젝트나 잡으면 사용자가 작업 중인
+        // 대본을 덮어쓴다(실측으로 한 번 겪었다 — 반드시 명시적으로 지정할 것).
+        let wanted = std::env::var("OMNIREC_TEST_PROJECT_URL").expect(
+            "OMNIREC_TEST_PROJECT_URL 에 덮어써도 되는 Typecast 프로젝트 URL 을 지정해야 한다",
+        );
         let mut editor_page = None;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
         while editor_page.is_none() && tokio::time::Instant::now() < deadline {
@@ -2581,7 +2755,7 @@ mod tests {
             for page in pages {
                 let url = page.url().await.ok().flatten().unwrap_or_default();
                 println!("탭: {}", url);
-                if url.contains("/text-to-speech/") {
+                if url == wanted {
                     editor_page = Some((page, url));
                     break;
                 }
@@ -2590,8 +2764,8 @@ mod tests {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
         }
-        let (page, url) =
-            editor_page.expect("작업할 Typecast 프로젝트를 직접 열어 둔 탭이 있어야 한다");
+        let (page, url) = editor_page
+            .unwrap_or_else(|| panic!("{wanted} 탭을 찾지 못했다. 그 프로젝트를 직접 열어 둘 것"));
         println!("대상 프로젝트: {}", url);
 
         // 이미 로드된 문서에는 `evaluate_on_new_document` 가 적용되지 않으므로 직접 주입한다.
@@ -2611,6 +2785,12 @@ mod tests {
             .await
             .expect("브리지 이벤트를 구독해야 한다");
 
+        // 덮어쓸 대본을 먼저 백업한다(끝에 되돌린다). 비어 있는 프로젝트도 대상이 될 수 있다.
+        let original = TypecastController::read_script(&page)
+            .await
+            .expect("원래 대본을 읽어야 한다");
+        println!("원래 대본 백업: {}자", original.chars().count());
+
         let long_script = format!(
             "긴 대본 검증. {}",
             "한 단락을 길게 만드는 반복 문장입니다. ".repeat(110)
@@ -2619,12 +2799,31 @@ mod tests {
             .map(|i| format!("짧은 대본 {}번째 단락입니다.", i))
             .collect::<Vec<_>>()
             .join("\n");
+        let many_script = (1..=22)
+            .map(|i| {
+                format!(
+                    "여러 단락 {}번째. 채용에서 금융 경력을 요구하지 않았습니다.",
+                    i
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
 
-        for (label, script) in [("긴 대본", &long_script), ("짧은 대본", &short_script)] {
+        // 실제 일괄 녹음과 같은 순서로 돈다: 입력 → 재생 → 정지 → 다음 대본.
+        // 길이가 늘었다 줄었다 하는 순서여야 Slate 의 옛 캐럿 offset 문제가 드러난다.
+        for (label, script) in [
+            ("긴 대본", &long_script),
+            ("짧은 대본", &short_script),
+            ("여러 단락", &many_script),
+        ] {
             let detail = TypecastController::type_script(&page, script)
                 .await
                 .unwrap_or_else(|e| panic!("{label} 입력이 성공해야 한다: {e}"));
             println!("{label} 입력: {}", detail);
+            assert!(
+                !detail.contains("button"),
+                "{label}: 캐럿을 화자 선택 버튼에 놓으면 안 된다: {detail}"
+            );
 
             let payload = serde_json::to_string(script).expect("json encode should succeed");
             let detail_json = serde_json::to_string(&detail).expect("json encode should succeed");
@@ -2650,18 +2849,42 @@ mod tests {
                 report.starts_with("step:prepared:"),
                 "{label} 입력이 정확히 들어가야 한다: {report}"
             );
+
+            // 재생·정지까지 돌려 배치와 같은 상태 전이를 만든다(재생 중 교체가 사고의 조건이었다).
+            page.evaluate("window.__omnirecPlay && window.__omnirecPlay();")
+                .await
+                .unwrap_or_else(|e| panic!("{label} 재생 호출이 성공해야 한다: {e}"));
+            tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+            page.evaluate("window.__omnirecStopPlayback && window.__omnirecStopPlayback();")
+                .await
+                .unwrap_or_else(|e| panic!("{label} 정지 호출이 성공해야 한다: {e}"));
+            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+
+            let still_there = page.url().await.ok().flatten().unwrap_or_default();
+            assert_eq!(
+                still_there, url,
+                "{label} 처리 뒤에도 같은 프로젝트에 남아 있어야 한다(사이트가 튕기지 않았다)"
+            );
         }
 
-        // ErrorBoundary 가 튕겼으면 URL 이 프로젝트 목록으로 바뀐다.
-        let after = page
-            .url()
-            .await
-            .expect("URL 을 읽어야 한다")
-            .unwrap_or_default();
-        assert_eq!(
-            after, url,
-            "짧은 대본으로 교체한 뒤에도 같은 프로젝트에 남아 있어야 한다(사이트가 튕기지 않았다)"
-        );
+        // 빌려 쓴 프로젝트를 원래 대본으로 되돌린다.
+        match TypecastController::type_script(&page, &original).await {
+            Ok(detail) => {
+                println!("원래 대본 복원: {}", detail);
+                let restored = TypecastController::read_script(&page)
+                    .await
+                    .unwrap_or_default();
+                assert_eq!(
+                    restored.replace(['\n', ' '], ""),
+                    original.replace(['\n', ' '], ""),
+                    "원래 대본이 그대로 복원되어야 한다"
+                );
+            }
+            Err(e) => {
+                println!("복원 실패({e}). 아래 백업으로 직접 되돌릴 것:\n{original}");
+                panic!("원래 대본 복원 실패: {e}");
+            }
+        }
 
         // 사용자의 Chrome 이므로 닫지 않는다. 연결만 놓는다.
         handler_task.abort();
