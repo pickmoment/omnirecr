@@ -422,10 +422,10 @@ settle   EDITOR_SETTLE_MS(2초) 대기 — `step:prepared` 는 DOM 에 글자가
 record   start_audio_record       → 저장 경로 확보 (auto_stop 은 끄고 직접 판정)
 play     focus_typecast_browser → typecast_play → step:playing / step:play-failed (12s)
 speak    audio_vu_meter 구독      → sys_level > 임계값이면 시작, 무음 N초 지속되면 종료
-         (단락/화자 전환으로 오디오가 재생성되는 동안의 무음은 `media-ended` 신호로,
-          Typecast 사이트가 스스로 재생을 멈추는 오동작은 `media-pause` 신호로 들어온다.
-          둘 다 재생 버튼을 다시 누르는 등 추가 개입 없이 `segmentGapMs`(무음 판정의
-          2배, 최소 8초) 만큼 종료 판정만 미룬다 — TtsBatchRunner.tsx)
+         첫 클릭 후 5초간 소리가 없으면 `typecast_stop_playback` → 700ms → `typecast_play` 로
+         정확히 한 번 복구한다. 실제 낭독이 시작된 뒤에는 재생 버튼에 개입하지 않는다.
+         단락/화자 전환으로 오디오가 재생성되는 동안의 무음은 `media-ended`, 사이트가 스스로
+         재생을 멈추는 오동작은 `media-pause` 로 받고 `segmentGapMs` 동안 종료 판정만 미룬다.
 save     stop_record → attach_script_recording → 다음 대본 (gap 초 대기)
 ```
 
@@ -535,7 +535,7 @@ DOM 구조가 평범한 `contenteditable` 이 아니라 아래처럼 생겼다. 
    가 거부될 수 있으므로, Chrome 실행 인자 `--autoplay-policy=no-user-gesture-required` 로 이
    제한을 끈다(`BrowserConfig::builder().arg(...)`, `TypecastController::open`).
 
-#### 재생 버튼은 안정화 후 정확히 한 번 누른다
+#### 재생 버튼은 단일 클릭하고, 무음일 때만 한 번 복구한다
 
 `step:prepared` 는 편집기 DOM 의 내용 일치만 보장한다. Typecast 의 React + Slate 내부 상태와
 합성 준비가 뒤따라 반영될 시간을 주기 위해 배치 러너는 녹음 시작 전에 2초간 기다린다. 그 뒤
@@ -543,11 +543,14 @@ DOM 구조가 평범한 `contenteditable` 이 아니라 아래처럼 생겼다. 
 
 반복 클릭으로 되돌리지 말 것. Typecast 가 Web Audio 로 재생하면 `<audio>`/`<video>` 상태만으로
 실제 재생 여부를 알 수 없고, 합성 준비 중 재생/정지 토글을 연속으로 바꾸면 화면만 재생 상태인 채
-소리가 시작되지 않을 수 있다. 낭독 도중 재클릭도 같은 이유로 금지한다.
+소리가 시작되지 않을 수 있다. 대신 시스템 VU 가 첫 클릭 후 5초간 계속 무음일 때만 배치 러너가
+`정지 → 700ms 대기 → 재생 1회`를 수행한다. 이는 낭독 시작 전의 반쪽짜리 상태를 초기화하는
+단 한 번의 복구다. 실제 소리가 감지된 뒤나 단락 사이 무음에는 적용하지 않는다.
 
-클릭 전달 여부는 `step:playing` 에 `클릭 1회(전달 1)` 형태로 남는다. **소리가 안 나면 먼저
-진단 로그의 `play=` 가 진짜 재생 버튼을 가리키는지 확인할 것** — 구조 선택자가 밀려 엉뚱한
-버튼을 잡고 있으면 한 번의 클릭도 해롭다.
+Typecast 의 플레이어 버튼은 실제로 `aria-label="Play"`에서 `aria-label="Stop"`으로 전환되므로
+`typecast_stop_playback` 이 `Stop` 상태를 되돌린 뒤 두 번째 단일 클릭을 보낸다. 클릭 전달 여부는
+`step:playing` 에 `클릭 1회(전달 1)` 형태로 남는다. 소리가 안 나면 진단 로그의 `play=`가 진짜
+재생 버튼을 가리키는지도 확인할 것.
 
 붙여넣기 직후에는 재생 버튼이 잠시 비활성일 수 있어 `doPlay()` 가 최대 5초간 활성화를 기다린다.
 클릭이 버튼까지 전달됐는지는 임시 capture 리스너로 확인하므로, 실패 시 "버튼을 못 찾음 / 클릭이

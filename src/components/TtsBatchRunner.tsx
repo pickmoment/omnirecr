@@ -78,6 +78,10 @@ const STEP_LOG_LIMIT = 300;
 const VU_STALL_MS = 3000;
 /** 녹음 직후에는 첫 VU 이벤트가 늦을 수 있어 위 판정에 유예를 준다. */
 const VU_GRACE_MS = 5000;
+/** 첫 재생 클릭 후 이 시간 동안 소리가 없으면 정지 후 한 번만 다시 재생한다. */
+const PLAYBACK_RECOVERY_MS = 5000;
+/** Typecast 재생 상태를 정지로 되돌린 뒤 다시 누르기 전 안정화 시간. */
+const PLAYBACK_RESTART_GAP_MS = 700;
 /** Typecast 창이 실제로 열릴 때까지 1초 간격으로 확인할 횟수. */
 const BROWSER_READY_POLLS = 12;
 
@@ -318,13 +322,10 @@ export const TtsBatchRunner: React.FC<TtsBatchRunnerProps> = ({
    * 시스템 오디오 레벨을 보고 낭독 시작 / 종료를 판정한다.
    * Typecast 가 어떤 방식으로 재생하든(미디어 엘리먼트 · Web Audio) 동작한다.
    *
-   * Typecast 사이트를 최대한 건드리지 않는다. 단락(화자) 전환으로 다음 오디오를 새로
-   * 생성하는 동안의 정상적인 무음(`step:media-ended`)과, 사이트가 낭독 도중 스스로
-   * 재생을 멈추는 오동작(`ended` 없는 `step:media-pause`) 둘 다 재생 버튼을 다시 누르는
-   * 등 추가로 개입하지 않고 `segmentGapMs` 만큼 무음 판정만 미뤄 다음 재생을 기다린다.
-   * (재생 버튼을 다시 누르는 방식은 이미 재생 중인데 또 클릭해 토글을 꺼버리는 등
-   * 오히려 사이트 동작을 방해할 수 있어 쓰지 않는다.) 그 유예 안에 재생이 돌아오지
-   * 않으면 낭독이 실제로 끝난 것으로 보고 정상 종료 처리한다.
+   * 첫 클릭 뒤에도 소리가 없으면 화면만 재생 상태인 Typecast 를 정지한 뒤 한 번만
+   * 다시 재생한다. 실제 낭독이 시작된 뒤에는 재생 버튼에 개입하지 않는다. 단락 전환의
+   * 정상적인 무음(`step:media-ended`)과 사이트의 중간 정지(`step:media-pause`)는
+   * `segmentGapMs` 동안 재생이 스스로 이어지길 기다린다.
    */
   const waitForSpeechCycle = (
     thresholdDb: number,
@@ -333,6 +334,7 @@ export const TtsBatchRunner: React.FC<TtsBatchRunnerProps> = ({
     hardCapMs: number,
     segmentGapMs: number,
     since: number,
+    recoverPlayback: () => Promise<StepResult>,
   ): Promise<StepResult> =>
     new Promise((resolve) => {
       let settled = false;
@@ -345,6 +347,10 @@ export const TtsBatchRunner: React.FC<TtsBatchRunnerProps> = ({
       // "낭독 시작"으로 오판하고 무음만 담긴 파일을 완료로 처리한다.
       takeVuPeak();
       const beganAt = Date.now();
+      let startDeadlineAt = beganAt + startTimeoutMs;
+      const recoveryAfterMs = Math.min(PLAYBACK_RECOVERY_MS, startTimeoutMs / 2);
+      let recoveryStarted = false;
+      let recoveryInFlight = false;
 
       const applyStep: StepWaiter = (record) => {
         if (record.name === 'media-ended' || record.name === 'media-pause') {
@@ -386,6 +392,9 @@ export const TtsBatchRunner: React.FC<TtsBatchRunnerProps> = ({
           return;
         }
 
+        // 복구 중 첫 시도의 늦은 소리가 들어와도 새 재생의 시작으로 세지 않는다.
+        if (recoveryInFlight) return;
+
         if (vu.peakDb > thresholdDb) {
           if (!started) {
             started = true;
@@ -396,10 +405,33 @@ export const TtsBatchRunner: React.FC<TtsBatchRunnerProps> = ({
         }
 
         if (!started) {
-          if (now - beganAt > startTimeoutMs) {
+          if (!recoveryStarted && now - beganAt >= recoveryAfterMs) {
+            recoveryStarted = true;
+            recoveryInFlight = true;
+            setPhaseMessage('재생 응답이 없어 정지 후 다시 재생하는 중...');
+            void recoverPlayback().then((recovery) => {
+              recoveryInFlight = false;
+              if (settled) return;
+              if (!recovery.ok) {
+                finish({
+                  ...recovery,
+                  detail: recovery.aborted
+                    ? recovery.detail
+                    : `재생 자동 복구 실패: ${recovery.detail}`,
+                });
+                return;
+              }
+              takeVuPeak();
+              startDeadlineAt = Date.now() + startTimeoutMs;
+              setPhaseMessage('재생 재시도 후 소리를 기다리는 중...');
+            });
+            return;
+          }
+          if (recoveryInFlight) return;
+          if (now > startDeadlineAt) {
             finish({
               ok: false,
-              detail: '재생 소리가 감지되지 않았습니다 (시스템 오디오 캡처 · 임계값 확인)',
+              detail: '재생을 자동으로 다시 시도했지만 소리가 감지되지 않았습니다 (시스템 오디오 캡처 · 임계값 확인)',
             });
           }
           return;
@@ -622,6 +654,18 @@ export const TtsBatchRunner: React.FC<TtsBatchRunnerProps> = ({
       return { ...(await waitForStep(['playing'], ['play-failed'], 12000, mark)), mark };
     };
 
+    /** 소리가 시작되지 않은 첫 재생을 정지 상태로 되돌린 뒤 한 번만 다시 누른다. */
+    const restartPlayback = async (): Promise<StepResult> => {
+      try {
+        await invoke('typecast_stop_playback');
+      } catch (err) {
+        return { ok: false, detail: `재생 정지 실패: ${err}` };
+      }
+      await sleep(PLAYBACK_RESTART_GAP_MS);
+      if (abortRef.current) return { ok: false, detail: '중단됨', aborted: true };
+      return pressPlay();
+    };
+
     for (const script of targets) {
       if (abortRef.current) {
         setItem(script.id, { status: 'skipped', message: '중단됨' });
@@ -711,6 +755,7 @@ export const TtsBatchRunner: React.FC<TtsBatchRunnerProps> = ({
           hardCapMs,
           segmentGapMs,
           played.mark,
+          restartPlayback,
         );
       }
 
