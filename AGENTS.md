@@ -400,7 +400,7 @@ chromiumoxide 의 CDP 요청/응답이 (드물지만) 영원히 안 돌아오는
 URL 휴리스틱 대신 사람 확인을 기다린다 — `hub send` 로 표준입력에 아무 텍스트나 보내면 됨).
 같은 프로필을 재사용하므로 한 번 로그인해 두면 다음 실행부터는 바로 Enter 를 보내도 된다.
 `cargo test --manifest-path src-tauri/Cargo.toml --lib tts::tests::real_login_and_prepare_flow -- --ignored --nocapture`
-로 수동 실행. Chrome 자동화 관련 코드(특히 `MAIN_INIT_SCRIPT`, `doPrepare`, `doPlay`)를 고칠 때마다
+로 수동 실행. Chrome 자동화 관련 코드(특히 `MAIN_INIT_SCRIPT`, `type_script`, `doPlay`)를 고칠 때마다
 이 테스트로 먼저 확인할 것 — 이 문서의 Slate 관련 함정들은 전부 이 테스트로 실측한 것이다.
 
 #### 자동 일괄 녹음 파이프라인 (`TtsBatchRunner`)
@@ -434,7 +434,7 @@ save     stop_record → attach_script_recording → 다음 대본 (gap 초 대�
 **단계 보고 구독은 상시로 두고 일련번호로 "이 시점 이후"를 판정할 것.** `invoke()` 를 보낸
 **뒤에** `listen('typecast_step')` 을 거는 방식으로 되돌리지 말 것 — `listen()` 등록 자체가
 비동기 왕복이라 그사이 도착한 보고를 놓친다. 특히 페이지 스크립트가 **동기적으로** 내는
-실패 보고(`fillEditor` 예외 → `step:prepare-failed:입력 중 오류 …`)는 항상 유실돼, 진짜 원인
+실패 보고(`step:prepare-failed:입력 확인 실패 …`)는 항상 유실돼, 진짜 원인
 대신 10초 뒤 "페이지 응답 시간 초과"만 보였다. `markSteps()` 로 `invoke` **전에** 기준점을
 찍고, `waitForStep(…, since)` 이 이미 도착한 로그부터 훑은 뒤 구독한다.
 **구독 등록 자체도 기다려야 한다** — 상시 구독이라도 `listen()` 의 프라미스가 아직 안 끝났으면
@@ -483,7 +483,9 @@ Typecast 의 3,000자 제한은 **문단(줄) 하나의 최대 길이**이지 �
 멈춘 pause 는 `intentionalStop` 플래그로 걸러 오동작으로 보고하지 않는다. 이 유예 없이 `silenceMs` 자체를 늘리는
 식으로 고치면 진짜 낭독 종료 판정도 그만큼 느려지므로 반드시 구분해서 다룰 것.
 
-**입력 직후 캐럿을 반드시 맨 앞으로 되돌릴 것.** `execCommand('insertText')` 는 캐럿을 본문 끝에 남기는데, Typecast 는 커서 위치부터 낭독하므로 그대로 재생하면 아무 소리도 나지 않거나 마지막 부분만 읽는다. `collapseCaretToStart()` 를 입력 직후와 재생 직전 두 번 호출한다.
+**입력 직후 캐럿을 반드시 맨 앞으로 되돌릴 것.** 입력이 끝나면 캐럿은 본문 끝에 남는데,
+Typecast 는 커서 위치부터 낭독하므로 그대로 재생하면 아무 소리도 나지 않거나 마지막 부분만
+읽는다. `moveToBeginningOfDocument` 편집 명령을 입력 직후와 재생 직전 두 번 보낸다.
 
 #### Typecast 편집기는 Slate.js 다
 
@@ -503,14 +505,54 @@ DOM 구조가 평범한 `contenteditable` 이 아니라 아래처럼 생겼다. 
 </div>
 ```
 
-여기서 나오는 세 가지 함정:
+여기서 나오는 함정:
 
 1. **`textContent` 로 본문을 읽으면 안 된다.** 단락마다 붙은 화자 이름("필재")이 섞여 들어온다. `readEditor()` 는 `[data-slate-string="true"]` 만 모아 읽는다.
-2. **캐럿을 첫 텍스트 노드에 놓으면 안 된다.** 첫 텍스트 노드는 `contenteditable="false"` 인 화자 버튼 안에 있다. `collapseCaretToStart()` 는 첫 `[data-slate-string="true"]` 노드를 찾아 그 앞에 놓고, 없으면 편집 불가 서브트리를 걸러내는 TreeWalker 로 되돌아간다.
+2. **첫 텍스트 노드를 클릭하면 안 된다.** 첫 텍스트 노드는 `contenteditable="false"` 인 화자 버튼 안에 있어 클릭하면 음성 선택 UI 가 열린다. `editorPoint()` 는 `[data-slate-string="true"]` 를 겨냥하고, `elementFromPoint` 로 그 지점이 실제로 편집기에 닿는지 확인한다.
 3. **빈 줄은 빈 단락이 된다.** 소리 없는 단락과 화자 선택 UI만 늘어나므로 `cleanScript()` 로 미리 걷어낸다(프론트엔드 `scriptChunks.ts` 에도 같은 정리 로직이 있다).
 
-4. **`execCommand('selectAll')` 은 문단 하나만 선택할 수 있다.** 그 상태로 붙여넣으면 첫 문단만 새 대본으로 바뀌고 이전 대본의 나머지 문단이 그대로 남는다. `selectAllIn()` 은 첫 `[data-slate-string]` 텍스트 노드부터 마지막 노드까지 범위를 직접 만들고, `doPrepare()` 는 붙여넣기 **전에** `clearEditor()` 로 편집기를 완전히 비운다(최대 4회 반복).
-5. **`execCommand('delete')` 로 지우지 말 것 — Slate 의 "문단 최소 1개" 불변식이 깨진다.** 실측: 전체 선택 후 `execCommand('delete')` 를 반복하면 문단이 화자 선택 버튼까지 통째로 사라져 `[data-slate-node="element"]` 가 0개가 되는 경우가 있었다. 이 상태가 되면 Slate 가 이 DOM 과 완전히 어긋나 이후 어떤 `execCommand`(`insertText` 포함)로도 복구되지 않고 — 붙여넣기가 조용히 사라진다("입력 확인 실패"). `execCommand` 는 Slate 의 `onKeyDown` 컨트롤을 거치지 않고 DOM 을 직접 바꾸기 때문이다. `clearEditor()` 는 대신 진짜 `KeyboardEvent('keydown', { key: 'Backspace', ... })` 를 보낸다 — Slate 가 이 키를 자기 핸들러에서 가로채 자신의 delete 트랜잭션으로 처리하므로 불변식이 유지된다. **`execCommand` 기반 삭제/삽입으로 되돌리지 말 것.**
+#### 편집기 내용은 반드시 CDP 신뢰된 입력으로만 바꾼다
+
+**JS 로 Slate 문서를 고치지 말 것.** 손으로 만든 `Range` + `selection.addRange()`, 합성
+`KeyboardEvent`, 합성 `paste`(ClipboardEvent), `execCommand` 는 전부 금지다. 이 방식은 DOM 은
+바꾸지만 Slate 의 **내부 선택 상태**는 갱신하지 못해, 다음 렌더에서 Slate 가 옛 위치를 DOM 으로
+해석하려다 예외를 던진다. 실측(Sentry 페이로드로 확인):
+
+```text
+React ErrorBoundary Error
+Cannot resolve a DOM point from Slate point: {"path":[0,0,0],"offset":4328}
+```
+
+offset 4328 은 **이전 대본**의 캐럿 위치였다. 더 짧은 대본으로 교체되는 순간 그 위치가 사라져
+Typecast 의 ErrorBoundary 가 화면을 버리고 프로젝트 목록으로 되돌린다("알 수 없는 오류가
+발생했습니다" 배너 + 이전 페이지로 튕김). 대본 길이에 따라 재현되므로 간헐적으로 보인다.
+
+그래서 편집기 조작은 전부 앱이 CDP 입력으로 한다(`TypecastController`):
+
+|단계|수단|
+|---|---|
+|포커스|`Input.dispatchMouseEvent` (클릭 좌표는 `__omnirecEditorPoint()` 가 계산)|
+|전체 선택|`Input.dispatchKeyEvent` + `commands: ["selectAll"]`|
+|삭제|`Input.dispatchKeyEvent` + `commands: ["deleteBackward"]`|
+|입력|`Input.insertText` (줄마다 한 번)|
+|단락 나누기|`Input.dispatchKeyEvent` Enter (줄 사이)|
+|캐럿 맨 앞|`Input.dispatchKeyEvent` + `commands: ["moveToBeginningOfDocument"]`|
+
+**편집 명령(`commands`)을 반드시 실어 보낼 것.** macOS 에서는 ⌘A · Backspace 키 조합을 CDP 로
+보내도 렌더러가 편집 동작을 실행하지 않는다(네이티브 키 바인딩이 담당하는 영역이다). 실측:
+명령 없이 보내면 전체 선택은 되지만 삭제가 안 돼 새 대본이 이전 대본 뒤에 덧붙는다.
+
+**클릭 좌표는 세 조건을 모두 만족해야 한다** — 편집기 안 · 화면 안 · 가려지지 않음.
+첫 단락은 스크롤 컨테이너가 이미 맨 위라 `scrollIntoView` 로 더 내릴 수 없고 그 자리는 프로젝트
+헤더 밑이라 클릭이 헤더로 들어가며(실측), 뷰포트보다 긴 단락은 스크롤해도 위쪽이 화면 밖에 남는다.
+`editorPoint()` 는 편집기의 보이는 구간을 위에서 아래로 훑어 `elementFromPoint` 가 편집기를
+가리키는 첫 지점을 고른다. 어느 단락을 클릭해도 무해하다 — 캐럿은 곧바로 맨 앞으로 옮긴다.
+
+주입 스크립트(`MAIN_INIT_SCRIPT`)가 편집기에 대해 하는 일은 **읽기와 좌표 계산뿐**이다
+(`findEditor` · `readEditor` · `cleanScript` · `editorPoint` · `verifyScript`). 회귀 테스트:
+`tts::tests::trusted_input_survives_shrinking_replacement`(`#[ignore]`) — 실행 중인 Typecast
+Chrome 에 재접속해 **긴 대본 → 짧은 대본** 순서로 채우고, 두 번 다 `step:prepared` 가 나오며
+페이지가 같은 프로젝트에 남아 있는지(= 사이트가 튕기지 않았는지) 확인한다.
 
 **Typecast 프로젝트 이동은 사람이 한다.** 기본 URL(`studio.typecast.ai/text-to-speech`)은 "새 프로젝트 /
 대본 가져오기 / 새 폴더"가 있는 프로젝트 목록이고, 페이지 이동 과정에서 Typecast 자체 오류가 날 수
@@ -518,8 +560,8 @@ DOM 구조가 평범한 `contenteditable` 이 아니라 아래처럼 생겼다. 
 
 사용자가 `Typecast 열기` 후 Chrome에서 녹음에 사용할 프로젝트를 직접 열고, 대본 편집기와 재생
 버튼이 보이는 상태로 둔 뒤 배치를 시작한다. 시작 전 `typecast_editor_ready`가 두 요소를 모두
-확인하며, 준비되지 않았으면 대본 입력·출력 덮어쓰기 확인·녹음을 시작하지 않는다. `doPrepare()`와
-`doPlay()`도 편집기/버튼이 없으면 자동 이동 대신 직접 프로젝트를 열라는 실패를 즉시 보고한다.
+확인하며, 준비되지 않았으면 대본 입력·출력 덮어쓰기 확인·녹음을 시작하지 않는다. `prepare_script`
+와 `doPlay()` 도 편집기/버튼이 없으면 자동 이동 대신 직접 프로젝트를 열라는 실패를 즉시 보고한다.
 
 입력 검증은 **정규화 후 완전 일치**다. "앞 40자가 어딘가 있다 + 기대보다 20자 넘게 길지 않다"는
 예전 휴리스틱에는 **하한이 없어**, 3,000자 대본에서 앞 50자만 들어가도 `step:prepared` 를 내고
@@ -528,7 +570,10 @@ DOM 구조가 평범한 `contenteditable` 이 아니라 아래처럼 생겼다. 
 `normalize()` 가 흡수하는 것은 공백·개행(Slate 단락 렌더링), 제로폭 스캐폴딩 문자, 한글 NFC
 통일 셋뿐이다 — 관대한 오차 허용으로 되돌리지 말 것.
 
-편집기 입력은 **`paste`(ClipboardEvent) 를 먼저** 시도한다. Slate 는 자체 paste 핸들러에서 줄바꿈을 단락으로 나눠 주지만 `insertText` 는 한 단락에 몰아넣을 수 있어서다. 편집기가 처리했는지는 `event.defaultPrevented` 로 판단하고, 실패하면 다시 전체 선택 후 `insertText` → `textContent` 순으로 물러난다. 어떤 방법이 통했는지는 `step:prepared` 에 단락 수와 함께 실어 보낸다.
+대본 입력은 `Input.insertText` 로 줄 단위로 넣고 줄 사이에 Enter 키를 보낸다 —
+`Input.insertText` 는 개행을 단락으로 나누지 않기 때문이다(사람이 타이핑하는 것과 같은 경로라
+Typecast 가 새 단락의 화자를 스스로 배정한다). 몇 단락으로 들어갔는지는 `step:prepared` 에
+`신뢰된 입력 · N단락` 형태로 실려 온다.
 
 #### 합성 클릭의 두 가지 함정
 

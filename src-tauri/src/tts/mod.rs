@@ -28,6 +28,10 @@ use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::Mutex as AsyncMutex;
 
 use chromiumoxide::browser::{Browser, BrowserConfig};
+use chromiumoxide::cdp::browser_protocol::input::{
+    DispatchKeyEventParams, DispatchKeyEventType, DispatchMouseEventParams, DispatchMouseEventType,
+    InsertTextParams, MouseButton,
+};
 use chromiumoxide::cdp::browser_protocol::page::EventFrameNavigated;
 use chromiumoxide::cdp::browser_protocol::storage::ClearDataForOriginParams;
 use chromiumoxide::cdp::browser_protocol::target::EventTargetCreated;
@@ -81,6 +85,99 @@ static NAV_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 const SIGN_IN_PATH_HINTS: [&str; 6] = [
     "/sign-in", "/signin", "/login", "/sign-up", "/signup", "/auth",
 ];
+
+/// 주입 스크립트가 알려주는 편집기 클릭 지점(뷰포트 좌표).
+#[derive(serde::Deserialize)]
+struct EditorPoint {
+    x: f64,
+    y: f64,
+    /// 그 좌표가 배너·팝업 등 편집기 밖 요소에 가려져 있으면 true.
+    covered: bool,
+    /// 겨냥한 노드 설명(진단용).
+    at: String,
+    /// 가린 요소 설명(진단용).
+    cover: String,
+}
+
+/// CDP 로 보낼 키 입력 하나.
+///
+/// `commands` 는 Blink 의 편집 명령 이름이다. macOS 에서는 ⌘A 같은 조합을 CDP 로 보내도
+/// 렌더러가 편집 명령으로 해석하지 않으므로(네이티브 키 바인딩이 담당한다), 명령을 직접
+/// 실어 보내야 전체 선택·캐럿 이동이 실제로 실행된다(실측).
+struct KeyStroke {
+    key: &'static str,
+    code: &'static str,
+    virtual_key: i64,
+    modifiers: i64,
+    text: Option<&'static str>,
+    commands: &'static [&'static str],
+}
+
+impl KeyStroke {
+    /// 편집기 내용 전체 선택. 조합 키는 OS 관례를 따르고, 실행은 `selectAll` 명령이 한다.
+    fn select_all() -> Self {
+        Self {
+            key: "a",
+            code: "KeyA",
+            virtual_key: 65,
+            modifiers: if cfg!(target_os = "macos") { 4 } else { 2 },
+            text: None,
+            commands: &["selectAll"],
+        }
+    }
+
+    /// 선택 영역 삭제.
+    ///
+    /// `deleteBackward` 명령을 반드시 실어 보낸다. macOS 에서 CDP 로 보낸 Backspace 키
+    /// 이벤트만으로는 렌더러가 삭제를 실행하지 않는 경우가 있다(실측: 전체 선택은 됐는데
+    /// 내용이 그대로 남아 새 대본이 이전 대본 뒤에 덧붙었다). Slate 는 이 삭제도 자기
+    /// 파이프라인에서 처리하므로 "문단 최소 1개" 불변식이 유지된다.
+    fn backspace() -> Self {
+        Self {
+            key: "Backspace",
+            code: "Backspace",
+            virtual_key: 8,
+            modifiers: 0,
+            text: None,
+            commands: &["deleteBackward"],
+        }
+    }
+
+    /// 새 단락. `Input.insertText` 는 개행을 단락으로 나누지 않으므로 줄 사이에 이 키를 보낸다.
+    fn enter() -> Self {
+        Self {
+            key: "Enter",
+            code: "Enter",
+            virtual_key: 13,
+            modifiers: 0,
+            text: Some("\r"),
+            commands: &[],
+        }
+    }
+
+    /// 캐럿을 본문 맨 앞으로. Typecast 는 커서 위치부터 낭독한다.
+    fn to_document_start() -> Self {
+        if cfg!(target_os = "macos") {
+            Self {
+                key: "ArrowUp",
+                code: "ArrowUp",
+                virtual_key: 38,
+                modifiers: 4,
+                text: None,
+                commands: &["moveToBeginningOfDocument"],
+            }
+        } else {
+            Self {
+                key: "Home",
+                code: "Home",
+                virtual_key: 36,
+                modifiers: 2,
+                text: None,
+                commands: &["moveToBeginningOfDocument"],
+            }
+        }
+    }
+}
 
 /// 실행 중인 Chrome 세션 하나. 앱 전체에 Typecast 창은 하나만 존재하는 모델이라
 /// 세션도 하나만 유지한다.
@@ -197,6 +294,64 @@ impl TypecastController {
                 at: chrono::Local::now().format("%H:%M:%S").to_string(),
             },
         );
+    }
+
+    /// 자동화 단계를 프론트엔드로 보고한다. 페이지가 아니라 **앱이** 판정한 단계를 낼 때 쓴다
+    /// (예: 편집기 좌표를 못 얻어 입력 자체를 시작하지 못한 경우). 프론트엔드는 성공/실패를
+    /// `typecast_step` 으로만 판정하므로, 이 경로가 없으면 일괄 러너가 타임아웃까지 기다린다.
+    fn step(app: &AppHandle, name: &str, detail: &str) {
+        let name: String = name.chars().take(MAX_STEP_NAME_CHARS).collect();
+        let detail: String = detail.chars().take(MAX_STEP_DETAIL_CHARS).collect();
+        let _ = app.emit("typecast_step", TypecastStepPayload { name, detail });
+    }
+
+    /// 뷰포트 좌표에 실제 마우스 클릭을 보낸다(누름 → 뗌).
+    async fn click_at(page: &Page, x: f64, y: f64) -> Result<(), String> {
+        let mut press = DispatchMouseEventParams::new(DispatchMouseEventType::MousePressed, x, y);
+        press.button = Some(MouseButton::Left);
+        press.buttons = Some(1);
+        press.click_count = Some(1);
+        page.execute(press)
+            .await
+            .map_err(|e| format!("편집기 클릭 실패: {}", e))?;
+
+        let mut release =
+            DispatchMouseEventParams::new(DispatchMouseEventType::MouseReleased, x, y);
+        release.button = Some(MouseButton::Left);
+        release.buttons = Some(0);
+        release.click_count = Some(1);
+        page.execute(release)
+            .await
+            .map_err(|e| format!("편집기 클릭 해제 실패: {}", e))?;
+        Ok(())
+    }
+
+    /// 키 입력 하나를 보낸다. 편집 명령은 `keyDown` 에만 실린다.
+    async fn press_key(page: &Page, stroke: &KeyStroke) -> Result<(), String> {
+        let mut down = DispatchKeyEventParams::new(DispatchKeyEventType::KeyDown);
+        down.key = Some(stroke.key.to_string());
+        down.code = Some(stroke.code.to_string());
+        down.windows_virtual_key_code = Some(stroke.virtual_key);
+        down.native_virtual_key_code = Some(stroke.virtual_key);
+        down.modifiers = Some(stroke.modifiers);
+        down.text = stroke.text.map(|t| t.to_string());
+        if !stroke.commands.is_empty() {
+            down.commands = Some(stroke.commands.iter().map(|c| c.to_string()).collect());
+        }
+        page.execute(down)
+            .await
+            .map_err(|e| format!("{} 키 입력 실패: {}", stroke.key, e))?;
+
+        let mut up = DispatchKeyEventParams::new(DispatchKeyEventType::KeyUp);
+        up.key = Some(stroke.key.to_string());
+        up.code = Some(stroke.code.to_string());
+        up.windows_virtual_key_code = Some(stroke.virtual_key);
+        up.native_virtual_key_code = Some(stroke.virtual_key);
+        up.modifiers = Some(stroke.modifiers);
+        page.execute(up)
+            .await
+            .map_err(|e| format!("{} 키 해제 실패: {}", stroke.key, e))?;
+        Ok(())
     }
 
     /// 페이지가 CDP 바인딩으로 보낸 메시지를 처리한다. 형식은 `<kind>:<payload>`.
@@ -982,7 +1137,50 @@ impl TypecastController {
             .map_err(|e| format!("프로젝트 편집기 확인 결과 해석 실패: {}", e))
     }
 
+    /// 편집기 안의 클릭 가능한 지점에 **CDP 마우스 클릭**을 보내 포커스를 준다.
+    ///
+    /// 좌표는 주입 스크립트가 계산한다(스티키 헤더에 가려지지 않고 편집기에 실제로 닿는
+    /// 지점). JS 로 DOM Range 를 만들어 선택을 강제하던 방식으로 되돌리지 말 것 — Slate
+    /// 내부 상태가 DOM 과 어긋나 사이트가 통째로 튕긴다.
+    async fn click_into_editor(page: &Page) -> Result<String, String> {
+        let point = page
+            .evaluate("window.__omnirecEditorPoint && window.__omnirecEditorPoint()")
+            .await
+            .map_err(|e| format!("편집기 좌표 확인 실패: {}", e))?
+            .into_value::<Option<EditorPoint>>()
+            .map_err(|e| format!("편집기 좌표 해석 실패: {}", e))?
+            .ok_or_else(|| {
+                "작업할 Typecast 프로젝트를 직접 열어 둔 뒤 다시 시작하세요".to_string()
+            })?;
+
+        if point.covered {
+            return Err(format!(
+                "편집기 클릭 지점이 다른 요소에 가려져 있습니다({}). 배너·팝업을 닫고 다시 시작하세요",
+                point.cover
+            ));
+        }
+
+        Self::click_at(page, point.x, point.y).await?;
+        Ok(point.at)
+    }
+
+    /// 편집기에 포커스를 주고 캐럿을 본문 맨 앞으로 보낸다.
+    ///
+    /// Typecast 는 커서 위치부터 낭독하므로, 재생 직전에 이 처리가 없으면 뒷부분만 읽거나
+    /// 아무 소리도 나지 않는다.
+    async fn focus_editor_start(page: &Page) -> Result<String, String> {
+        let at = Self::click_into_editor(page).await?;
+        Self::press_key(page, &KeyStroke::to_document_start()).await?;
+        Ok(at)
+    }
+
     /// 대본을 편집기에 채우고, 결과를 `typecast_step` 이벤트로 보고한다.
+    ///
+    /// 편집기 조작은 전부 **CDP 입력 이벤트**로 한다(클릭 · `selectAll` · Backspace ·
+    /// `Input.insertText` · Enter). 합성 JS 이벤트와 손으로 만든 DOM Range 로 Slate 문서를
+    /// 바꾸면 Slate 의 내부 선택이 DOM 과 어긋나 `Cannot resolve a DOM point from Slate
+    /// point` 예외가 나고, Typecast 의 ErrorBoundary 가 프로젝트 목록으로 튕겨낸다
+    /// (실측: Sentry 이벤트로 확인 — 긴 대본 다음에 짧은 대본을 넣을 때 재현된다).
     ///
     /// 자동 입력이 실패하더라도 사용자가 직접 붙여넣을 수 있도록 클립보드에도 넣어 둔다.
     /// 수동 녹음 화면의 "대본 보내기"도 같은 경로를 쓴다.
@@ -1004,28 +1202,91 @@ impl TypecastController {
         }
         Self::apply_automation_options(app).await?;
         let page = Self::get_main_page(app).await?;
-        let payload = serde_json::to_string(&text).map_err(|e| e.to_string())?;
-        page.evaluate(format!(
-            "window.__omnirecPrepare && window.__omnirecPrepare({});",
-            payload
-        ))
-        .await
-        .map_err(|e| format!("대본 주입 실패: {}", e))?;
-        // 탭 활성화 실패는 대본 주입 결과를 바꾸지 않는다(주입은 위에서 이미 성공했다).
+
+        // 탭 활성화 실패는 입력을 막지 않는다(CDP 입력은 활성 탭이 아니어도 전달된다).
         // 다만 진단에는 남긴다 — 창이 앞으로 오지 않는 증상의 단서다.
         if let Err(e) = page.bring_to_front().await {
             Self::debug(app, "focus-failed", &e.to_string());
         }
-        Ok(())
+
+        match Self::type_script(&page, &text).await {
+            Ok(detail) => {
+                let payload = serde_json::to_string(&text).map_err(|e| e.to_string())?;
+                let detail = serde_json::to_string(&detail).map_err(|e| e.to_string())?;
+                page.evaluate(format!(
+                    "window.__omnirecVerifyScript && window.__omnirecVerifyScript({}, {});",
+                    payload, detail
+                ))
+                .await
+                .map(|_| ())
+                .map_err(|e| format!("입력 확인 실패: {}", e))
+            }
+            // 입력 자체가 안 된 경우도 프론트엔드는 `step:prepare-failed` 로 판정한다.
+            // 커맨드 에러로만 돌려주면 일괄 러너가 10초 타임아웃까지 기다린다.
+            Err(reason) => {
+                Self::step(app, "prepare-failed", &reason);
+                Ok(())
+            }
+        }
+    }
+
+    /// 편집기 내용을 CDP 입력으로 교체하고, 진단 문자열을 돌려준다.
+    ///
+    /// 줄 하나가 곧 Slate 단락 하나다. `Input.insertText` 는 개행을 단락으로 나누지 않으므로
+    /// 줄 사이에 실제 Enter 키 이벤트를 보낸다(사람이 타이핑하는 것과 같은 경로 —
+    /// Typecast 가 새 단락의 화자를 스스로 배정한다).
+    async fn type_script(page: &Page, raw_text: &str) -> Result<String, String> {
+        let payload = serde_json::to_string(raw_text).map_err(|e| e.to_string())?;
+        let cleaned = page
+            .evaluate(format!(
+                "window.__omnirecCleanScript ? window.__omnirecCleanScript({}) : ''",
+                payload
+            ))
+            .await
+            .map_err(|e| format!("대본 정리 실패: {}", e))?
+            .into_value::<String>()
+            .map_err(|e| format!("대본 정리 결과 해석 실패: {}", e))?;
+
+        let at = Self::click_into_editor(page).await?;
+
+        // 이전 대본을 남기지 않는다. 전체 선택과 삭제는 편집 명령으로 보낸다 — macOS 에서는
+        // ⌘A · Backspace 키 조합만으로는 렌더러가 편집 명령을 실행하지 않는다(실측).
+        Self::press_key(page, &KeyStroke::select_all()).await?;
+        Self::press_key(page, &KeyStroke::backspace()).await?;
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        let lines: Vec<&str> = cleaned.split('\n').collect();
+        for (index, line) in lines.iter().enumerate() {
+            if index > 0 {
+                Self::press_key(page, &KeyStroke::enter()).await?;
+            }
+            if line.is_empty() {
+                continue;
+            }
+            page.execute(InsertTextParams::new(line.to_string()))
+                .await
+                .map_err(|e| format!("대본 입력 실패: {}", e))?;
+        }
+
+        // 낭독은 커서 위치부터 시작한다. 입력 직후 캐럿은 본문 끝에 있으므로 맨 앞으로 되돌린다.
+        Self::press_key(page, &KeyStroke::to_document_start()).await?;
+        // Slate 가 입력을 반영·정규화할 시간을 준 뒤에 검증한다.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+        Ok(format!("신뢰된 입력 · {}단락 · 클릭 {}", lines.len(), at))
     }
 
     /// 편집기의 재생 버튼을 누른다.
     ///
-    /// 누르기 전에 자동화 선택자를 다시 심는다. 대본 주입 이후 페이지가 다시
-    /// 로드됐을 수 있기 때문이다.
+    /// 누르기 전에 자동화 선택자를 다시 심고, 캐럿을 본문 맨 앞으로 되돌린다(대본 입력
+    /// 이후 사용자가 편집기를 클릭했을 수 있다). 캐럿 이동도 CDP 입력으로만 한다.
     pub async fn play(app: &AppHandle) -> Result<(), String> {
         Self::apply_automation_options(app).await?;
         let page = Self::get_main_page(app).await?;
+        if let Err(reason) = Self::focus_editor_start(&page).await {
+            Self::step(app, "play-failed", &reason);
+            return Ok(());
+        }
         page.evaluate("window.__omnirecPlay && window.__omnirecPlay();")
             .await
             .map(|_| ())
@@ -1343,17 +1604,6 @@ const MAIN_INIT_SCRIPT: &str = r#"
     });
   }
 
-  function setNativeValue(el, value) {
-    var proto = el instanceof HTMLTextAreaElement
-      ? HTMLTextAreaElement.prototype
-      : HTMLInputElement.prototype;
-    var setter = Object.getOwnPropertyDescriptor(proto, 'value');
-    if (setter && setter.set) setter.set.call(el, value);
-    else el.value = value;
-    el.dispatchEvent(new Event('input', { bubbles: true }));
-    el.dispatchEvent(new Event('change', { bubbles: true }));
-  }
-
   function readEditor(el) {
     if (!el) return '';
     if (el.value !== undefined && el.value !== null) return String(el.value);
@@ -1380,160 +1630,63 @@ const MAIN_INIT_SCRIPT: &str = r#"
       .join('\n');
   }
 
-  // Slate · ProseMirror 같은 편집기는 자체 paste 핸들러에서 줄바꿈을 단락으로 나눈다.
-  // 사람이 ⌘V 로 붙여넣은 것과 같은 결과를 얻으려면 이 경로를 써야 한다.
-  // 편집기가 처리했는지는 preventDefault 여부로 판단한다.
-  function pasteInto(el, text) {
-    try {
-      var transfer = new DataTransfer();
-      transfer.setData('text/plain', text);
-      var event = new ClipboardEvent('paste', {
-        bubbles: true,
-        cancelable: true,
-        clipboardData: transfer
-      });
-      el.dispatchEvent(event);
-      return event.defaultPrevented;
-    } catch (e) {
-      return false;
-    }
-  }
-
-  function firstTextNode(root) {
-    if (!root) return null;
-    if (root.nodeType === 3) return root;
-    var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
-    return walker.nextNode();
-  }
-
-  function lastTextNode(root) {
-    if (!root) return null;
-    if (root.nodeType === 3) return root;
-    var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
-    var node = null;
-    var next;
-    while ((next = walker.nextNode())) node = next;
-    return node;
-  }
-
-  // 편집기 내용을 전부 선택한다.
-  //
-  // Slate 에서는 execCommand('selectAll') 이 커서가 놓인 **문단 하나만** 선택하는 경우가 있다.
-  // 그 상태로 붙여넣으면 첫 문단만 새 대본으로 바뀌고 이전 대본의 나머지 문단이 그대로 남는다.
-  // 그래서 첫 텍스트 노드부터 마지막 텍스트 노드까지 범위를 직접 만들어 준다.
-  function selectAllIn(el) {
-    el.focus();
-    var selection = window.getSelection();
-    var range = document.createRange();
-
-    var leaves = el.querySelectorAll('[data-slate-string="true"], [data-slate-zero-width]');
-    var start = leaves.length ? firstTextNode(leaves[0]) : null;
-    var end = leaves.length ? lastTextNode(leaves[leaves.length - 1]) : null;
-
-    try {
-      if (start && end) {
-        range.setStart(start, 0);
-        range.setEnd(end, end.nodeType === 3 ? end.length : end.childNodes.length);
-      } else {
-        // 텍스트 노드가 하나도 없는 완전히 빈 문단이면 el 전체 대신 편집 가능한
-        // <p> 안쪽만 선택한다. el 전체를 선택하면 화자 선택 버튼(contenteditable="false")
-        // 까지 선택 범위에 들어가, 그 상태로 붙여넣으면 Slate 가 문단 자체를(화자 버튼까지)
-        // 지워버려 문단이 0개가 되고 이후 붙여넣기가 들어갈 자리가 없어지는 문제가 있었다.
-        var editableParagraphs = el.querySelectorAll('p');
-        var target = editableParagraphs.length
-          ? editableParagraphs[editableParagraphs.length - 1]
-          : el;
-        range.selectNodeContents(target);
-      }
-      selection.removeAllRanges();
-      selection.addRange(range);
-      document.dispatchEvent(new Event('selectionchange'));
-      return;
-    } catch (e) {}
-
-    try {
-      document.execCommand('selectAll');
-    } catch (e) {}
-  }
-
-  function editorIsEmpty(el) {
-    return normalize(readEditor(el)).length === 0;
-  }
-
   /**
-   * 편집기를 완전히 비운다.
+   * 편집기 안에서 캐럿을 놓을 뷰포트 좌표를 돌려준다(앱이 CDP 마우스 클릭에 쓴다).
    *
-   * execCommand('delete') 는 Slate 의 컨트롤을 거치지 않고 DOM 을 직접 바꾼다. 그 결과
-   * Slate 가 항상 유지해야 할 불변식("문단이 최소 1개는 있어야 한다")이 깨져 문단이
-   * 통째로(화자 선택 버튼까지) 사라지는 경우가 실측으로 확인됐다 — 이 상태가 되면
-   * Slate 가 이 편집기 DOM 과 완전히 어긋나 이후 어떤 execCommand 로도 복구되지 않는다.
-   * 대신 진짜 Backspace keydown 이벤트를 보낸다 — Slate 는 이 키를 자기 onKeyDown 에서
-   * 가로채 자신의 delete 트랜잭션으로 처리하므로 불변식이 깨지지 않는다.
+   * 편집기 내용은 **절대 JS 로 고치지 않는다.** 손으로 만든 DOM Range · 합성 keydown ·
+   * 합성 paste 로 Slate 문서를 바꾸면 Slate 의 내부 선택이 DOM 과 어긋나고, 다음 렌더에서
+   * `Cannot resolve a DOM point from Slate point` 예외가 나 Typecast 의 ErrorBoundary 가
+   * 프로젝트 목록으로 튕겨낸다(실측: Sentry 이벤트로 확인. 이전 대본이 더 길었을 때
+   * 남은 캐럿 offset 이 새 대본 길이를 넘겨 재현된다). 그래서 이 스크립트는 좌표만
+   * 알려주고, 선택 · 삭제 · 입력은 전부 앱이 CDP 입력 이벤트로 처리한다.
+   *
+   * 화자 선택 버튼(`contenteditable="false"`)을 클릭하면 음성 선택 UI 가 열리므로
+   * 실제 대본 문자열 노드를 우선 겨냥하고, 그 지점이 다른 요소에 가려져 있으면 알려준다.
    */
-  function clearEditor(el, attempt, done) {
-    attempt = attempt || 0;
-    if (editorIsEmpty(el)) {
-      done(true);
-      return;
-    }
-    if (attempt >= 4) {
-      done(false);
-      return;
-    }
-    selectAllIn(el);
-    try {
-      el.dispatchEvent(new KeyboardEvent('keydown', {
-        key: 'Backspace',
-        code: 'Backspace',
-        keyCode: 8,
-        which: 8,
-        bubbles: true,
-        cancelable: true
-      }));
-    } catch (e) {}
-    setTimeout(function () { clearEditor(el, attempt + 1, done); }, 150);
-  }
+  function editorPoint() {
+    var editor = findEditor();
+    if (!editor) return null;
 
-  /**
-   * execCommand('delete') 는 Slate 의 컨트롤을 거치지 않고 DOM 을 직접 바꾼다.
-   * 그 결과 Slate 가 항상 유지해야 할 불변식("문단이 최소 1개는 있어야 한다")이
-   * 깨져 문단이 통째로(화자 선택 버튼까지) 사라지는 경우가 실측으로 확인됐다 —
-   * 이 상태에서는 붙여넣기가 들어갈 자리가 없어 입력이 조용히 사라진다.
-   * execCommand('insertText') 로 진짜 문자 입력 하나를 흘려보내면 Slate 의
-   * onChange/정규화 파이프라인이 정상적으로 돌아 문단을 스스로 복구한다.
-   */
-  function repairEmptyEditor(el, done) {
-    if (el.querySelectorAll('[data-slate-node="element"]').length > 0) {
-      done();
-      return;
-    }
-    el.focus();
-    try { document.execCommand('insertText', false, ' '); } catch (e) {}
-    setTimeout(done, 150);
-  }
+    var target = editor.querySelector('[data-slate-string="true"]')
+      || editor.querySelector('p')
+      || editor;
+    try { target.scrollIntoView({ block: 'center' }); } catch (e) {}
 
-  /** 대본을 편집기에 넣고, 어떤 방식이 통했는지 돌려준다. */
-  function fillEditor(el, text) {
-    el.focus();
-    if (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') {
-      setNativeValue(el, text);
-      return 'value';
+    var rect = target.getBoundingClientRect();
+    if (rect.width < 2 || rect.height < 2) return null;
+
+    // 클릭 지점은 (1) 편집기 안이고 (2) 화면 안이며 (3) 스티키 헤더·배너에 가려지지
+    // 않아야 한다. 세 조건이 다 필요하다는 것은 실측으로 확인했다:
+    //  - 첫 단락은 컨테이너가 이미 맨 위라 `scrollIntoView` 로 더 내릴 수 없고, 그 자리는
+    //    프로젝트 헤더 밑이라 클릭이 헤더로 들어간다.
+    //  - 뷰포트보다 긴 단락은 스크롤해도 위쪽이 화면 밖에 남는다(밖을 클릭하면 아무 곳에도
+    //    닿지 않는다).
+    // 그래서 편집기의 보이는 구간을 위에서 아래로 훑어 실제로 편집기에 닿는 첫 지점을 쓴다.
+    // 어느 단락을 클릭해도 무해하다 — 캐럿은 곧바로 `moveToBeginningOfDocument` 로 옮긴다.
+    var editorRect = editor.getBoundingClientRect();
+    var top = Math.max(Math.min(rect.top, editorRect.top), 0);
+    var bottom = Math.min(Math.max(rect.bottom, editorRect.bottom), window.innerHeight);
+    var x = Math.min(Math.max(rect.left + 4, 4), Math.min(rect.right - 4, window.innerWidth - 4));
+    var lastHit = null;
+    var steps = 24;
+
+    for (var i = 1; i < steps; i++) {
+      var y = top + ((bottom - top) * i) / steps;
+      if (y < 1 || y > window.innerHeight - 1) continue;
+      var hit = document.elementFromPoint(x, y);
+      if (hit && (editor === hit || editor.contains(hit))) {
+        return { x: x, y: y, covered: false, at: describe(hit), cover: '' };
+      }
+      if (hit) lastHit = hit;
     }
 
-    selectAllIn(el);
-
-    // 붙여넣기를 먼저 시도한다. Slate 는 paste 에서 줄바꿈을 단락으로 나눠 주지만
-    // insertText 는 편집기에 따라 한 단락에 몰아넣기도 한다.
-    if (pasteInto(el, text)) return 'paste';
-
-    // paste 를 편집기가 처리하지 않았다면 다시 전체 선택 후 insertText 로 교체한다.
-    // (혹시 일부라도 들어갔더라도 덧붙지 않고 대체되도록)
-    selectAllIn(el);
-    if (document.execCommand('insertText', false, text)) return 'insertText';
-
-    el.textContent = text;
-    el.dispatchEvent(new Event('input', { bubbles: true }));
-    return 'textContent';
+    return {
+      x: x,
+      y: Math.min(Math.max(top + 8, 8), Math.max(bottom - 4, 8)),
+      covered: true,
+      at: describe(target),
+      cover: describe(lastHit)
+    };
   }
 
   // 편집기 내용과 대본을 비교하기 위한 정규화.
@@ -1567,131 +1720,50 @@ const MAIN_INIT_SCRIPT: &str = r#"
     return String(value).slice(Math.max(0, at - 8), at + 12);
   }
 
-  // 선택을 해제하고 캐럿을 본문 맨 앞으로 옮긴다.
-  // insertText 직후에는 캐럿이 끝에 남는데, Typecast 는 커서 위치부터 낭독하므로
-  // 이 처리를 하지 않으면 마지막 부분만 재생되거나 아무 소리도 나지 않는다.
-  function collapseCaretToStart(el) {
-    if (!el) return false;
-    try {
-      el.focus();
-      if (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') {
-        el.setSelectionRange(0, 0);
-        el.scrollTop = 0;
-        el.dispatchEvent(new Event('select', { bubbles: true }));
-        document.dispatchEvent(new Event('selectionchange'));
-        return true;
-      }
-
-      var selection = window.getSelection();
-      var range = document.createRange();
-
-      // Slate 편집기는 단락마다 화자 선택 버튼(contenteditable="false")이 앞에 붙어 있어
-      // 단순히 첫 텍스트 노드를 잡으면 편집 불가 영역에 캐럿을 놓게 된다.
-      // 실제 대본 문자열 노드를 찾아 그 맨 앞에 놓는다.
-      var firstString = el.querySelector('[data-slate-string="true"]');
-      var anchor = null;
-      if (firstString && firstString.firstChild && firstString.firstChild.nodeType === 3) {
-        anchor = firstString.firstChild;
-      } else {
-        var walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, {
-          acceptNode: function (node) {
-            var parent = node.parentElement;
-            while (parent && parent !== el) {
-              if (parent.getAttribute && parent.getAttribute('contenteditable') === 'false') {
-                return NodeFilter.FILTER_REJECT;
-              }
-              parent = parent.parentElement;
-            }
-            return NodeFilter.FILTER_ACCEPT;
-          }
-        });
-        anchor = walker.nextNode();
-      }
-
-      if (anchor) range.setStart(anchor, 0);
-      else range.setStart(el, 0);
-      range.collapse(true);
-      selection.removeAllRanges();
-      selection.addRange(range);
-      el.scrollTop = 0;
-      // ProseMirror 등은 selectionchange 로 내부 상태를 동기화한다.
-      document.dispatchEvent(new Event('selectionchange'));
-      return true;
-    } catch (e) {
-      return false;
-    }
-  }
 
 
-  // 이 프레임에서 실제 작업을 수행한다. 대상이 없으면 조용히 false 를 돌려준다.
-  function doPrepare(rawText) {
+  /**
+   * 앱이 CDP 입력으로 넣은 대본이 편집기에 정확히 들어갔는지 확인하고 보고한다.
+   *
+   * 검증은 **정규화 후 완전 일치**다. 예전에는 "앞 40자가 어딘가 들어 있다"만 봐서
+   * 3,000자 대본에서 앞 50자만 들어가도 `step:prepared` 가 나갔고, 앞부분만 낭독한
+   * 파일이 정상 완료로 저장됐다. 관대한 오차 허용으로 되돌리지 말 것 — 편집기가
+   * 필연적으로 바꾸는 부분은 `normalize()` 안에서만 흡수한다.
+   */
+  function verifyScript(rawText, inputDetail) {
     var editor = findEditor();
     if (!editor) {
       report('step:prepare-failed:작업할 Typecast 프로젝트를 직접 열어 둔 뒤 다시 시작하세요');
-      return true;
+      return;
     }
 
-    // 빈 줄을 걷어내 빈 단락이 생기지 않게 한다.
     var text = cleanScript(rawText);
-    editor.focus();
+    var actual = normalize(readEditor(editor));
+    var expected = normalize(text);
+    var paragraphs = editor.querySelectorAll('[data-slate-node="element"]').length;
+    var details = ' · ' + describe(editor) + (inputDetail ? ' · ' + inputDetail : '');
 
-    // 이전 대본을 먼저 완전히 비운다. 비우지 않고 붙여넣으면 Slate 가
-    // 커서가 놓인 문단만 교체해 이전 대본의 나머지 문단이 남는다.
-    clearEditor(editor, 0, function (cleared) {
-      repairEmptyEditor(editor, function () {
-        var method;
-        try {
-          method = fillEditor(editor, text);
-        } catch (e) {
-          report('step:prepare-failed:입력 중 오류 ' + e);
-          return;
-        }
+    if (actual !== expected) {
+      var at = firstDifference(actual, expected);
+      var reason = (actual.length < expected.length && at === actual.length)
+        ? '대본 앞부분만 들어갔습니다'
+        : (actual.length > expected.length && at === expected.length)
+          ? '이전 대본이 뒤에 남아 있습니다'
+          : '내용이 어긋납니다';
+      report(
+        'step:prepare-failed:입력 확인 실패 — ' + reason +
+        ' (기대 ' + expected.length + '자 / 실제 ' + actual.length + '자' +
+        ' / 첫 불일치 ' + at + '번째' +
+        ' / 기대 [' + excerpt(expected, at) + '] 실제 [' + excerpt(actual, at) + '])' +
+        details
+      );
+      return;
+    }
 
-        setTimeout(function () {
-          var actual = normalize(readEditor(editor));
-          var expected = normalize(text);
-          var paragraphs = editor.querySelectorAll('[data-slate-node="element"]').length;
-          // 처음부터 낭독되도록 선택 해제 + 캐럿을 맨 앞으로 옮긴다.
-          var caret = collapseCaretToStart(editor);
-
-          var details =
-            ' · ' + describe(editor) +
-            ' · ' + method +
-            (cleared ? '' : ' · 비우기실패') +
-            (caret ? ' · 캐럿맨앞' : ' · 캐럿이동실패');
-
-          // **완전 일치**로 검증한다.
-          //
-          // 예전에는 "앞 40자가 어딘가 들어 있다" + "기대보다 20자 넘게 길지 않다"만 봤다.
-          // 하한이 없어서 3,000자 대본에서 앞 50자만 들어가도 step:prepared 가 나갔고,
-          // 앞부분만 낭독한 파일이 정상 완료로 저장됐다. 관대한 오차 허용으로 되돌리지
-          // 말 것 — 편집기가 필연적으로 바꾸는 부분은 normalize() 안에서만 흡수한다.
-          if (actual !== expected) {
-            var at = firstDifference(actual, expected);
-            var reason = (actual.length < expected.length && at === actual.length)
-              ? '대본 앞부분만 들어갔습니다'
-              : (actual.length > expected.length && at === expected.length)
-                ? '이전 대본이 뒤에 남아 있습니다'
-                : '내용이 어긋납니다';
-            report(
-              'step:prepare-failed:입력 확인 실패 — ' + reason +
-              ' (기대 ' + expected.length + '자 / 실제 ' + actual.length + '자' +
-              ' / 첫 불일치 ' + at + '번째' +
-              ' / 기대 [' + excerpt(expected, at) + '] 실제 [' + excerpt(actual, at) + '])' +
-              details
-            );
-            return;
-          }
-
-          report(
-            'step:prepared:' + actual.length + '자' +
-            (paragraphs ? ' · ' + paragraphs + '단락' : '') + details
-          );
-        }, 500);
-      });
-    });
-
-    return true;
+    report(
+      'step:prepared:' + actual.length + '자' +
+      (paragraphs ? ' · ' + paragraphs + '단락' : '') + details
+    );
   }
 
   function doPlay() {
@@ -1704,8 +1776,8 @@ const MAIN_INIT_SCRIPT: &str = r#"
       return true;
     }
     var source = playSource;
-    // 입력 후 재생까지 사이에 커서가 움직였을 수 있으므로 직전에 다시 맨 앞으로 보낸다.
-    var caret = collapseCaretToStart(findEditor());
+    // 캐럿을 본문 맨 앞으로 보내는 것은 앱이 CDP 입력(클릭 + moveToBeginningOfDocument)으로
+    // 처리한다. 여기서 DOM 선택을 손대면 Slate 내부 상태가 어긋나 사이트가 튕긴다.
 
     // 붙여넣기 직후에는 재생 버튼이 잠시 비활성일 수 있어 활성화될 때까지 기다린다.
     var waits = 0;
@@ -1721,7 +1793,7 @@ const MAIN_INIT_SCRIPT: &str = r#"
         report('step:play-failed:재생 버튼이 계속 비활성 상태입니다 ' + describe(button));
         return;
       }
-      clickPlayOnce(button, source, caret);
+      clickPlayOnce(button, source);
     })();
     return true;
   }
@@ -1733,7 +1805,7 @@ const MAIN_INIT_SCRIPT: &str = r#"
    * 연속으로 바꿔 화면만 재생 상태이고 소리는 나지 않는 경합을 만들 수 있다.
    * 편집기 안정화는 호출자가 녹음 시작 전에 기다리고, 여기서는 단일 클릭만 보낸다.
    */
-  function clickPlayOnce(button, source, caret) {
+  function clickPlayOnce(button, source) {
     var target = closestButton(button);
     var delivered = 0;
     var probeListener = function () { delivered += 1; };
@@ -1744,7 +1816,6 @@ const MAIN_INIT_SCRIPT: &str = r#"
     report(
       'step:playing:' + describe(button) +
       (source ? ' · ' + source : '') +
-      (caret ? ' · 캐럿맨앞' : '') +
       ' · 클릭 1회(전달 ' + delivered + ')'
     );
   }
@@ -1787,7 +1858,6 @@ const MAIN_INIT_SCRIPT: &str = r#"
   function handleRequest(request) {
     if (!request || !request.type) return;
     if (request.type === 'probe') doProbe();
-    else if (request.type === 'prepare') { if (doPrepare(request.text)) markHandled('prepare'); }
     else if (request.type === 'play') { if (doPlay()) markHandled('play'); }
     else if (request.type === 'stop') doStop();
   }
@@ -1847,16 +1917,11 @@ const MAIN_INIT_SCRIPT: &str = r#"
 
     window.__omnirecProbe = function () { dispatchRequest({ type: 'probe' }); };
 
-    window.__omnirecPrepare = function (text) {
-      window.__omnirecHandled.prepare = false;
-      dispatchRequest({ type: 'prepare', text: text });
-      // 어떤 프레임도 편집기를 찾지 못하면 실패로 보고한다.
-      setTimeout(function () {
-        if (!window.__omnirecHandled.prepare) {
-          report('step:prepare-failed:작업할 Typecast 프로젝트를 직접 열어 둔 뒤 다시 시작하세요');
-          toast('Typecast에서 작업할 프로젝트를 직접 열어 주세요.', 'warn');
-        }
-      }, 1200);
+    // 앱이 CDP 입력으로 대본을 넣기 위해 쓰는 훅. 편집기 내용을 JS 로 고치지 않는다.
+    window.__omnirecCleanScript = function (text) { return cleanScript(text); };
+    window.__omnirecEditorPoint = function () { return editorPoint(); };
+    window.__omnirecVerifyScript = function (text, inputDetail) {
+      verifyScript(text, inputDetail);
     };
 
     window.__omnirecPlay = function () {
@@ -2301,14 +2366,20 @@ mod tests {
                     Err(_) => break,
                 }
             }
-            let sample_text = "안녕하세요. 이것은 OmniRec 자동화 테스트 대본입니다.";
+            // 프로덕션과 같은 경로: CDP 입력으로 넣고, 페이지가 내용을 검증해 보고한다.
+            let sample_text = "안녕하세요. 이것은 OmniRec 자동화 테스트 대본입니다.\n두 번째 단락도 함께 넣어 단락 분리를 확인합니다.";
+            let input_detail = TypecastController::type_script(&page, sample_text)
+                .await
+                .expect("trusted input should fill the editor");
+            println!("입력 방식: {}", input_detail);
             let payload = serde_json::to_string(sample_text).expect("json encode should succeed");
+            let detail = serde_json::to_string(&input_detail).expect("json encode should succeed");
             page.evaluate(format!(
-                "window.__omnirecPrepare && window.__omnirecPrepare({});",
-                payload
+                "window.__omnirecVerifyScript && window.__omnirecVerifyScript({}, {});",
+                payload, detail
             ))
             .await
-            .expect("prepare evaluate should succeed");
+            .expect("verify evaluate should succeed");
 
             let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
             loop {
@@ -2465,5 +2536,134 @@ mod tests {
         first_handler_task.abort();
         drop(first_browser);
         let _ = std::fs::remove_dir_all(&profile_dir);
+    }
+
+    /// 사용자가 보고한 사고의 회귀 테스트 — "Typecast 프로젝트 화면에서 알 수 없는 오류가
+    /// 나며 프로젝트 목록으로 튕긴다".
+    ///
+    /// 원인은 합성 이벤트 + 손으로 만든 DOM Range 로 Slate 문서를 바꾼 것이었다. Slate 의
+    /// 내부 선택이 옛 문서의 offset 을 가리킨 채 남아, 더 짧은 대본으로 교체되는 순간
+    /// `Cannot resolve a DOM point from Slate point: {"path":[0,0,0],"offset":4328}` 예외가
+    /// 나고 Typecast 의 ErrorBoundary 가 목록으로 되돌린다(Sentry 페이로드로 실측 확인).
+    /// 그래서 이 테스트는 **긴 대본 → 짧은 대본** 순서로 두 번 채운 뒤, 페이지가 여전히
+    /// 그 프로젝트에 남아 있고 두 번 다 `step:prepared` 가 나오는지 본다.
+    ///
+    /// 준비: 앱에서 `Typecast 열기` 로 창을 띄우고 작업할 프로젝트를 직접 열어 둘 것.
+    /// 수동 실행: `cargo test --manifest-path src-tauri/Cargo.toml --lib tts::tests::trusted_input_survives_shrinking_replacement -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn trusted_input_survives_shrinking_replacement() {
+        use crate::settings::SettingsManager;
+        use chromiumoxide::browser::Browser;
+        use chromiumoxide::cdp::js_protocol::runtime::{AddBindingParams, EventBindingCalled};
+        use futures::StreamExt;
+
+        let profile_dir = SettingsManager::typecast_chrome_profile_dir();
+        let port = TypecastController::read_devtools_port(&profile_dir)
+            .expect("Typecast Chrome 이 실행 중이어야 한다(앱에서 'Typecast 열기')");
+        let (browser, mut handler) = Browser::connect(format!("http://127.0.0.1:{}", port))
+            .await
+            .expect("실행 중인 Typecast Chrome 에 접속해야 한다");
+        let handler_task = tokio::spawn(async move {
+            while let Some(event) = handler.next().await {
+                if event.is_err() {
+                    break;
+                }
+            }
+        });
+
+        // 재접속 직후에는 chromiumoxide 가 아직 기존 탭에 붙지 않았을 수 있다(핸들러가
+        // 타깃 이벤트를 처리해야 목록이 채워진다). 몇 초간 다시 훑는다.
+        let mut editor_page = None;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while editor_page.is_none() && tokio::time::Instant::now() < deadline {
+            let pages = browser.pages().await.expect("탭 목록을 얻어야 한다");
+            for page in pages {
+                let url = page.url().await.ok().flatten().unwrap_or_default();
+                println!("탭: {}", url);
+                if url.contains("/text-to-speech/") {
+                    editor_page = Some((page, url));
+                    break;
+                }
+            }
+            if editor_page.is_none() {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+        }
+        let (page, url) =
+            editor_page.expect("작업할 Typecast 프로젝트를 직접 열어 둔 탭이 있어야 한다");
+        println!("대상 프로젝트: {}", url);
+
+        // 이미 로드된 문서에는 `evaluate_on_new_document` 가 적용되지 않으므로 직접 주입한다.
+        // 프로덕션과 달리 이 탭에는 옛 사본이 남아 있을 수 있어 멱등 가드를 먼저 내린다 —
+        // 그러지 않으면 스크립트를 고쳐도 예전 코드가 계속 실행돼 테스트가 거짓 실패한다.
+        page.evaluate("window.__omnirecInjected = false;")
+            .await
+            .expect("주입 가드를 내려야 한다");
+        page.execute(AddBindingParams::new(BRIDGE_BINDING_NAME))
+            .await
+            .expect("브리지 바인딩이 등록되어야 한다");
+        page.evaluate(MAIN_INIT_SCRIPT)
+            .await
+            .expect("자동화 스크립트가 주입되어야 한다");
+        let mut binding_events = page
+            .event_listener::<EventBindingCalled>()
+            .await
+            .expect("브리지 이벤트를 구독해야 한다");
+
+        let long_script = format!(
+            "긴 대본 검증. {}",
+            "한 단락을 길게 만드는 반복 문장입니다. ".repeat(110)
+        );
+        let short_script = (1..=20)
+            .map(|i| format!("짧은 대본 {}번째 단락입니다.", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        for (label, script) in [("긴 대본", &long_script), ("짧은 대본", &short_script)] {
+            let detail = TypecastController::type_script(&page, script)
+                .await
+                .unwrap_or_else(|e| panic!("{label} 입력이 성공해야 한다: {e}"));
+            println!("{label} 입력: {}", detail);
+
+            let payload = serde_json::to_string(script).expect("json encode should succeed");
+            let detail_json = serde_json::to_string(&detail).expect("json encode should succeed");
+            page.evaluate(format!(
+                "window.__omnirecVerifyScript && window.__omnirecVerifyScript({}, {});",
+                payload, detail_json
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("{label} 검증 호출이 성공해야 한다: {e}"));
+
+            let report = loop {
+                let event =
+                    tokio::time::timeout(std::time::Duration::from_secs(10), binding_events.next())
+                        .await
+                        .unwrap_or_else(|_| panic!("{label} 검증 결과가 10초 안에 와야 한다"))
+                        .expect("브리지 스트림이 끊기지 않아야 한다");
+                if event.payload.starts_with("step:prepare") {
+                    break event.payload.clone();
+                }
+            };
+            println!("{label} 결과: {}", report);
+            assert!(
+                report.starts_with("step:prepared:"),
+                "{label} 입력이 정확히 들어가야 한다: {report}"
+            );
+        }
+
+        // ErrorBoundary 가 튕겼으면 URL 이 프로젝트 목록으로 바뀐다.
+        let after = page
+            .url()
+            .await
+            .expect("URL 을 읽어야 한다")
+            .unwrap_or_default();
+        assert_eq!(
+            after, url,
+            "짧은 대본으로 교체한 뒤에도 같은 프로젝트에 남아 있어야 한다(사이트가 튕기지 않았다)"
+        );
+
+        // 사용자의 Chrome 이므로 닫지 않는다. 연결만 놓는다.
+        handler_task.abort();
     }
 }

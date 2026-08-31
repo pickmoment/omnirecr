@@ -635,9 +635,10 @@ pub async fn typecast_prepare_script(
     text: String,
     copy_to_clipboard: Option<bool>,
 ) -> Result<(), String> {
+    // 입력은 CDP 키/텍스트 이벤트를 단락 수만큼 순차로 보낸다 — 긴 대본은 20초를 넘길 수 있다.
     with_typecast_timeout(
         "대본 입력",
-        20,
+        60,
         TypecastController::prepare_script(&app, text, copy_to_clipboard.unwrap_or(true)),
     )
     .await
