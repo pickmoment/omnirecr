@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tauri::{AppHandle, Manager, PhysicalPosition, Position, Size, State};
 
@@ -22,6 +23,9 @@ pub struct AppState {
     pub merger: Arc<MergerController>,
     pub converter: Arc<AudioConverterController>,
     pub last_selection_screen: Arc<parking_lot::Mutex<Option<SelectionScreenInfo>>>,
+    /// 사용자가 메인 창을 직접 닫았는가(macOS 는 파괴 대신 숨긴다).
+    /// 이 상태에서는 녹음 종료 같은 자동 복원이 창을 되살리지 않는다.
+    pub main_window_closed_by_user: Arc<AtomicBool>,
 }
 
 #[tauri::command]
@@ -220,7 +224,15 @@ pub fn finish_recording_windows<R: tauri::Runtime>(app: &AppHandle<R>) {
 /// 녹음은 메인 창을 건드리지 않는데, 그때도 무조건 `set_focus()` 를 부르면 대본 하나가
 /// 끝날 때마다 Typecast Chrome 창에서 포커스를 빼앗아 화면이 깜빡이고, 다음 대본의
 /// 재생 클릭 전에 창을 다시 앞으로 올려야 한다.
+///
+/// 사용자가 창을 직접 닫아 숨겨 둔 경우(macOS)는 되돌리지 않는다 — 닫아 둔 창이 대본
+/// 하나가 끝날 때마다 되살아나면 안 된다. 그 창은 Dock 재열기로만 다시 뜬다.
 pub fn restore_main_window_if_hidden<R: tauri::Runtime>(app: &AppHandle<R>) {
+    if let Some(state) = app.try_state::<AppState>() {
+        if state.main_window_closed_by_user.load(Ordering::SeqCst) {
+            return;
+        }
+    }
     let Some(main_win) = app.get_webview_window("main") else {
         return;
     };

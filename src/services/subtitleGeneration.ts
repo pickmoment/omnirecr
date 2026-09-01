@@ -5,13 +5,9 @@ import type {
   SubtitleItem,
   SubtitleSplitMode,
 } from '../types';
-import {
-  alignScriptWithWhisperChunks,
-  generateSubtitlesFromAiChunks,
-  runLocalWhisperTranscribe,
-  splitScriptIntoLines,
-  throwIfCancelled,
-} from './whisperService';
+import { splitScriptIntoLines } from './subtitleAlign';
+import { runLocalWhisperTranscribe, throwIfCancelled } from './whisperService';
+import type { WhisperAlignSpec } from './whisperWorkerProtocol';
 
 // 취소는 성공도 실패도 아니다. 호출자가 "생성 실패"로 표시하지 않도록 판별 수단을 같이 내보낸다.
 export { SubtitleCancelledError, isSubtitleCancelled } from './whisperService';
@@ -235,27 +231,32 @@ export const generateSubtitles = async (
     throwIfCancelled(signal);
     const totalDuration = pcm.length / 16000;
 
-    // pcm 은 전사 과정에서 제자리 세정되므로 이후 다시 쓰지 않는다.
+    // 정렬 방식은 전사 요청과 함께 넘긴다 — 전사도 정렬 DP 도 워커에서 끝내야 메인
+    // 스레드가 멈추지 않고, 청크 배열을 왕복시키는 복제도 없앤다.
+    let align: WhisperAlignSpec;
+    if (workflow === 'ai-only') {
+      align = { mode: 'ai', maxChars };
+    } else {
+      const lines = splitScriptIntoLines(scriptText, splitMode, maxChars, splitOnComma);
+      if (lines.length === 0) {
+        throw new Error('대본에서 유효한 텍스트 문장을 찾을 수 없습니다.');
+      }
+      align = { mode: 'script', lines };
+    }
+
+    // pcm 버퍼는 워커로 transfer 되어 이쪽에서는 분리된다. 이후 다시 읽지 않는다.
     const whisperResult = await runLocalWhisperTranscribe(
       pcm,
       whisperModel,
       report,
       whisperLanguage,
       signal,
+      align,
     );
 
     throwIfCancelled(signal);
 
-    let subtitles: SubtitleItem[];
-    if (workflow === 'ai-only') {
-      subtitles = generateSubtitlesFromAiChunks(whisperResult.chunks, maxChars);
-    } else {
-      const lines = splitScriptIntoLines(scriptText, splitMode, maxChars, splitOnComma);
-      if (lines.length === 0) {
-        throw new Error('대본에서 유효한 텍스트 문장을 찾을 수 없습니다.');
-      }
-      subtitles = alignScriptWithWhisperChunks(lines, whisperResult.chunks, totalDuration);
-    }
+    const subtitles = whisperResult.subtitles;
 
     const srtContent = buildSrt(subtitles);
     const vttContent = buildVtt(subtitles);

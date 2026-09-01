@@ -15,9 +15,17 @@ use commands::AppState;
 use converter::AudioConverterController;
 use merger::MergerController;
 use recorder::RecorderController;
+use std::sync::atomic::AtomicBool;
+#[cfg(target_os = "macos")]
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use tauri::Manager;
+#[cfg(target_os = "macos")]
+use tauri::RunEvent;
+use tauri::{Manager, WindowEvent};
 use tts::TypecastCdpState;
+
+/// 기본(그리고 유일하게 사용자에게 보이는) 창의 라벨.
+pub const MAIN_WINDOW_LABEL: &str = "main";
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -30,6 +38,7 @@ pub fn run() {
         merger,
         converter,
         last_selection_screen: Arc::new(parking_lot::Mutex::new(None)),
+        main_window_closed_by_user: Arc::new(AtomicBool::new(false)),
     };
 
     let recorder_for_hotkey = recorder.clone();
@@ -41,6 +50,34 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .manage(app_state)
         .manage(TypecastCdpState::new())
+        .on_window_event(|window, event| {
+            if window.label() != MAIN_WINDOW_LABEL {
+                return;
+            }
+            let WindowEvent::CloseRequested { api, .. } = event else {
+                return;
+            };
+            // 메인 창을 그냥 파괴하면 프로세스는 계속 살아 있다 — `selection-overlay` 와
+            // `mini-controller` 가 숨겨진 채로 존재해 마지막 창 종료 조건이 성립하지 않는다.
+            // 그 상태에서는 보이는 창이 하나도 없고, Dock/Finder 로 다시 열어도 macOS 는
+            // 이미 실행 중인 인스턴스를 활성화할 뿐이라 아무 창도 뜨지 않았다(강제 종료 후에야
+            // 다시 열렸다). macOS 는 창을 숨겨 두고 재열기(Reopen)로 되살리고,
+            // Dock 재열기 개념이 없는 OS 는 그대로 종료한다.
+            #[cfg(target_os = "macos")]
+            {
+                api.prevent_close();
+                let _ = window.hide();
+                window
+                    .state::<AppState>()
+                    .main_window_closed_by_user
+                    .store(true, Ordering::SeqCst);
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = api;
+                window.app_handle().exit(0);
+            }
+        })
         .setup(move |app| {
             recorder.set_app_handle(app.handle().clone());
             if let Some(window) = app.get_webview_window("selection-overlay") {
@@ -114,8 +151,54 @@ pub fn run() {
             commands::typecast_stop_playback,
             commands::typecast_probe,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while running tauri application")
+        .run(|app_handle, event| {
+            // macOS 전용 이벤트. Dock 아이콘 클릭 · Finder 재실행 · `open -a` 가 모두 여기로 온다.
+            #[cfg(target_os = "macos")]
+            if let RunEvent::Reopen { .. } = event {
+                show_main_window(app_handle);
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = (app_handle, event);
+            }
+        });
+}
+
+/// 메인 창을 다시 보여 준다. 창이 사라진 경우(다른 경로에서 destroy)에는
+/// `tauri.conf.json` 의 정의를 그대로 다시 만들어 설정이 두 곳으로 갈라지지 않게 한다.
+#[cfg(target_os = "macos")]
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(state) = app.try_state::<AppState>() {
+        state.main_window_closed_by_user.store(false, Ordering::SeqCst);
+    }
+
+    if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+        return;
+    }
+
+    let config = app
+        .config()
+        .app
+        .windows
+        .iter()
+        .find(|w| w.label == MAIN_WINDOW_LABEL)
+        .cloned();
+    let Some(config) = config else {
+        return;
+    };
+    match tauri::WebviewWindowBuilder::from_config(app, &config).and_then(|b| b.build()) {
+        Ok(window) => {
+            let _ = window.set_focus();
+        }
+        Err(err) => {
+            log::error!("메인 창을 다시 만들지 못했습니다: {err}");
+        }
+    }
 }
 
 #[cfg(target_os = "windows")]

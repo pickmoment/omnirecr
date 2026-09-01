@@ -97,6 +97,19 @@
   '완료'로 보고되고 파일까지 썼다), 호출자는 `isSubtitleCancelled(err)` 로 '건너뜀'과 '실패'를
   구분한다.
 
+**로컬 Whisper 전사와 강제 정렬은 전용 Web Worker(`services/whisperWorker.ts`)에서만 돈다.**
+ONNX Runtime(WASM) 추론 호출은 동기라서 메인 스레드에서 돌리면 그 시간 동안 웹뷰가 통째로
+멈춘다 — 자막 일괄 생성이 중간에 굳어 보이던 원인이다(진행 표시도 중단 버튼도 반응하지 않음).
+정렬 DP 도 같은 이유로 워커에서 돈다(1시간 녹음 = 대본 9천 단어 × 밴드 폭, 수천만 셀).
+- 계약은 `services/whisperWorkerProtocol.ts` 한 곳에 있다. 메인 스레드는 워커 본체를 절대
+  정적 import 하지 않는다 — transformers.js 와 onnxruntime-web 이 메인 번들로 딸려 들어온다.
+- PCM 은 `postMessage` transfer 로 넘긴다(사본 없음). 넘긴 뒤 호출자 쪽 버퍼는 분리된다.
+- 순수 계산(`splitScriptIntoLines` · `alignScriptWithWhisperChunks` · `generateSubtitlesFromAiChunks`)은
+  `services/subtitleAlign.ts` 에 있고 워커와 메인 스레드가 함께 쓴다.
+- 취소는 **워커 `terminate()`** 다. WASM 추론은 중간에 끼어들 수 없어 플래그만 두면 사용자가
+  중단해도 계산이 끝까지 돈다. 모델은 브라우저 캐시에 남아 다음 요청에서 다시 내려받지 않는다.
+- Vite 는 `worker: { format: 'es' }` 여야 한다(기본 iife 워커는 동적 import 를 못 해 깨진다).
+
 ### 6. Script Library & Typecast TTS Recording
 
 > 자막 생성 파이프라인은 `src/services/subtitleGeneration.ts` 한 곳에 있다.
@@ -257,6 +270,20 @@ exit 234, 0바이트 파일 생성, `progress=end` 까지 찍힘). stderr 는 �
 - `mini-controller`: Compact, frameless, always-on-top floating toolbar displayed during active screen recordings, and during TTS 낭독 녹음 (`start_audio_record` 의 `show_mini_controller` 옵션).
 
 Typecast 는 Tauri 창이 아니다 — `typecast-browser`/`typecast-popup` 이라는 이름의 앱 창은 없다.
+
+**메인 창을 닫아도 프로세스는 남는다 — 그래서 창 종료를 그냥 파괴로 두면 앱을 다시 열 수 없다.**
+`selection-overlay` 와 `mini-controller` 는 시작할 때 만들어져 숨겨진 채 계속 존재하므로,
+`main` 을 파괴해도 "마지막 창이 닫혔다"가 성립하지 않아 Tauri 는 종료하지 않는다. 그 상태에서는
+보이는 창이 하나도 없고 Dock/Finder 로 다시 열어도 macOS 는 실행 중인 인스턴스를 활성화만 해
+아무 일도 일어나지 않았다(강제 종료해야 다시 열렸다). 지금은 `lib.rs` 가 이렇게 처리한다.
+- macOS: `WindowEvent::CloseRequested` 에서 `prevent_close()` + `hide()`, 그리고
+  `RunEvent::Reopen`(Dock 클릭 · Finder 재실행 · `open -a`)에서 다시 `show()`.
+  창이 사라진 경우에는 `tauri.conf.json` 의 `main` 정의를 그대로 다시 만든다(설정을 복사하지 말 것).
+- 그 외 OS: Dock 재열기 개념이 없으므로 `main` 종료 = `app.exit(0)`.
+
+사용자가 직접 닫아 숨긴 상태는 `AppState.main_window_closed_by_user` 로 표시하고,
+`restore_main_window_if_hidden()` 은 이 플래그가 서 있으면 아무것도 하지 않는다 — 그러지 않으면
+대본 자동 녹음이 대본 하나 끝날 때마다 사용자가 닫아 둔 창을 되살린다.
 
 ### Typecast 자동화 — 실제 Chrome + CDP (`src-tauri/src/tts/mod.rs`)
 
@@ -704,6 +731,8 @@ npm run tauri dev
 | 하는 일 | 유일한 위치 |
 |---|---|
 | 자막 생성 파이프라인 | `services/subtitleGeneration.ts` |
+| 로컬 Whisper 전사 · 정렬 실행 | `services/whisperWorker.ts` (워커) |
+| 대본 분할 · 강제 정렬 계산 | `services/subtitleAlign.ts` |
 | 자막 생성 옵션 폼 | `components/SubtitleOptionsPanel.tsx` |
 | Typecast 로그인 · 창 제어 | `components/TypecastSessionCard.tsx` |
 | Typecast 연동 진단 로그 | 같은 파일의 `TypecastDiagnosticsLog` |
