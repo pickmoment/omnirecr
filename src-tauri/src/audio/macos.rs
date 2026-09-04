@@ -5,6 +5,7 @@ use crate::audio::engine::{CaptureRing, FatalReporter};
 use screencapturekit::cm::CMSampleBufferExt;
 
 use screencapturekit::prelude::*;
+use screencapturekit::stream::delegate_trait::ErrorHandler;
 
 pub const SYSTEM_AUDIO_SAMPLE_RATE_HZ: u32 = 48_000;
 
@@ -62,7 +63,16 @@ impl MacSystemAudioCapture {
             .with_channel_count(2)
             .with_excludes_current_process_audio(!include_own_app_audio);
 
-        let mut stream = SCStream::new(&filter, &configuration);
+        // ScreenCaptureKit 이 스트림을 스스로 멈추면(출력 장치 전환 · 권한 회수 · 디스플레이
+        // 구성 변경 · 프레임워크 오류) 이 콜백으로만 알려 준다. 등록하지 않으면 시스템
+        // 오디오가 조용히 사라진 채 녹음이 "진행 중" 으로 남는다.
+        let stop_reporter = reporter.clone();
+        let delegate = ErrorHandler::new(move |error| {
+            stop_reporter.report(format!(
+                "macOS 시스템 오디오 캡처가 중단되었습니다: {error}"
+            ));
+        });
+        let mut stream = SCStream::new_with_delegate(&filter, &configuration, delegate);
         let handler_id = stream.add_output_handler(
             move |sample: CMSampleBuffer, output_type: SCStreamOutputType| {
                 if output_type != SCStreamOutputType::Audio {

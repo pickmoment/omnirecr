@@ -36,6 +36,56 @@ const SILENCE_PAD_TRIGGER_MS: f64 = 200.0;
 /// 타임라인을 앞질러 버린다.
 const SILENCE_PAD_MARGIN_MS: f64 = 50.0;
 
+/// 이만큼 프레임이 오지 않으면 캡처가 멈춘 것으로 보고 VU · 무음 감지기에 무음을 넣는다.
+/// 정상 캡처는 10ms 안팎 간격으로 청크를 주므로 청크 사이의 빈틈에는 걸리지 않는다.
+const CAPTURE_STALL_SILENCE_MS: u64 = 250;
+
+/// 캡처 정지가 이만큼 이어지면 세션당 한 번 경고를 남긴다(진단용).
+const CAPTURE_STALL_WARN_MS: u64 = 2000;
+
+/// 캡처가 프레임을 주고 있는지 추적한다. 워커 루프가 매 회차 `observe()` 를 부른다.
+struct CaptureStallTracker {
+    last_frames_at: Instant,
+    warned: bool,
+}
+
+/// `CaptureStallTracker::observe()` 의 판정.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptureFlow {
+    /// 이번 회차에 프레임을 처리했다 — 실제 레벨로 판정한다.
+    Frames,
+    /// 청크 사이의 짧은 빈틈 — 아직 판정을 바꾸지 않는다.
+    Gap,
+    /// 캡처가 멈췄다 — 무음으로 판정한다. `first_warning` 은 이 정지 구간에서 첫 경고 시점.
+    Stalled { first_warning: bool },
+}
+
+impl CaptureStallTracker {
+    fn new(now: Instant) -> Self {
+        Self {
+            last_frames_at: now,
+            warned: false,
+        }
+    }
+
+    fn observe(&mut self, frames_processed: usize, now: Instant) -> CaptureFlow {
+        if frames_processed > 0 {
+            self.last_frames_at = now;
+            self.warned = false;
+            return CaptureFlow::Frames;
+        }
+        let since = now.saturating_duration_since(self.last_frames_at);
+        if since < Duration::from_millis(CAPTURE_STALL_SILENCE_MS) {
+            return CaptureFlow::Gap;
+        }
+        let first_warning = !self.warned && since >= Duration::from_millis(CAPTURE_STALL_WARN_MS);
+        if first_warning {
+            self.warned = true;
+        }
+        CaptureFlow::Stalled { first_warning }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AudioEngineEvent {
     AutoPause,
@@ -543,6 +593,7 @@ impl AudioCaptureEngine {
             let mut frames_written: u64 = 0;
             let mut drop_warning_emitted = false;
             let mut pad_warning_emitted = false;
+            let mut stall = CaptureStallTracker::new(Instant::now());
 
             while running_clone.load(Ordering::SeqCst) {
                 let mut received_any = false;
@@ -717,12 +768,36 @@ impl AudioCaptureEngine {
                     }
                 }
 
-                if frames_processed > 0 {
-                    let num_samples = (frames_processed * 2) as f32;
-                    let sys_rms = (sys_rms_accum / num_samples).sqrt();
-                    let mic_rms = (mic_rms_accum / num_samples).sqrt();
-                    let mixed_rms = (mixed_rms_accum / num_samples).sqrt();
+                // 캡처가 프레임을 주지 않는 동안에도 레벨 판정은 계속되어야 한다.
+                //
+                // 예전에는 `frames_processed == 0` 이면 VU 와 무음 감지기를 건드리지
+                // 않아 **마지막 블록 값이 그대로 얼어붙었다**. 시스템 오디오 캡처가
+                // 발화 도중 끊기면(출력 장치 전환 · ScreenCaptureKit 드롭아웃) VU 는 계속
+                // "소리 있음" 을 가리키고 무음 감지기는 무음을 재지 않아, 대본 자동 녹음이
+                // 파일에 아무것도 쓰지 못하면서 끝나지도 않았다(하드캡까지 수 분 대기).
+                // 프레임이 없다는 것은 결과 파일 기준으로 무음이므로 그렇게 다룬다 —
+                // `SkipPaused` 는 아무것도 쓰지 않고, `WallClock` 은 아래에서 0 으로 메운다.
+                let levels = match stall.observe(frames_processed, Instant::now()) {
+                    CaptureFlow::Frames => {
+                        let num_samples = (frames_processed * 2) as f32;
+                        Some((
+                            (sys_rms_accum / num_samples).sqrt(),
+                            (mic_rms_accum / num_samples).sqrt(),
+                            (mixed_rms_accum / num_samples).sqrt(),
+                        ))
+                    }
+                    CaptureFlow::Gap => None,
+                    CaptureFlow::Stalled { first_warning } => {
+                        if first_warning {
+                            log::warn!(
+                                "오디오 캡처가 {CAPTURE_STALL_WARN_MS}ms 넘게 프레임을 주지 않습니다 — 무음으로 처리합니다."
+                            );
+                        }
+                        Some((0.0, 0.0, 0.0))
+                    }
+                };
 
+                if let Some((sys_rms, mic_rms, mixed_rms)) = levels {
                     *sys_vu_clone.lock() = linear_to_db(sys_rms);
                     *mic_vu_clone.lock() = linear_to_db(mic_rms);
 
@@ -935,7 +1010,11 @@ impl Drop for AudioCaptureEngine {
 
 #[cfg(test)]
 mod tests {
-    use super::{frames_to_process, interleave_stereo_f32, interleave_stereo_i16, CaptureRing};
+    use super::{
+        frames_to_process, interleave_stereo_f32, interleave_stereo_i16, CaptureFlow, CaptureRing,
+        CaptureStallTracker, CAPTURE_STALL_SILENCE_MS, CAPTURE_STALL_WARN_MS,
+    };
+    use std::time::{Duration, Instant};
 
     #[test]
     fn microphone_is_the_dual_stream_master_clock() {
@@ -989,5 +1068,43 @@ mod tests {
             remaining += 1;
         }
         assert_eq!(remaining, super::CAPTURE_RING_CHUNKS);
+    }
+
+    /// 캡처가 프레임을 주지 않으면 레벨 판정은 **무음** 으로 이어져야 한다. 예전에는
+    /// 이때 VU 와 무음 감지기를 건드리지 않아 마지막 블록 값이 얼어붙었고, 발화 도중
+    /// 시스템 오디오 캡처가 끊기면 대본 자동 녹음이 끝나지도 기록하지도 않았다.
+    #[test]
+    fn capture_stall_is_reported_as_silence_after_the_grace_gap() {
+        let start = Instant::now();
+        let mut tracker = CaptureStallTracker::new(start);
+        let ms = |offset: u64| start + Duration::from_millis(offset);
+
+        assert_eq!(tracker.observe(480, ms(10)), CaptureFlow::Frames);
+        // 청크 사이의 정상적인 빈틈은 판정을 바꾸지 않는다.
+        assert_eq!(tracker.observe(0, ms(20)), CaptureFlow::Gap);
+        assert_eq!(
+            tracker.observe(0, ms(10 + CAPTURE_STALL_SILENCE_MS - 1)),
+            CaptureFlow::Gap
+        );
+        // 유예를 넘기면 무음으로 판정하되, 경고는 아직 아니다.
+        assert_eq!(
+            tracker.observe(0, ms(10 + CAPTURE_STALL_SILENCE_MS)),
+            CaptureFlow::Stalled { first_warning: false }
+        );
+        // 경고는 정지 구간마다 정확히 한 번.
+        assert_eq!(
+            tracker.observe(0, ms(10 + CAPTURE_STALL_WARN_MS)),
+            CaptureFlow::Stalled { first_warning: true }
+        );
+        assert_eq!(
+            tracker.observe(0, ms(10 + CAPTURE_STALL_WARN_MS + 500)),
+            CaptureFlow::Stalled { first_warning: false }
+        );
+        // 프레임이 돌아오면 정상으로 복귀하고, 다음 정지에서 다시 경고할 수 있다.
+        assert_eq!(tracker.observe(480, ms(5000)), CaptureFlow::Frames);
+        assert_eq!(
+            tracker.observe(0, ms(5000 + CAPTURE_STALL_WARN_MS)),
+            CaptureFlow::Stalled { first_warning: true }
+        );
     }
 }

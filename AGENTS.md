@@ -212,6 +212,18 @@ ONNX Runtime(WASM) 추론 호출은 동기라서 메인 스레드에서 돌리�
      플래그를 볼 수 없으므로, 완료 플래그를 **데드라인 폴링**한 뒤에만 `join` 하고, stdin 이
      닫히지 않았으면 기다리지 않고 FFmpeg 을 kill 해 파이프를 깨워 수거한다. `join()` 을
      플래그 확인 없이 부르는 코드로 되돌리지 말 것 — 동기 커맨드였다면 앱이 통째로 멈춘다.
+9. **캡처가 프레임을 주지 않으면 그 구간은 무음이다 — 레벨 판정을 얼리지 말 것.**
+   워커 루프가 `frames_processed == 0` 일 때 VU 와 `SilenceDetector` 를 건너뛰던 시절에는
+   마지막 블록 값이 그대로 얼어붙었다. 발화 도중 시스템 오디오 캡처가 끊기면(출력 장치
+   전환 · ScreenCaptureKit 드롭아웃) `audio_vu_meter` 는 계속 "소리 있음" 을 가리키고 무음
+   감지기는 무음을 재지 않아, 대본 자동 녹음이 **파일에 아무것도 쓰지 못하면서 끝나지도
+   않았다**(하드캡까지 수 분). 지금은 `CaptureStallTracker` 가 250ms 넘게 프레임이 없으면
+   VU 를 바닥으로 내리고 감지기에 0 을 넣는다(`SkipPaused` 는 아무것도 안 쓰고 `WallClock`
+   은 0 으로 메우므로 결과 파일 기준으로도 무음이 맞다). 2초 넘게 이어지면 세션당 한 번
+   경고를 남긴다. 회귀 테스트: `audio::engine::tests::capture_stall_is_reported_as_silence_after_the_grace_gap`.
+   macOS 는 `SCStream::new_with_delegate` + `ErrorHandler` 로 `didStopWithError` 를 받아
+   `FatalReporter` 에 올린다 — 델리게이트 없이 만들면 SCK 가 스트림을 스스로 멈춰도 아무
+   신호가 없다.
 
 ---
 
